@@ -1,0 +1,11 @@
+[package]
+name = "hg_proof"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+hg_core = { path = "../hg_core" }
+hg_fieldpack = { path = "../hg_fieldpack" }
+
+[lib]
+path = "src/lib.rs"

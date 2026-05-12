@@ -1,0 +1,14 @@
+[package]
+name = "hg_read_kernel"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+hg_core = { path = "../hg_core" }
+hg_kernel = { path = "../hg_kernel" }
+
+[dev-dependencies]
+hg_runtime = { path = "../hg_runtime" }
+
+[lib]
+path = "src/lib.rs"

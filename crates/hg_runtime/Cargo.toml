@@ -1,0 +1,13 @@
+[package]
+name = "hg_runtime"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+hg_core = { path = "../hg_core" }
+hg_fieldpack = { path = "../hg_fieldpack" }
+hg_kernel = { path = "../hg_kernel" }
+hg_proof = { path = "../hg_proof" }
+
+[lib]
+path = "src/lib.rs"

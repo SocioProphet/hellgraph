@@ -1,0 +1,10 @@
+[workspace]
+members = [
+    "crates/hg_core",
+    "crates/hg_fieldpack",
+    "crates/hg_proof",
+    "crates/hg_kernel",
+    "crates/hg_runtime",
+    "crates/hg_read_kernel",
+]
+resolver = "2"
