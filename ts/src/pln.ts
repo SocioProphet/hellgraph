@@ -22,7 +22,12 @@ import { getHellGraph } from './store'
 
 const MIN_STRENGTH  = 0.30
 const DEFAULT_MAX_ITERS = 80
-const CHAIN_EDGE    = 'RELATED_TO'
+const CHAIN_EDGE    = 'RELATED_TO'   // edge type written for DERIVED inferences
+// Edge types PLN reasons OVER. COOCCURS_WITH (entity co-occurrence, confidence
+// 0.8) is the dense semantic structure ingestion actually produces — without it
+// PLN had nothing to chain (RELATED_TO only forms above a high embedding-similarity
+// threshold). Derived edges are still written as RELATED_TO, so they feed forward.
+const SOURCE_EDGES  = new Set<string>(['RELATED_TO', 'COOCCURS_WITH'])
 const ABD_MIN_STRENGTH = 0.55   // minimum edge strength to trigger abduction
 
 export interface PLNResult {
@@ -49,7 +54,7 @@ export function forwardChain(opts: PLNOptions = {}): PLNResult {
   const runAbduction = opts.runAbduction ?? true
 
   const g = getHellGraph()
-  const allEdges = g.allEdges().filter(e => e.label === CHAIN_EDGE)
+  const allEdges = g.allEdges().filter(e => SOURCE_EDGES.has(e.label))
 
   type Neighbor = { to: string; s: number; c: number; sources: string[] }
   const adj = new Map<string, Neighbor[]>()
