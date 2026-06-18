@@ -42,7 +42,12 @@ export interface PLNOptions {
   maxIters?: number
   runRevision?: boolean
   runAbduction?: boolean
+  /** Hard cap on derived edges per run — bounds graph growth now that PLN fires
+   *  over the dense co-occurrence graph and feeds its own output forward. */
+  maxDerived?: number
 }
+
+const DEFAULT_MAX_DERIVED = 2000
 
 /**
  * Run PLN forward chaining over RELATED_TO edges.
@@ -52,6 +57,7 @@ export function forwardChain(opts: PLNOptions = {}): PLNResult {
   const maxIters = opts.maxIters ?? DEFAULT_MAX_ITERS
   const runRevision  = opts.runRevision  ?? true
   const runAbduction = opts.runAbduction ?? true
+  const maxDerived   = opts.maxDerived   ?? DEFAULT_MAX_DERIVED
 
   const g = getHellGraph()
   const allEdges = g.allEdges().filter(e => SOURCE_EDGES.has(e.label))
@@ -113,14 +119,16 @@ export function forwardChain(opts: PLNOptions = {}): PLNResult {
   }
 
   // ── Deduction: A→B + B→C → A→C ──────────────────────────────────────────
-  while (changed && iters < maxIters) {
+  while (changed && iters < maxIters && derived < maxDerived) {
     changed = false
     iters++
 
     for (const [a, aNeighbors] of adj) {
+      if (derived >= maxDerived) break
       for (const { to: b, s: p1, c: c1 } of aNeighbors) {
         const bNeighbors = adj.get(b) ?? []
         for (const { to: cc, s: p2, c: c2 } of bNeighbors) {
+          if (derived >= maxDerived) break
           if (cc === a) continue
           const inferredS = p1 * p2
           const inferredC = c1 * c2 * 0.9
@@ -186,6 +194,7 @@ export function forwardChain(opts: PLNOptions = {}): PLNResult {
 
     const ABD_SHARED_THRESHOLD = 3
     for (const { a, b, shared, minS, minC } of pairs.values()) {
+      if (derived >= maxDerived) break
       if (shared < ABD_SHARED_THRESHOLD) continue
       // Already directly connected? Skip
       if (adj.get(a)?.some(n => n.to === b) || adj.get(b)?.some(n => n.to === a)) continue
