@@ -1,0 +1,23 @@
+{
+  "name": "@socioprophet/hellgraph",
+  "version": "0.1.0",
+  "description": "HellGraph — TypeScript OpenCog-compatible AtomSpace metagraph engine (PLN, ECAN, pattern matcher, SPARQL/Gremlin, SHACL, Atomese, StorageNode federation). Polyglot sibling of the Rust hellgraph crate.",
+  "license": "UNLICENSED",
+  "main": "ts/dist/index.js",
+  "types": "ts/dist/index.d.ts",
+  "files": [
+    "ts/dist",
+    "ts/src"
+  ],
+  "scripts": {
+    "build": "tsc -p ts/tsconfig.json",
+    "prepare": "tsc -p ts/tsconfig.json",
+    "typecheck": "tsc -p ts/tsconfig.json --noEmit",
+    "test": "node --import tsx --test ts/src/*.test.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "tsx": "^4.0.0",
+    "typescript": "^5.5.0"
+  }
+}
