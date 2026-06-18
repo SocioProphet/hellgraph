@@ -1,9 +1,1 @@
-/target/
-**/.DS_Store
-*.log
-*.tmp
-*.swp
-
-# TS engine build artifacts
 node_modules/
-ts/dist/
