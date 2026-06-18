@@ -43,10 +43,11 @@ interface RocksDb {
 }
 type RocksCtor = (location: string) => RocksDb
 
-function loadRocks(): RocksCtor | null {
+// Dynamic import works in both the ESM and CJS builds (a bare require() throws in
+// the ESM bundle, which is why the binding must be loaded this way).
+async function loadRocks(): Promise<RocksCtor | null> {
   try {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const mod = require('rocksdb') as RocksCtor | { default: RocksCtor }
+    const mod = (await import('rocksdb')) as unknown as RocksCtor | { default: RocksCtor }
     return typeof mod === 'function' ? mod : mod.default
   } catch {
     return null
@@ -70,7 +71,7 @@ export class RocksDBBackend implements AtomSpaceBackend {
    * caller should catch and fall back to JSONL.
    */
   static async open(baseDir: string, spaceId = 'sociosphere-primary'): Promise<RocksDBBackend> {
-    const ctor = loadRocks()
+    const ctor = await loadRocks()
     if (!ctor) throw new Error('rocksdb binding not available (optional dependency not installed)')
     const dbPath = path.join(baseDir, `${spaceId}.rocks`)
     const backend = new RocksDBBackend(dbPath)

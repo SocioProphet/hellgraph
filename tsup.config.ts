@@ -15,4 +15,9 @@ export default defineConfig({
   treeshake: true,
   platform: 'node',
   target: 'node18',
+  // rocksdb is an optional NATIVE dependency: keep it external so the dynamic
+  // import resolves from the consumer's node_modules (and its node-gyp-build
+  // prebuild path works), and so absence degrades gracefully to the JSONL
+  // backend instead of breaking the bundle.
+  external: ['rocksdb'],
 })
