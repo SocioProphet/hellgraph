@@ -24,6 +24,7 @@
  */
 
 import * as path from 'node:path'
+import * as fs from 'node:fs'
 import type { AtomSpaceBackend, AtomLogEntry } from './atomspace.js'
 
 const SEQ_WIDTH = 16 // zero-pad so lexical order == numeric order up to 1e16 entries
@@ -73,6 +74,9 @@ export class RocksDBBackend implements AtomSpaceBackend {
   static async open(baseDir: string, spaceId = 'sociosphere-primary'): Promise<RocksDBBackend> {
     const ctor = await loadRocks()
     if (!ctor) throw new Error('rocksdb binding not available (optional dependency not installed)')
+    // RocksDB's createIfMissing makes the leaf dir but not parents — ensure the
+    // base store dir exists first (callers may point at a fresh path).
+    fs.mkdirSync(baseDir, { recursive: true })
     const dbPath = path.join(baseDir, `${spaceId}.rocks`)
     const backend = new RocksDBBackend(dbPath)
     const db = ctor(dbPath)
