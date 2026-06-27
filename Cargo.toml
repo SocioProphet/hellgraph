@@ -6,5 +6,6 @@ members = [
     "crates/hg_kernel",
     "crates/hg_runtime",
     "crates/hg_read_kernel",
+    "crates/hg_analytics",
 ]
 resolver = "2"

@@ -3,6 +3,13 @@
 version = 4
 
 [[package]]
+name = "hg_analytics"
+version = "0.1.0"
+dependencies = [
+ "hg_core",
+]
+
+[[package]]
 name = "hg_core"
 version = "0.1.0"
 
