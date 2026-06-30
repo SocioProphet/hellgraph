@@ -47,6 +47,12 @@ Freeze the canonical semantics, interfaces, projections, and pilot overlays befo
    - staffing and effort model
    - risk register and remediation sequence
 
+8. `08_Reflexive_Loop_and_Convergence_v0_1.md`
+   - bidirectional ontology/epistemology operations over the hypergraph substrate
+   - reconciliation fixpoint as the "survives the loop" convergence criterion
+   - binding to the reasoning-evidence fabric and authored-canon system-of-record
+   - Hopf-fibration framing is motivating metaphor only; no topology is computed
+
 ## Canonical Kernel Theorem
 
 One canonical core: immutable typed atoms plus versioned valuations.
