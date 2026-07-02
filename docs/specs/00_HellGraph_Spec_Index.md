@@ -47,6 +47,18 @@ Freeze the canonical semantics, interfaces, projections, and pilot overlays befo
    - staffing and effort model
    - risk register and remediation sequence
 
+8. `08_Federated_Sovereign_HellGraph_v0_1.md`
+   - managed offering as a federation of sovereign append-only logs
+   - DAS + Hypercore/Autobase/Hyperbee conformance targets
+   - super-peer (derived index) vs. participant (source of truth)
+   - causal consistency; retires client→server `StorageNodeClient` federation
+
+9. `09_Proof_Under_Causal_Consistency_v0_1.md`
+   - causal cut (version vector over Hypercores)
+   - proof binding: frame-relative validity, no silent downgrade
+   - field-state / valuation and read semantics under eventual consistency
+   - invariants and open questions (cut compaction, cross-cut composition, retraction)
+
 ## Canonical Kernel Theorem
 
 One canonical core: immutable typed atoms plus versioned valuations.
