@@ -15,9 +15,10 @@ export default defineConfig({
   treeshake: true,
   platform: 'node',
   target: 'node18',
-  // rocksdb is an optional NATIVE dependency: keep it external so the dynamic
-  // import resolves from the consumer's node_modules (and its node-gyp-build
-  // prebuild path works), and so absence degrades gracefully to the JSONL
-  // backend instead of breaking the bundle.
-  external: ['rocksdb'],
+  // rocksdb and hypercore are optional dependencies loaded via dynamic import:
+  // keep them external so they resolve from the consumer's node_modules (rocksdb's
+  // node-gyp-build prebuild path works; hypercore pulls a large P2P dep tree we must
+  // not inline), and so absence degrades gracefully to the JSONL backend instead of
+  // bloating/breaking the bundle.
+  external: ['rocksdb', 'hypercore'],
 })
