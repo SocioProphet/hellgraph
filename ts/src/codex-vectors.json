@@ -1,0 +1,33 @@
+{
+  "_note": "Frozen reference vectors for the GKG-CODEX formal layer. Parity contract: any implementation MUST reproduce these byte-for-byte (derived from the gkg_codex.py oracle). Internal fixture — not shipped in dist.",
+  "known_answer": {
+    "gematria": { "abc": 6 },
+    "sequence": { "abc": 14 },
+    "spacing": { "the open gate": [1, 1] },
+    "structure": { "the open gate": [11, 3] },
+    "residue_len": 4
+  },
+  "manifest": {
+    "text": "the open gate",
+    "division": 42,
+    "expect": {
+      "gematria": 116,
+      "sequence": 639,
+      "spacing": [1, 1],
+      "structure": [11, 3],
+      "residue": [1, 4, 14, 2],
+      "_sha256": "ed49b79ff37fdbfa",
+      "_division": 42
+    }
+  },
+  "syndrome": {
+    "base": "the open gate",
+    "cases": [
+      { "label": "substitution",  "text": "the open gaze",     "breaks": ["gematria", "residue", "sequence"], "class": "substitution",  "verdict": "NEG" },
+      { "label": "transposition", "text": "the gate open",     "breaks": ["sequence"], "class": "transposition", "verdict": "NEG" },
+      { "label": "spacing",       "text": "the  open gate",    "breaks": ["spacing"], "class": "spacing", "verdict": "NEG" },
+      { "label": "structural",    "text": "the open red gate", "breaks": ["gematria", "residue", "sequence", "spacing", "structure"], "class": "structural", "verdict": "NEG" },
+      { "label": "intact",        "text": "the open gate",     "breaks": [], "class": "INTACT", "verdict": "POS" }
+    ]
+  }
+}
