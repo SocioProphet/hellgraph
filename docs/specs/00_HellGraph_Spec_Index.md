@@ -59,6 +59,13 @@ Freeze the canonical semantics, interfaces, projections, and pilot overlays befo
    - field-state / valuation and read semantics under eventual consistency
    - invariants and open questions (cut compaction, cross-cut composition, retraction)
 
+10. `10_Content_Data_Plane_v0_1.md`
+   - content/object plane as the same canonical+derived+policy spine (see ADR-0003)
+   - 7-layer seam map onto HellGraph + estate; content lifecycle state model
+   - policy plane (L5): engine, retention/legal-hold, audit=evidence spine
+   - masking as a HellGraph policy-graph; opt-in default-off vendor/connector egress
+   - L3⇄L5 coupling; key-management open decision
+
 ## Canonical Kernel Theorem
 
 One canonical core: immutable typed atoms plus versioned valuations.
