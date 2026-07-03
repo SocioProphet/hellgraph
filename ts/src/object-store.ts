@@ -44,15 +44,35 @@ export interface ObjectProvenance {
   cut?: CausalCut
 }
 
-// ─── Byte backend (BYOS-pluggable) ───────────────────────────────────────────────────
+// ─── Byte backend (BYOS-pluggable, async — production storage is remote) ──────────────
 export interface ObjectBackend {
-  put(hash: string, bytes: Buffer): void
-  get(hash: string): Buffer | undefined
+  put(hash: string, bytes: Buffer): Promise<void>
+  get(hash: string): Promise<Buffer | undefined>
 }
 export class InMemoryObjectBackend implements ObjectBackend {
   private readonly blobs = new Map<string, Buffer>()
-  put(hash: string, bytes: Buffer): void { this.blobs.set(hash, bytes) }
-  get(hash: string): Buffer | undefined { return this.blobs.get(hash) }
+  async put(hash: string, bytes: Buffer): Promise<void> { this.blobs.set(hash, bytes) }
+  async get(hash: string): Promise<Buffer | undefined> { return this.blobs.get(hash) }
+}
+
+/** Minimal S3-compatible client — inject the customer's SDK/endpoint (BYOS). An adapter over
+ *  @aws-sdk/client-s3, MinIO, or any S3-compatible edge store implements this. */
+export interface S3Client {
+  putObject(bucket: string, key: string, body: Buffer): Promise<void>
+  getObject(bucket: string, key: string): Promise<Buffer | undefined>
+}
+
+/**
+ * Content-addressed object storage on any S3-compatible endpoint (AWS / MinIO / edge). BYOS:
+ * the client is injected, so the customer's own bucket, credentials, and residency apply —
+ * the operator never holds the bytes. Keys are `<prefix><sha256>`, so storage is deduplicated
+ * and integrity is verifiable by key.
+ */
+export class S3ObjectBackend implements ObjectBackend {
+  constructor(private readonly client: S3Client, private readonly bucket: string, private readonly prefix = 'hg/') {}
+  private key(hash: string): string { return `${this.prefix}${hash}` }
+  async put(hash: string, bytes: Buffer): Promise<void> { await this.client.putObject(this.bucket, this.key(hash), bytes) }
+  async get(hash: string): Promise<Buffer | undefined> { return this.client.getObject(this.bucket, this.key(hash)) }
 }
 
 export interface IngestMeta {
@@ -68,10 +88,10 @@ export class CanonicalObjectStore {
   constructor(private readonly backend: ObjectBackend = new InMemoryObjectBackend()) {}
 
   /** Ingest content: store bytes content-addressed, codex-seal, catalog at state Normalized. */
-  ingest(id: string, content: string, meta: IngestMeta): CatalogEntry {
+  async ingest(id: string, content: string, meta: IngestMeta): Promise<CatalogEntry> {
     const bytes = Buffer.from(content, 'utf8')
     const contentHash = sha256(bytes)
-    this.backend.put(contentHash, bytes)
+    await this.backend.put(contentHash, bytes)
     const entry: CatalogEntry = {
       id,
       version: 1,
@@ -90,31 +110,31 @@ export class CanonicalObjectStore {
 
   entry(id: string): CatalogEntry | undefined { return this.catalog.get(id) }
 
-  get(id: string): { content: string; entry: CatalogEntry } | undefined {
+  async get(id: string): Promise<{ content: string; entry: CatalogEntry } | undefined> {
     const entry = this.catalog.get(id)
     if (!entry) return undefined
-    const bytes = this.backend.get(entry.contentHash)
+    const bytes = await this.backend.get(entry.contentHash)
     if (!bytes) return undefined
     return { content: bytes.toString('utf8'), entry }
   }
 
   /** Integrity check: recompute the codex manifest and diff against the sealed one. Defaults
    *  to the stored bytes (should be INTACT); pass `currentContent` to check external drift. */
-  verify(id: string, currentContent?: string): Syndrome {
+  async verify(id: string, currentContent?: string): Promise<Syndrome> {
     const entry = this.catalog.get(id)
     if (!entry) throw new Error(`object ${id} not in catalog`)
-    const content = currentContent ?? this.backend.get(entry.contentHash)?.toString('utf8')
+    const content = currentContent ?? (await this.backend.get(entry.contentHash))?.toString('utf8')
     if (content === undefined) throw new Error(`object ${id} bytes missing`)
     return syndrome(entry.codex, content)
   }
 
   /** Append a new immutable version: new bytes, new hash, new codex seal; version bumps. */
-  newVersion(id: string, content: string): CatalogEntry {
+  async newVersion(id: string, content: string): Promise<CatalogEntry> {
     const prev = this.catalog.get(id)
     if (!prev) throw new Error(`object ${id} not in catalog`)
     const bytes = Buffer.from(content, 'utf8')
     const contentHash = sha256(bytes)
-    this.backend.put(contentHash, bytes)
+    await this.backend.put(contentHash, bytes)
     const entry: CatalogEntry = {
       ...prev,
       version: prev.version + 1,
