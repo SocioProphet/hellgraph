@@ -14,7 +14,12 @@ pub struct FieldEvent {
 
 pub trait FieldOperatorSemantics {
     fn name(&self) -> &'static str;
-    fn apply(&self, pack: &FieldPack26, prior: &FieldState26, events: &[FieldEvent]) -> FieldState26;
+    fn apply(
+        &self,
+        pack: &FieldPack26,
+        prior: &FieldState26,
+        events: &[FieldEvent],
+    ) -> FieldState26;
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -25,7 +30,12 @@ impl FieldOperatorSemantics for ProvisionalOperatorSemantics {
         "provisional_mean_abs_operator"
     }
 
-    fn apply(&self, pack: &FieldPack26, prior: &FieldState26, events: &[FieldEvent]) -> FieldState26 {
+    fn apply(
+        &self,
+        pack: &FieldPack26,
+        prior: &FieldState26,
+        events: &[FieldEvent],
+    ) -> FieldState26 {
         let mut next = prior.clone();
         let mut deltas = vec![0.0_f64; pack.dims.len()];
         for event in events.iter() {
@@ -54,7 +64,11 @@ pub struct RuntimeCommitOutput {
     pub proof: ProofArtifact,
 }
 
-pub fn apply_events(pack: &FieldPack26, prior: &FieldState26, events: &[FieldEvent]) -> FieldState26 {
+pub fn apply_events(
+    pack: &FieldPack26,
+    prior: &FieldState26,
+    events: &[FieldEvent],
+) -> FieldState26 {
     ProvisionalOperatorSemantics.apply(pack, prior, events)
 }
 
@@ -73,7 +87,13 @@ pub fn run_cycle_and_commit_with<S: RuntimeStore, O: FieldOperatorSemantics>(
         .unwrap_or_else(FieldState26::zeroed);
 
     let next_state = operator.apply(pack, &prior, events);
-    let proof = check_bounded_state(subject_atom, prior_snapshot_txn, pack, &next_state, evidence_count);
+    let proof = check_bounded_state(
+        subject_atom,
+        prior_snapshot_txn,
+        pack,
+        &next_state,
+        evidence_count,
+    );
 
     let field_value = FieldValue {
         field_pack_name: format!("{}@{}", pack.name, operator.name()),
@@ -166,7 +186,12 @@ mod tests {
             "midpoint_operator"
         }
 
-        fn apply(&self, pack: &FieldPack26, _prior: &FieldState26, _events: &[FieldEvent]) -> FieldState26 {
+        fn apply(
+            &self,
+            pack: &FieldPack26,
+            _prior: &FieldState26,
+            _events: &[FieldEvent],
+        ) -> FieldState26 {
             let mut next = FieldState26::zeroed();
             for dim in pack.dims.iter() {
                 next.dims[dim.index] = (dim.lower + dim.upper) / 2.0;
@@ -204,17 +229,50 @@ mod tests {
             subject,
             created_txn,
             &[
-                FieldEvent { dim_index: 0, delta: 0.8 },
-                FieldEvent { dim_index: 10, delta: 0.75 },
-                FieldEvent { dim_index: 11, delta: 0.75 },
-                FieldEvent { dim_index: 12, delta: 0.70 },
-                FieldEvent { dim_index: 14, delta: 0.70 },
-                FieldEvent { dim_index: 16, delta: 0.70 },
-                FieldEvent { dim_index: 19, delta: 0.70 },
-                FieldEvent { dim_index: 20, delta: 0.90 },
-                FieldEvent { dim_index: 21, delta: 0.80 },
-                FieldEvent { dim_index: 22, delta: 0.70 },
-                FieldEvent { dim_index: 23, delta: 0.60 },
+                FieldEvent {
+                    dim_index: 0,
+                    delta: 0.8,
+                },
+                FieldEvent {
+                    dim_index: 10,
+                    delta: 0.75,
+                },
+                FieldEvent {
+                    dim_index: 11,
+                    delta: 0.75,
+                },
+                FieldEvent {
+                    dim_index: 12,
+                    delta: 0.70,
+                },
+                FieldEvent {
+                    dim_index: 14,
+                    delta: 0.70,
+                },
+                FieldEvent {
+                    dim_index: 16,
+                    delta: 0.70,
+                },
+                FieldEvent {
+                    dim_index: 19,
+                    delta: 0.70,
+                },
+                FieldEvent {
+                    dim_index: 20,
+                    delta: 0.90,
+                },
+                FieldEvent {
+                    dim_index: 21,
+                    delta: 0.80,
+                },
+                FieldEvent {
+                    dim_index: 22,
+                    delta: 0.70,
+                },
+                FieldEvent {
+                    dim_index: 23,
+                    delta: 0.60,
+                },
             ],
             3,
         )
@@ -225,7 +283,9 @@ mod tests {
         assert_eq!(field.state, output.next_state);
         assert_eq!(proof.verdict, output.proof.verdict);
         assert!(output.proof_artifact_ref.is_some());
-        assert!(store.read_artifact(output.proof_artifact_ref.unwrap()).is_some());
+        assert!(store
+            .read_artifact(output.proof_artifact_ref.unwrap())
+            .is_some());
     }
 
     #[test]
@@ -238,21 +298,66 @@ mod tests {
             subject,
             created_txn,
             &[
-                FieldEvent { dim_index: 0, delta: 0.9 },
-                FieldEvent { dim_index: 1, delta: 0.9 },
-                FieldEvent { dim_index: 3, delta: 0.9 },
-                FieldEvent { dim_index: 7, delta: 0.9 },
-                FieldEvent { dim_index: 9, delta: 0.9 },
-                FieldEvent { dim_index: 10, delta: 0.9 },
-                FieldEvent { dim_index: 11, delta: 0.9 },
-                FieldEvent { dim_index: 12, delta: 0.9 },
-                FieldEvent { dim_index: 14, delta: 0.9 },
-                FieldEvent { dim_index: 16, delta: 0.9 },
-                FieldEvent { dim_index: 19, delta: 0.9 },
-                FieldEvent { dim_index: 20, delta: 0.9 },
-                FieldEvent { dim_index: 21, delta: 0.9 },
-                FieldEvent { dim_index: 22, delta: 0.9 },
-                FieldEvent { dim_index: 23, delta: 0.9 },
+                FieldEvent {
+                    dim_index: 0,
+                    delta: 0.9,
+                },
+                FieldEvent {
+                    dim_index: 1,
+                    delta: 0.9,
+                },
+                FieldEvent {
+                    dim_index: 3,
+                    delta: 0.9,
+                },
+                FieldEvent {
+                    dim_index: 7,
+                    delta: 0.9,
+                },
+                FieldEvent {
+                    dim_index: 9,
+                    delta: 0.9,
+                },
+                FieldEvent {
+                    dim_index: 10,
+                    delta: 0.9,
+                },
+                FieldEvent {
+                    dim_index: 11,
+                    delta: 0.9,
+                },
+                FieldEvent {
+                    dim_index: 12,
+                    delta: 0.9,
+                },
+                FieldEvent {
+                    dim_index: 14,
+                    delta: 0.9,
+                },
+                FieldEvent {
+                    dim_index: 16,
+                    delta: 0.9,
+                },
+                FieldEvent {
+                    dim_index: 19,
+                    delta: 0.9,
+                },
+                FieldEvent {
+                    dim_index: 20,
+                    delta: 0.9,
+                },
+                FieldEvent {
+                    dim_index: 21,
+                    delta: 0.9,
+                },
+                FieldEvent {
+                    dim_index: 22,
+                    delta: 0.9,
+                },
+                FieldEvent {
+                    dim_index: 23,
+                    delta: 0.9,
+                },
             ],
             3,
         )
@@ -263,7 +368,10 @@ mod tests {
             &mut store,
             subject,
             snapshot,
-            &[FieldEvent { dim_index: 2, delta: 0.5 }],
+            &[FieldEvent {
+                dim_index: 2,
+                delta: 0.5,
+            }],
             3,
         )
         .unwrap();
@@ -304,29 +412,80 @@ mod tests {
             subject,
             created_txn,
             &[
-                FieldEvent { dim_index: 0, delta: 0.9 },
-                FieldEvent { dim_index: 1, delta: 0.9 },
-                FieldEvent { dim_index: 3, delta: 0.9 },
-                FieldEvent { dim_index: 7, delta: 0.9 },
-                FieldEvent { dim_index: 9, delta: 0.9 },
-                FieldEvent { dim_index: 10, delta: 0.9 },
-                FieldEvent { dim_index: 11, delta: 0.9 },
-                FieldEvent { dim_index: 12, delta: 0.9 },
-                FieldEvent { dim_index: 14, delta: 0.9 },
-                FieldEvent { dim_index: 16, delta: 0.9 },
-                FieldEvent { dim_index: 19, delta: 0.9 },
-                FieldEvent { dim_index: 20, delta: 0.9 },
-                FieldEvent { dim_index: 21, delta: 0.9 },
-                FieldEvent { dim_index: 22, delta: 0.9 },
-                FieldEvent { dim_index: 23, delta: 0.9 },
-                FieldEvent { dim_index: 25, delta: 0.9 },
+                FieldEvent {
+                    dim_index: 0,
+                    delta: 0.9,
+                },
+                FieldEvent {
+                    dim_index: 1,
+                    delta: 0.9,
+                },
+                FieldEvent {
+                    dim_index: 3,
+                    delta: 0.9,
+                },
+                FieldEvent {
+                    dim_index: 7,
+                    delta: 0.9,
+                },
+                FieldEvent {
+                    dim_index: 9,
+                    delta: 0.9,
+                },
+                FieldEvent {
+                    dim_index: 10,
+                    delta: 0.9,
+                },
+                FieldEvent {
+                    dim_index: 11,
+                    delta: 0.9,
+                },
+                FieldEvent {
+                    dim_index: 12,
+                    delta: 0.9,
+                },
+                FieldEvent {
+                    dim_index: 14,
+                    delta: 0.9,
+                },
+                FieldEvent {
+                    dim_index: 16,
+                    delta: 0.9,
+                },
+                FieldEvent {
+                    dim_index: 19,
+                    delta: 0.9,
+                },
+                FieldEvent {
+                    dim_index: 20,
+                    delta: 0.9,
+                },
+                FieldEvent {
+                    dim_index: 21,
+                    delta: 0.9,
+                },
+                FieldEvent {
+                    dim_index: 22,
+                    delta: 0.9,
+                },
+                FieldEvent {
+                    dim_index: 23,
+                    delta: 0.9,
+                },
+                FieldEvent {
+                    dim_index: 25,
+                    delta: 0.9,
+                },
             ],
             3,
         )
         .unwrap();
         store.checkpoint_and_compact().unwrap();
         let reopened = JournaledStore::open_or_replay(&journal).unwrap();
-        let proof = reopened.inner().read_proof_at(subject, out.commit_txn).unwrap();
+        let proof = reopened
+            .inner()
+            .read_proof_at(subject, out.commit_txn)
+            .unwrap();
         assert_eq!(proof.verdict, out.proof.verdict);
         std::fs::remove_file(&journal).ok();
         std::fs::remove_file(format!("{}.manifest", journal.to_string_lossy())).ok();

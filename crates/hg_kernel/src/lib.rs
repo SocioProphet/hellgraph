@@ -183,7 +183,10 @@ impl SpaceStore {
         }
         for artifact in &batch.artifacts {
             match artifact {
-                ArtifactDraft::Proof { subject_atom, record } => {
+                ArtifactDraft::Proof {
+                    subject_atom,
+                    record,
+                } => {
                     if !self.atoms.contains_key(subject_atom) {
                         return Err(format!("unknown artifact subject atom {}", subject_atom));
                     }
@@ -203,7 +206,10 @@ impl SpaceStore {
             self.next_artifact_seq += 1;
             let artifact_id = ((txn as u128) << 64) | ((ordinal as u128) + 1);
             let stored = match artifact {
-                ArtifactDraft::Proof { subject_atom, record } => {
+                ArtifactDraft::Proof {
+                    subject_atom,
+                    record,
+                } => {
                     proof_artifact_for_subject.insert(subject_atom, artifact_id);
                     StoredArtifact {
                         artifact_id,
@@ -415,7 +421,9 @@ impl JournaledStore {
     ) -> Result<(AtomId, TxnId), String> {
         let type_name = type_name.into();
         let members_clone = members.clone();
-        let (atom_id, txn) = self.inner.create_link(type_name.clone(), semantics, members)?;
+        let (atom_id, txn) = self
+            .inner
+            .create_link(type_name.clone(), semantics, members)?;
         self.append_frame(
             "ATOM",
             txn,
@@ -488,10 +496,17 @@ fn save_manifest(path: &Path, manifest: &JournalManifest) -> Result<(), String> 
     }
     let mut f = File::create(path).map_err(|e| e.to_string())?;
     writeln!(f, "{}", MANIFEST_HEADER).map_err(|e| e.to_string())?;
-    writeln!(f, "CHECKSUM_SCHEME\t{}", esc(&manifest.checksum_scheme)).map_err(|e| e.to_string())?;
-    writeln!(f, "CHECKPOINT_PATH\t{}", esc(manifest.checkpoint_path.as_deref().unwrap_or(""))).map_err(|e| e.to_string())?;
+    writeln!(f, "CHECKSUM_SCHEME\t{}", esc(&manifest.checksum_scheme))
+        .map_err(|e| e.to_string())?;
+    writeln!(
+        f,
+        "CHECKPOINT_PATH\t{}",
+        esc(manifest.checkpoint_path.as_deref().unwrap_or(""))
+    )
+    .map_err(|e| e.to_string())?;
     writeln!(f, "LAST_REPLAYED_TXN\t{}", manifest.last_replayed_txn).map_err(|e| e.to_string())?;
-    writeln!(f, "LAST_CHECKPOINT_TXN\t{}", manifest.last_checkpoint_txn).map_err(|e| e.to_string())?;
+    writeln!(f, "LAST_CHECKPOINT_TXN\t{}", manifest.last_checkpoint_txn)
+        .map_err(|e| e.to_string())?;
     writeln!(f, "LAST_FRAME_SEQ\t{}", manifest.last_frame_seq).map_err(|e| e.to_string())?;
     writeln!(f, "COMPACTED_FRAMES\t{}", manifest.compacted_frames).map_err(|e| e.to_string())?;
     f.flush().map_err(|e| e.to_string())?;
@@ -539,13 +554,23 @@ pub fn save_checkpoint(store: &SpaceStore, path: impl AsRef<Path>) -> Result<(),
     let mut f = File::create(path).map_err(|e| e.to_string())?;
     writeln!(f, "{}", CHECKPOINT_HEADER).map_err(|e| e.to_string())?;
     writeln!(f, "CHECKSUM_SCHEME\t{}", CHECKSUM_SCHEME).map_err(|e| e.to_string())?;
-    writeln!(f, "META\t{}\t{}\t{}", store.next_atom, store.next_txn, store.next_artifact_seq)
-        .map_err(|e| e.to_string())?;
+    writeln!(
+        f,
+        "META\t{}\t{}\t{}",
+        store.next_atom, store.next_txn, store.next_artifact_seq
+    )
+    .map_err(|e| e.to_string())?;
     for atom in store.atoms.values() {
         match atom {
             Atom::Node(n) => {
-                writeln!(f, "NODE\t{}\t{}\t{}", n.hdr.atom_id, n.hdr.created_txn, esc(&n.hdr.type_name))
-                    .map_err(|e| e.to_string())?;
+                writeln!(
+                    f,
+                    "NODE\t{}\t{}\t{}",
+                    n.hdr.atom_id,
+                    n.hdr.created_txn,
+                    esc(&n.hdr.type_name)
+                )
+                .map_err(|e| e.to_string())?;
             }
             Atom::Link(l) => {
                 writeln!(
@@ -616,7 +641,10 @@ pub fn replay_journal(path: impl AsRef<Path>) -> Result<SpaceStore, String> {
     Ok(store)
 }
 
-pub fn replay_journal_into(path: impl AsRef<Path>, store: &mut SpaceStore) -> Result<ReplayStats, String> {
+pub fn replay_journal_into(
+    path: impl AsRef<Path>,
+    store: &mut SpaceStore,
+) -> Result<ReplayStats, String> {
     let f = File::open(path).map_err(|e| e.to_string())?;
     let lines = BufReader::new(f)
         .lines()
@@ -645,7 +673,10 @@ pub fn replay_journal_into(path: impl AsRef<Path>, store: &mut SpaceStore) -> Re
             return Err(format!("unexpected journal record {}", parts[0]));
         }
         let seq = parse_u64(parts.get(1).copied())?;
-        let _kind = parts.get(2).copied().ok_or_else(|| "missing frame kind".to_string())?;
+        let _kind = parts
+            .get(2)
+            .copied()
+            .ok_or_else(|| "missing frame kind".to_string())?;
         let txn = parse_u64(parts.get(3).copied())?;
         let payload_count = parse_usize(parts.get(4).copied())?;
         let checksum = parse_u64(parts.get(5).copied())?;
@@ -692,9 +723,19 @@ pub fn frame_checksum(payloads: &[String]) -> u64 {
 fn restore_node_line(store: &mut SpaceStore, parts: &[&str]) -> Result<(), String> {
     let atom_id = parse_u128(parts.get(1).copied())?;
     let created_txn = parse_u64(parts.get(2).copied())?;
-    let type_name = unesc(parts.get(3).copied().ok_or_else(|| "missing node type".to_string())?)?;
+    let type_name = unesc(
+        parts
+            .get(3)
+            .copied()
+            .ok_or_else(|| "missing node type".to_string())?,
+    )?;
     let node = NodeAtom {
-        hdr: AtomHeader { atom_id, kind: AtomKind::Node, type_name, created_txn },
+        hdr: AtomHeader {
+            atom_id,
+            kind: AtomKind::Node,
+            type_name,
+            created_txn,
+        },
     };
     store.atoms.insert(atom_id, Atom::Node(node));
     store.next_atom = store.next_atom.max(atom_id);
@@ -705,11 +746,26 @@ fn restore_node_line(store: &mut SpaceStore, parts: &[&str]) -> Result<(), Strin
 fn restore_link_line(store: &mut SpaceStore, parts: &[&str]) -> Result<(), String> {
     let atom_id = parse_u128(parts.get(1).copied())?;
     let created_txn = parse_u64(parts.get(2).copied())?;
-    let type_name = unesc(parts.get(3).copied().ok_or_else(|| "missing link type".to_string())?)?;
-    let semantics = decode_link_semantics(parts.get(4).copied().ok_or_else(|| "missing link semantics".to_string())?)?;
+    let type_name = unesc(
+        parts
+            .get(3)
+            .copied()
+            .ok_or_else(|| "missing link type".to_string())?,
+    )?;
+    let semantics = decode_link_semantics(
+        parts
+            .get(4)
+            .copied()
+            .ok_or_else(|| "missing link semantics".to_string())?,
+    )?;
     let members = decode_members(parts.get(5).copied().unwrap_or(""))?;
     let link = LinkAtom {
-        hdr: AtomHeader { atom_id, kind: AtomKind::Link, type_name, created_txn },
+        hdr: AtomHeader {
+            atom_id,
+            kind: AtomKind::Link,
+            type_name,
+            created_txn,
+        },
         semantics,
         members,
     };
@@ -722,7 +778,10 @@ fn restore_link_line(store: &mut SpaceStore, parts: &[&str]) -> Result<(), Strin
 fn restore_artifact_line(store: &mut SpaceStore, parts: &[&str]) -> Result<(), String> {
     let artifact_id = parse_u128(parts.get(1).copied())?;
     let created_at_txn = parse_u64(parts.get(2).copied())?;
-    let kind = parts.get(3).copied().ok_or_else(|| "missing artifact kind".to_string())?;
+    let kind = parts
+        .get(3)
+        .copied()
+        .ok_or_else(|| "missing artifact kind".to_string())?;
     match kind {
         "PROOF" => {
             let record = decode_proof_artifact_record(&parts[4..])?;
@@ -749,8 +808,18 @@ fn restore_value_line(store: &mut SpaceStore, parts: &[&str]) -> Result<(), Stri
     let key = decode_value_key(parts.get(2).copied(), parts.get(3).copied())?;
     let committed_at_txn = parse_u64(parts.get(4).copied())?;
     let retired_at_txn = parse_opt_u64(parts.get(5).copied())?;
-    let epistemic_mode = decode_epistemic(parts.get(6).copied().ok_or_else(|| "missing epistemic mode".to_string())?)?;
-    let security = decode_security(parts.get(7).copied().ok_or_else(|| "missing security label".to_string())?)?;
+    let epistemic_mode = decode_epistemic(
+        parts
+            .get(6)
+            .copied()
+            .ok_or_else(|| "missing epistemic mode".to_string())?,
+    )?;
+    let security = decode_security(
+        parts
+            .get(7)
+            .copied()
+            .ok_or_else(|| "missing security label".to_string())?,
+    )?;
     let payload = decode_value_payload(&parts[8..])?;
     store.values.push(ValueEnvelope {
         subject_atom,
@@ -842,12 +911,22 @@ fn decode_proof_artifact_record(parts: &[&str]) -> Result<ProofArtifactRecord, S
     Ok(ProofArtifactRecord {
         subject_atom: parse_u128(parts.get(0).copied())?,
         snapshot_txn: parse_u64(parts.get(1).copied())?,
-        field_pack_name: unesc(parts.get(2).copied().ok_or_else(|| "missing field pack name".to_string())?)?,
+        field_pack_name: unesc(
+            parts
+                .get(2)
+                .copied()
+                .ok_or_else(|| "missing field pack name".to_string())?,
+        )?,
         field_pack_basis_version: parse_u32(parts.get(3).copied())?,
         basis_fingerprint_fnv1a64: parse_u64(parts.get(4).copied())?,
         assumptions_fingerprint_fnv1a64: parse_u64(parts.get(5).copied())?,
         evidence_basis_fingerprint_fnv1a64: parse_u64(parts.get(6).copied())?,
-        verdict: decode_proof_verdict(parts.get(7).copied().ok_or_else(|| "missing verdict".to_string())?)?,
+        verdict: decode_proof_verdict(
+            parts
+                .get(7)
+                .copied()
+                .ok_or_else(|| "missing verdict".to_string())?,
+        )?,
         evidence_count: parse_usize(parts.get(8).copied())?,
         epsilon_eff: parse_f64(parts.get(9).copied())?,
         max_violation_magnitude: parse_f64(parts.get(10).copied())?,
@@ -877,21 +956,35 @@ fn decode_value_key(kind: Option<&str>, arg: Option<&str>) -> Result<ValueKey, S
 }
 
 fn decode_value_payload(parts: &[&str]) -> Result<ValuePayload, String> {
-    match parts.get(0).copied().ok_or_else(|| "missing payload kind".to_string())? {
+    match parts
+        .get(0)
+        .copied()
+        .ok_or_else(|| "missing payload kind".to_string())?
+    {
         "FIELD" => {
             let state = hg_core::FieldState26 {
                 dims: decode_dims(parts.get(5).copied().unwrap_or(""))?,
                 epsilon_eff: parse_f64(parts.get(4).copied())?,
             };
             Ok(ValuePayload::Field(FieldValue {
-                field_pack_name: unesc(parts.get(1).copied().ok_or_else(|| "missing field pack name".to_string())?)?,
+                field_pack_name: unesc(
+                    parts
+                        .get(1)
+                        .copied()
+                        .ok_or_else(|| "missing field pack name".to_string())?,
+                )?,
                 basis_version: parse_u32(parts.get(2).copied())?,
                 basis_fingerprint_fnv1a64: parse_u64(parts.get(3).copied())?,
                 state,
             }))
         }
         "PROOF" => Ok(ValuePayload::Proof(ProofValue {
-            verdict: decode_proof_verdict(parts.get(1).copied().ok_or_else(|| "missing proof verdict".to_string())?)?,
+            verdict: decode_proof_verdict(
+                parts
+                    .get(1)
+                    .copied()
+                    .ok_or_else(|| "missing proof verdict".to_string())?,
+            )?,
             artifact_ref: parse_opt_u128(parts.get(2).copied())?,
             evidence_count: parse_usize(parts.get(3).copied())?,
             epsilon_eff: parse_f64(parts.get(4).copied())?,
@@ -944,7 +1037,11 @@ fn decode_members(s: &str) -> Result<Vec<RoleBinding>, String> {
     s.split(';')
         .map(|item| {
             let mut parts = item.splitn(3, ',');
-            let role_name = unesc(parts.next().ok_or_else(|| "missing member role".to_string())?)?;
+            let role_name = unesc(
+                parts
+                    .next()
+                    .ok_or_else(|| "missing member role".to_string())?,
+            )?;
             let target = parts
                 .next()
                 .ok_or_else(|| "missing member target".to_string())?
@@ -1084,7 +1181,9 @@ fn decode_link_semantics(s: &str) -> Result<LinkSemantics, String> {
 }
 
 fn esc(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('\t', "\\t").replace('\n', "\\n")
+    s.replace('\\', "\\\\")
+        .replace('\t', "\\t")
+        .replace('\n', "\\n")
 }
 
 fn unesc(s: &str) -> Result<String, String> {
@@ -1316,7 +1415,11 @@ mod tests {
 
         let reopened = JournaledStore::open_or_replay(&journal).unwrap();
         assert_eq!(
-            reopened.inner().read_field_at(subject, receipt.txn).unwrap().state,
+            reopened
+                .inner()
+                .read_field_at(subject, receipt.txn)
+                .unwrap()
+                .state,
             sample_field().state
         );
         std::fs::remove_file(&journal).ok();
@@ -1330,23 +1433,24 @@ mod tests {
         let mut store = SpaceStore::new();
         let (a, _) = store.create_node("Service");
         let (b, _) = store.create_node("Key");
-        store.create_link(
-            "Decrypt",
-            LinkSemantics::DirectedBinary,
-            vec![
-                RoleBinding {
-                    role_name: "caller".into(),
-                    target: a,
-                    ordinal: 0,
-                },
-                RoleBinding {
-                    role_name: "key".into(),
-                    target: b,
-                    ordinal: 1,
-                },
-            ],
-        )
-        .unwrap();
+        store
+            .create_link(
+                "Decrypt",
+                LinkSemantics::DirectedBinary,
+                vec![
+                    RoleBinding {
+                        role_name: "caller".into(),
+                        target: a,
+                        ordinal: 0,
+                    },
+                    RoleBinding {
+                        role_name: "key".into(),
+                        target: b,
+                        ordinal: 1,
+                    },
+                ],
+            )
+            .unwrap();
         save_checkpoint(&store, &ckpt).unwrap();
         let loaded = load_checkpoint(&ckpt).unwrap();
         assert!(loaded.atom(a).is_some());
