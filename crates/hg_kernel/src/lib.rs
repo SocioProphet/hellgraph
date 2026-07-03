@@ -316,8 +316,10 @@ impl JournaledStore {
             fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
         rewrite_journal_header(&journal_path)?;
-        let mut manifest = JournalManifest::default();
-        manifest.checkpoint_path = Some(checkpoint_path.to_string_lossy().to_string());
+        let manifest = JournalManifest {
+            checkpoint_path: Some(checkpoint_path.to_string_lossy().to_string()),
+            ..Default::default()
+        };
         save_manifest(&manifest_path, &manifest)?;
         Ok(Self {
             inner: SpaceStore::new(),
@@ -909,7 +911,7 @@ fn encode_proof_artifact_record(record: &ProofArtifactRecord) -> Vec<String> {
 
 fn decode_proof_artifact_record(parts: &[&str]) -> Result<ProofArtifactRecord, String> {
     Ok(ProofArtifactRecord {
-        subject_atom: parse_u128(parts.get(0).copied())?,
+        subject_atom: parse_u128(parts.first().copied())?,
         snapshot_txn: parse_u64(parts.get(1).copied())?,
         field_pack_name: unesc(
             parts
@@ -957,7 +959,7 @@ fn decode_value_key(kind: Option<&str>, arg: Option<&str>) -> Result<ValueKey, S
 
 fn decode_value_payload(parts: &[&str]) -> Result<ValuePayload, String> {
     match parts
-        .get(0)
+        .first()
         .copied()
         .ok_or_else(|| "missing payload kind".to_string())?
     {

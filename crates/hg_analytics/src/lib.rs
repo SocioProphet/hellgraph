@@ -378,8 +378,8 @@ mod tests {
         // star: center 0 connected to 1,2,3 → center on all 3 leaf-pairs, leaves 0.
         let bc = betweenness(4, &[(0, 1), (0, 2), (0, 3)]);
         assert!((bc[0] - 3.0).abs() < 1e-9, "center {}", bc[0]);
-        for i in 1..4 {
-            assert!(bc[i].abs() < 1e-9, "leaf {i} = {}", bc[i]);
+        for (i, &leaf) in bc.iter().enumerate().skip(1) {
+            assert!(leaf.abs() < 1e-9, "leaf {i} = {leaf}");
         }
     }
 

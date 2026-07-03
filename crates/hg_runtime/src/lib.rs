@@ -397,9 +397,8 @@ mod tests {
         .unwrap();
         assert_eq!(out.proof.verdict, ProofVerdict::Proved);
         let field = store.read_field_at(subject, out.commit_txn).unwrap();
-        match &field.state {
-            state => assert!(state.epsilon_eff <= pack.epsilon_limit),
-        }
+        let state = &field.state;
+        assert!(state.epsilon_eff <= pack.epsilon_limit);
     }
 
     #[test]
