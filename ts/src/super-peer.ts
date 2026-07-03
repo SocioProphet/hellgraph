@@ -1,0 +1,207 @@
+/**
+ * SuperPeer — the deployable "managed HellGraph" service (docs/specs/08).
+ *
+ * A super-peer is NOT a central authority. It is just a peer with more uptime and an
+ * index: it joins a federation, replicates the participants' sovereign logs, keeps an
+ * always-on Autobase materialization of the shared view, and serves reads + governance
+ * over HTTP. Every atom it serves traces to a participant signature; it cannot forge or
+ * rewrite, and the whole view is rebuildable from the participant logs alone.
+ *
+ * Responsibilities (spec 08 §"Super-peer"):
+ *   - discovery/relay      → Hyperswarm on the federation topic (optional; joinSwarm)
+ *   - always-on indexer    → FederatedAtomSpace materialization, cached on view growth
+ *   - query endpoint       → SPARQL / Gremlin over the materialized view
+ *   - sovereign admission  → signed addWriter control ops (POST /admit)
+ *
+ * Networking is deliberately separable: the indexer + query + admit logic works over any
+ * replication transport (direct streams in tests; Hyperswarm in production), so the
+ * service is fully testable without a live DHT.
+ */
+
+import * as http from 'node:http'
+import type { AddressInfo } from 'node:net'
+import { FederatedAtomSpace, type FederatedOptions } from './autobase-view.js'
+import { HellGraphStore } from './store.js'
+import { runSparql } from './sparql.js'
+import { runGremlin } from './gremlin.js'
+import type { CausalCut } from './causal-proof.js'
+
+async function loadDep<T>(name: string): Promise<T | null> {
+  try {
+    const mod = (await import(name)) as unknown as T | { default: T }
+    return typeof mod === 'function' ? (mod as T) : (mod as { default: T }).default
+  } catch {
+    return null
+  }
+}
+
+interface SwarmConnection { /* Duplex stream */ }
+interface SwarmDiscovery { flushed(): Promise<void> }
+interface SwarmInstance {
+  on(event: 'connection', cb: (conn: SwarmConnection) => void): void
+  join(topic: Uint8Array, opts?: { server?: boolean; client?: boolean }): SwarmDiscovery
+  destroy(): Promise<void>
+}
+type SwarmCtor = new () => SwarmInstance
+
+export type QueryLang = 'sparql' | 'gremlin'
+
+export interface SuperPeerHealth {
+  ok: true
+  baseKey: string
+  nodes: number
+  edges: number
+  writers: number
+  cut: CausalCut
+}
+
+export class SuperPeer {
+  private server: http.Server | null = null
+  private swarm: SwarmInstance | null = null
+  // Materialization cache: re-materialize only when the linearization grows.
+  private cachedStore: HellGraphStore | null = null
+  private cachedLen = -1
+
+  private constructor(private readonly fed: FederatedAtomSpace) {}
+
+  /** Open (or join) a federation as a super-peer index. */
+  static async create(storageDir: string, opts: FederatedOptions = {}): Promise<SuperPeer> {
+    const fed = await FederatedAtomSpace.create(storageDir, opts)
+    return new SuperPeer(fed)
+  }
+
+  /** The federation identity participants bootstrap from. */
+  baseKey(): string { return this.fed.baseKey() }
+  /** This super-peer's own writer key (for admission by another indexer, if federated). */
+  writerKey(): string { return this.fed.localWriterKey() }
+
+  // ─── Indexing ────────────────────────────────────────────────────────────────
+
+  /** The current materialized view, re-derived only when new ops have linearized. */
+  async store(): Promise<HellGraphStore> {
+    const len = (await this.fed.linearization()).length
+    if (!this.cachedStore || len !== this.cachedLen) {
+      this.cachedStore = await this.fed.materializeStore()
+      this.cachedLen = len
+    }
+    return this.cachedStore
+  }
+
+  async currentCut(): Promise<CausalCut> { return this.fed.currentCut() }
+
+  /** Run a read query over the materialized view. */
+  async query(lang: QueryLang, q: string): Promise<unknown> {
+    const store = await this.store()
+    return lang === 'sparql' ? runSparql(store, q) : runGremlin(store, q)
+  }
+
+  /** Admit a sovereign participant (signed addWriter control op). */
+  async admit(writerKeyHex: string): Promise<void> { await this.fed.admitWriter(writerKeyHex) }
+
+  async health(): Promise<SuperPeerHealth> {
+    const store = await this.store()
+    const cut = await this.fed.currentCut()
+    return {
+      ok: true,
+      baseKey: this.baseKey(),
+      nodes: store.allNodes().length,
+      edges: store.allEdges().length,
+      writers: Object.keys(cut).length,
+      cut,
+    }
+  }
+
+  // ─── Replication transports ────────────────────────────────────────────────────
+
+  /** Direct replication (tests / manual peering). Pass true on the initiating side. */
+  replicate(isInitiator: boolean): unknown { return this.fed.replicate(isInitiator) }
+
+  /**
+   * Join the federation swarm for discovery-driven peering (production). The topic is the
+   * 32-byte base key, so anyone with the base key discovers this super-peer and replicates
+   * their sovereign log to it. Optional dependency — throws if hyperswarm is unavailable.
+   */
+  async joinSwarm(): Promise<void> {
+    const Hyperswarm = await loadDep<SwarmCtor>('hyperswarm')
+    if (!Hyperswarm) throw new Error('hyperswarm not available (optional dependency not installed)')
+    const swarm = new Hyperswarm()
+    swarm.on('connection', (conn) => { this.fed.replicateThrough(conn) })
+    const topic = Buffer.from(this.baseKey(), 'hex') // 32-byte federation topic
+    const discovery = swarm.join(topic, { server: true, client: true })
+    await discovery.flushed()
+    this.swarm = swarm
+  }
+
+  // ─── HTTP endpoint ─────────────────────────────────────────────────────────────
+
+  /**
+   * Start the HTTP query/governance endpoint. Routes:
+   *   GET  /health          → SuperPeerHealth
+   *   GET  /cut             → current causal cut
+   *   POST /query {lang,query} → SPARQL/Gremlin results over the materialized view
+   *   POST /admit {writerKey}  → admit a sovereign participant
+   * Returns the bound port (pass 0 for an ephemeral port).
+   */
+  async listen(port = 0): Promise<number> {
+    const server = http.createServer((req, res) => { void this.handle(req, res) })
+    await new Promise<void>((resolve) => server.listen(port, resolve))
+    this.server = server
+    return (server.address() as AddressInfo).port
+  }
+
+  private async handle(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+    const send = (code: number, body: unknown): void => {
+      res.writeHead(code, { 'content-type': 'application/json' })
+      res.end(JSON.stringify(body))
+    }
+    try {
+      const url = new URL(req.url ?? '/', 'http://localhost')
+      if (req.method === 'GET' && url.pathname === '/health') return send(200, await this.health())
+      if (req.method === 'GET' && url.pathname === '/cut') return send(200, await this.currentCut())
+
+      if (req.method === 'POST' && url.pathname === '/query') {
+        const body = await readJson(req)
+        const lang = body['lang']
+        const q = body['query']
+        if ((lang !== 'sparql' && lang !== 'gremlin') || typeof q !== 'string') {
+          return send(400, { error: "body must be { lang: 'sparql'|'gremlin', query: string }" })
+        }
+        return send(200, { results: await this.query(lang, q) })
+      }
+
+      if (req.method === 'POST' && url.pathname === '/admit') {
+        const body = await readJson(req)
+        const writerKey = body['writerKey']
+        if (typeof writerKey !== 'string' || !/^[0-9a-f]{64}$/.test(writerKey)) {
+          return send(400, { error: 'body must be { writerKey: <64-hex> }' })
+        }
+        await this.admit(writerKey)
+        return send(200, { admitted: writerKey })
+      }
+      send(404, { error: 'not found' })
+    } catch (err) {
+      send(500, { error: err instanceof Error ? err.message : String(err) })
+    }
+  }
+
+  async close(): Promise<void> {
+    if (this.server) {
+      const server = this.server
+      // close() alone leaves keep-alive sockets open (the event loop never drains);
+      // drop live connections too.
+      server.closeAllConnections?.()
+      await new Promise<void>((resolve) => server.close(() => resolve()))
+    }
+    if (this.swarm) await this.swarm.destroy()
+    await this.fed.close()
+  }
+}
+
+function readJson(req: http.IncomingMessage): Promise<Record<string, unknown>> {
+  return new Promise((resolve, reject) => {
+    let raw = ''
+    req.on('data', (c) => { raw += c; if (raw.length > 1_000_000) reject(new Error('body too large')) })
+    req.on('end', () => { try { resolve(raw ? JSON.parse(raw) : {}) } catch { reject(new Error('invalid JSON')) } })
+    req.on('error', reject)
+  })
+}

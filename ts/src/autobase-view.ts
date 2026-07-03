@@ -65,7 +65,7 @@ type AutobaseHandlers = {
   apply(nodes: Array<{ value: unknown }>, view: ViewLog, host: AutobaseHost): Promise<void>
 }
 type AutobaseCtor = new (store: unknown, bootstrap: Uint8Array | null, handlers: AutobaseHandlers) => AutobaseInstance
-interface CorestoreInstance { replicate(isInitiator: boolean): unknown; close(): Promise<void> }
+interface CorestoreInstance { replicate(initiatorOrStream: boolean | unknown): unknown; close(): Promise<void> }
 type CorestoreCtor = new (storage: string) => CorestoreInstance
 
 async function loadDep<T>(name: string): Promise<T | null> {
@@ -193,6 +193,10 @@ export class FederatedAtomSpace {
    * streams together (`s1.pipe(s2).pipe(s1)`). Pass true on the initiating side.
    */
   replicate(isInitiator: boolean): unknown { return this.corestore.replicate(isInitiator) }
+
+  /** Replicate over an already-established transport stream (e.g. a Hyperswarm
+   *  connection). Used by the super-peer for discovery-driven peering. */
+  replicateThrough(stream: unknown): unknown { return this.corestore.replicate(stream) }
 
   /**
    * Materialize the merged view into a fresh AtomSpace by replaying the causally-ordered
