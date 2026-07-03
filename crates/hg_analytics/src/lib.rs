@@ -10,19 +10,50 @@ use hg_core::AtomId;
 use std::collections::HashMap;
 
 /// Cold PageRank over a 0..n indexed graph. Dangling nodes (no out-edges) redistribute their mass uniformly.
-pub fn pagerank(n: usize, edges: &[(usize, usize)], damping: f64, max_iters: usize, tol: f64) -> Vec<f64> {
-    pagerank_from(n, edges, damping, max_iters, tol, &vec![1.0 / n.max(1) as f64; n])
+pub fn pagerank(
+    n: usize,
+    edges: &[(usize, usize)],
+    damping: f64,
+    max_iters: usize,
+    tol: f64,
+) -> Vec<f64> {
+    pagerank_from(
+        n,
+        edges,
+        damping,
+        max_iters,
+        tol,
+        &vec![1.0 / n.max(1) as f64; n],
+    )
 }
 
 /// Warm-start PageRank: begin from `prior` instead of 1/n. After a small graph delta this converges in a handful
 /// of iterations to the SAME fixed point as a cold run (proven in tests) — the incremental hook for the refresh
 /// framework. If `prior.len() != n` (the graph grew/shrank), fall back to the uniform baseline for the new size.
-pub fn pagerank_warm(n: usize, edges: &[(usize, usize)], damping: f64, max_iters: usize, tol: f64, prior: &[f64]) -> Vec<f64> {
-    let seed = if prior.len() == n { prior.to_vec() } else { vec![1.0 / n.max(1) as f64; n] };
+pub fn pagerank_warm(
+    n: usize,
+    edges: &[(usize, usize)],
+    damping: f64,
+    max_iters: usize,
+    tol: f64,
+    prior: &[f64],
+) -> Vec<f64> {
+    let seed = if prior.len() == n {
+        prior.to_vec()
+    } else {
+        vec![1.0 / n.max(1) as f64; n]
+    };
     pagerank_from(n, edges, damping, max_iters, tol, &seed)
 }
 
-fn pagerank_from(n: usize, edges: &[(usize, usize)], damping: f64, max_iters: usize, tol: f64, seed: &[f64]) -> Vec<f64> {
+fn pagerank_from(
+    n: usize,
+    edges: &[(usize, usize)],
+    damping: f64,
+    max_iters: usize,
+    tol: f64,
+    seed: &[f64],
+) -> Vec<f64> {
     if n == 0 {
         return Vec::new();
     }
@@ -209,7 +240,9 @@ pub fn louvain(n: usize, edges: &[(usize, usize)]) -> Vec<usize> {
 /// One level of Louvain local-moving. Returns (community per node, whether any node moved).
 fn local_moving(adj: &[HashMap<usize, f64>], self_loop: &[f64]) -> (Vec<usize>, bool) {
     let n = adj.len();
-    let deg: Vec<f64> = (0..n).map(|i| adj[i].values().sum::<f64>() + self_loop[i]).collect();
+    let deg: Vec<f64> = (0..n)
+        .map(|i| adj[i].values().sum::<f64>() + self_loop[i])
+        .collect();
     let m2: f64 = deg.iter().sum::<f64>(); // 2m
     if m2 == 0.0 {
         return ((0..n).collect(), false);
@@ -264,13 +297,20 @@ mod tests {
         for x in &pr {
             assert!((x - 1.0 / 3.0).abs() < 1e-6, "got {x}");
         }
-        assert!((pr.iter().sum::<f64>() - 1.0).abs() < 1e-6, "mass conserved");
+        assert!(
+            (pr.iter().sum::<f64>() - 1.0).abs() < 1e-6,
+            "mass conserved"
+        );
     }
 
     #[test]
     fn deterministic_same_input_same_output() {
         let g = [(0, 1), (0, 2), (1, 2), (2, 0), (3, 2)];
-        assert_eq!(pagerank(4, &g, D, IT, TOL), pagerank(4, &g, D, IT, TOL), "bit-identical across runs");
+        assert_eq!(
+            pagerank(4, &g, D, IT, TOL),
+            pagerank(4, &g, D, IT, TOL),
+            "bit-identical across runs"
+        );
     }
 
     #[test]
@@ -281,19 +321,31 @@ mod tests {
         let cold = pagerank(4, &g, D, IT, TOL);
         let warm_from_cold = pagerank_warm(4, &g, D, IT, TOL, &cold);
         for i in 0..4 {
-            assert!((cold[i] - warm_from_cold[i]).abs() < 1e-9, "warm-from-converged must equal converged");
+            assert!(
+                (cold[i] - warm_from_cold[i]).abs() < 1e-9,
+                "warm-from-converged must equal converged"
+            );
         }
         let perturbed = vec![0.9, 0.03, 0.04, 0.03];
         let warm = pagerank_warm(4, &g, D, IT, TOL, &perturbed);
         for i in 0..4 {
-            assert!((cold[i] - warm[i]).abs() < 1e-6, "warm converges to cold at {i}: {} vs {}", cold[i], warm[i]);
+            assert!(
+                (cold[i] - warm[i]).abs() < 1e-6,
+                "warm converges to cold at {i}: {} vs {}",
+                cold[i],
+                warm[i]
+            );
         }
     }
 
     #[test]
     fn dangling_node_conserves_mass() {
         let pr = pagerank(3, &[(0, 1), (1, 2)], D, IT, TOL); // node 2 has no out-edges
-        assert!((pr.iter().sum::<f64>() - 1.0).abs() < 1e-6, "mass conserved with dangling: {}", pr.iter().sum::<f64>());
+        assert!(
+            (pr.iter().sum::<f64>() - 1.0).abs() < 1e-6,
+            "mass conserved with dangling: {}",
+            pr.iter().sum::<f64>()
+        );
     }
 
     #[test]
@@ -312,7 +364,12 @@ mod tests {
         let bc = betweenness(5, &[(0, 1), (1, 2), (2, 3), (3, 4)]);
         let expect = [0.0, 3.0, 4.0, 3.0, 0.0];
         for i in 0..5 {
-            assert!((bc[i] - expect[i]).abs() < 1e-9, "bc[{i}]={} expected {}", bc[i], expect[i]);
+            assert!(
+                (bc[i] - expect[i]).abs() < 1e-9,
+                "bc[{i}]={} expected {}",
+                bc[i],
+                expect[i]
+            );
         }
     }
 
@@ -321,8 +378,8 @@ mod tests {
         // star: center 0 connected to 1,2,3 → center on all 3 leaf-pairs, leaves 0.
         let bc = betweenness(4, &[(0, 1), (0, 2), (0, 3)]);
         assert!((bc[0] - 3.0).abs() < 1e-9, "center {}", bc[0]);
-        for i in 1..4 {
-            assert!(bc[i].abs() < 1e-9, "leaf {i} = {}", bc[i]);
+        for (i, &leaf) in bc.iter().enumerate().skip(1) {
+            assert!(leaf.abs() < 1e-9, "leaf {i} = {leaf}");
         }
     }
 
@@ -331,22 +388,42 @@ mod tests {
         // two triangles {0,1,2} {3,4,5} joined by a single bridge edge 2-3 → exactly two communities.
         let g = [(0, 1), (1, 2), (0, 2), (3, 4), (4, 5), (3, 5), (2, 3)];
         let c = louvain(6, &g);
-        let ncomm = c.iter().copied().collect::<std::collections::HashSet<_>>().len();
+        let ncomm = c
+            .iter()
+            .copied()
+            .collect::<std::collections::HashSet<_>>()
+            .len();
         assert_eq!(ncomm, 2, "two communities, got {ncomm}: {c:?}");
-        assert!(c[0] == c[1] && c[1] == c[2], "first triangle together: {c:?}");
-        assert!(c[3] == c[4] && c[4] == c[5], "second triangle together: {c:?}");
+        assert!(
+            c[0] == c[1] && c[1] == c[2],
+            "first triangle together: {c:?}"
+        );
+        assert!(
+            c[3] == c[4] && c[4] == c[5],
+            "second triangle together: {c:?}"
+        );
         assert_ne!(c[0], c[3], "the two triangles are distinct communities");
     }
 
     #[test]
     fn louvain_single_clique_is_one_community() {
         let c = louvain(3, &[(0, 1), (1, 2), (0, 2)]);
-        assert!(c[0] == c[1] && c[1] == c[2], "clique is one community: {c:?}");
+        assert!(
+            c[0] == c[1] && c[1] == c[2],
+            "clique is one community: {c:?}"
+        );
     }
 
     #[test]
     fn louvain_isolated_nodes_are_separate() {
         let c = louvain(3, &[]);
-        assert_eq!(c.iter().copied().collect::<std::collections::HashSet<_>>().len(), 3, "{c:?}");
+        assert_eq!(
+            c.iter()
+                .copied()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            3,
+            "{c:?}"
+        );
     }
 }

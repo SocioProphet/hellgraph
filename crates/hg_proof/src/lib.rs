@@ -143,38 +143,35 @@ pub fn check_bounded_state(
         .map(|v| v.magnitude)
         .fold(epsilon_violation, f64::max);
 
-    let (verdict, insufficiency_reason, witness_summary, counterexample_summary) = if evidence_count < 1 {
-        (
-            ProofVerdict::Inconclusive,
-            Some("no_evidence"),
-            None,
-            None,
-        )
-    } else if !violated.is_empty() || epsilon_violation > 0.0 {
-        (
-            ProofVerdict::Violated,
-            None,
-            None,
-            Some(format!(
-                "violations={} epsilon_excess={:.17}",
-                violated.len(), epsilon_violation
-            )),
-        )
-    } else if evidence_count < 3 {
-        (
-            ProofVerdict::Inconclusive,
-            Some("insufficient_positive_evidence"),
-            None,
-            None,
-        )
-    } else {
-        (
-            ProofVerdict::Proved,
-            None,
-            Some("all_dimensions_within_declared_bounds"),
-            None,
-        )
-    };
+    let (verdict, insufficiency_reason, witness_summary, counterexample_summary) =
+        if evidence_count < 1 {
+            (ProofVerdict::Inconclusive, Some("no_evidence"), None, None)
+        } else if !violated.is_empty() || epsilon_violation > 0.0 {
+            (
+                ProofVerdict::Violated,
+                None,
+                None,
+                Some(format!(
+                    "violations={} epsilon_excess={:.17}",
+                    violated.len(),
+                    epsilon_violation
+                )),
+            )
+        } else if evidence_count < 3 {
+            (
+                ProofVerdict::Inconclusive,
+                Some("insufficient_positive_evidence"),
+                None,
+                None,
+            )
+        } else {
+            (
+                ProofVerdict::Proved,
+                None,
+                Some("all_dimensions_within_declared_bounds"),
+                None,
+            )
+        };
 
     ProofArtifact {
         subject_atom,
