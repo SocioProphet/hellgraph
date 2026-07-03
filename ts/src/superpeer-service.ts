@@ -15,12 +15,15 @@
  *   HELLGRAPH_JOIN_SWARM     "0" to skip Hyperswarm (e.g. direct-replication/tests)
  */
 import { SuperPeer } from './super-peer.js'
+import { HmacTokenVerifier } from './auth.js'
 
 export interface SuperPeerServiceEnv {
   HELLGRAPH_STORAGE_DIR?: string
   HELLGRAPH_BOOTSTRAP_KEY?: string
   HELLGRAPH_HTTP_PORT?: string
   HELLGRAPH_JOIN_SWARM?: string
+  /** HMAC secret for bearer-token auth. Omit → endpoints run OPEN (dev only). */
+  HELLGRAPH_AUTH_SECRET?: string
 }
 
 export interface RunningSuperPeer {
@@ -35,7 +38,11 @@ export async function startSuperPeerFromEnv(env: SuperPeerServiceEnv = process.e
   const bootstrap = env.HELLGRAPH_BOOTSTRAP_KEY?.trim() || undefined
   const port = Number(env.HELLGRAPH_HTTP_PORT ?? '8850')
 
-  const superPeer = await SuperPeer.create(dir, bootstrap ? { bootstrap } : {})
+  const secret = env.HELLGRAPH_AUTH_SECRET?.trim()
+  if (!secret) console.warn('[superpeer] HELLGRAPH_AUTH_SECRET unset — endpoints are OPEN (dev only)')
+  const auth = secret ? HmacTokenVerifier.fromSecret(secret) : undefined
+
+  const superPeer = await SuperPeer.create(dir, { ...(bootstrap ? { bootstrap } : {}), ...(auth ? { auth } : {}) })
 
   if (env.HELLGRAPH_JOIN_SWARM !== '0') {
     try {

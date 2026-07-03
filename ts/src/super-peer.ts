@@ -25,6 +25,23 @@ import { HellGraphStore } from './store.js'
 import { runSparql } from './sparql.js'
 import { runGremlin } from './gremlin.js'
 import type { CausalCut } from './causal-proof.js'
+import { bearer, hasScope, type Scope, type TokenVerifier } from './auth.js'
+import type { AuditSink } from './policy.js'
+
+/** Per-route scope requirement (enforced only when an auth verifier is configured). */
+const ROUTE_SCOPE: Record<string, Scope> = {
+  'GET /health': 'read',
+  'GET /cut': 'read',
+  'POST /query': 'query',
+  'POST /admit': 'admit',
+}
+
+export interface SuperPeerOptions extends FederatedOptions {
+  /** Bearer-token verifier. If omitted, endpoints run OPEN (dev mode); production MUST set it. */
+  auth?: TokenVerifier
+  /** Append-only audit sink for auth denials (binds to the evidence spine in prod). */
+  audit?: AuditSink
+}
 
 async function loadDep<T>(name: string): Promise<T | null> {
   try {
@@ -62,13 +79,20 @@ export class SuperPeer {
   private cachedStore: HellGraphStore | null = null
   private cachedLen = -1
 
-  private constructor(private readonly fed: FederatedAtomSpace) {}
+  private constructor(
+    private readonly fed: FederatedAtomSpace,
+    private readonly auth: TokenVerifier | null = null,
+    private readonly audit: AuditSink | null = null,
+  ) {}
 
   /** Open (or join) a federation as a super-peer index. */
-  static async create(storageDir: string, opts: FederatedOptions = {}): Promise<SuperPeer> {
+  static async create(storageDir: string, opts: SuperPeerOptions = {}): Promise<SuperPeer> {
     const fed = await FederatedAtomSpace.create(storageDir, opts)
-    return new SuperPeer(fed)
+    return new SuperPeer(fed, opts.auth ?? null, opts.audit ?? null)
   }
+
+  /** True if this super-peer enforces authentication. */
+  get authEnforced(): boolean { return this.auth !== null }
 
   /** The federation identity participants bootstrap from. */
   baseKey(): string { return this.fed.baseKey() }
@@ -156,6 +180,24 @@ export class SuperPeer {
     }
     try {
       const url = new URL(req.url ?? '/', 'http://localhost')
+
+      // AuthN/Z gate — enforced only when a verifier is configured (production).
+      const scope = ROUTE_SCOPE[`${req.method} ${url.pathname}`]
+      if (scope && this.auth) {
+        const principal = ((): ReturnType<TokenVerifier['verify']> => {
+          const token = bearer(req.headers.authorization)
+          return token ? this.auth!.verify(token) : null
+        })()
+        if (!principal) {
+          this.audit?.append({ ts: Date.now(), kind: 'blocked', objectId: url.pathname, reason: 'unauthenticated' })
+          return send(401, { error: 'unauthenticated' })
+        }
+        if (!hasScope(principal, scope)) {
+          this.audit?.append({ ts: Date.now(), kind: 'blocked', objectId: url.pathname, reason: `forbidden:${scope}` })
+          return send(403, { error: `missing scope: ${scope}` })
+        }
+      }
+
       if (req.method === 'GET' && url.pathname === '/health') return send(200, await this.health())
       if (req.method === 'GET' && url.pathname === '/cut') return send(200, await this.currentCut())
 
