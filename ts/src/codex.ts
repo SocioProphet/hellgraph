@@ -15,6 +15,12 @@
  * CONFORMANCE: this is a byte-for-byte port of the reference oracle `gkg_codex.py`. It MUST
  * reproduce the frozen reference vectors (codex-vectors.json) exactly; that fixture is the
  * cross-implementation parity contract (cf. the TriTRPC byte-parity discipline). Latin v0.
+ *
+ * TriTRPC BINDING (docs/specs/12): GKG-CODEX rides as a Path-B-family CTRL243 profile, never
+ * Path-A; status is TWO axes — verdict (State243.epistemic) + evidence (CTRL243.evidence), no
+ * third vocabulary; residue moduli/topic23 must derive from the frozen topic23.v1. Ternary is
+ * unbalanced {0,1,2} in v0. Fixture-freeze (G4) is BLOCKED upstream on CTRL243 profile
+ * allocation + topic23.v1 ownership — this module stays Reference-only until then.
  */
 
 import { createHash } from 'node:crypto'
@@ -108,8 +114,32 @@ export function manifest(text: string, division?: number): Manifest {
 
 // ─── Syndrome + decoder ─────────────────────────────────────────────────────────────
 export type ChangeClass = 'INTACT' | Transform | 'compound/unknown'
+/** Verdict — the State243.epistemic axis (TriTRPC reconciliation §16.4): WHAT the outcome is. */
 export type Verdict = 'POS' | 'ZERO' | 'NEG'
-export interface Syndrome { breaks: string[]; intact: string[]; class: ChangeClass; verdict: Verdict }
+/**
+ * Evidence tier — the CTRL243.evidence axis (§16.4): HOW the manifest/syndrome was computed.
+ * This is a SEPARATE axis from the verdict; GKG-CODEX MUST NOT introduce a third status
+ * vocabulary. T1 deterministic formal facet → exact; T2 empirical (SCT) → sampled; ρ
+ * cross-transform validated → verified.
+ */
+export type EvidenceTier = 'exact' | 'sampled' | 'verified'
+export interface Syndrome { breaks: string[]; intact: string[]; class: ChangeClass; verdict: Verdict; evidence: EvidenceTier }
+
+// Per-facet evidence tier. v0 formal facets are all T1 deterministic → 'exact'; empirical
+// (sct) and ρ cross-transform facets shift this when added.
+const FACET_EVIDENCE: Record<string, EvidenceTier> = {
+  gematria: 'exact', sequence: 'exact', spacing: 'exact', structure: 'exact', residue: 'exact',
+}
+const TIER_RANK: Record<EvidenceTier, number> = { exact: 0, verified: 1, sampled: 2 }
+/** The weakest evidence tier among the involved facets (exact strongest). */
+export function evidenceTierOf(facets: Iterable<string>): EvidenceTier {
+  let tier: EvidenceTier = 'exact'
+  for (const f of facets) {
+    const t = FACET_EVIDENCE[f] ?? 'sampled'
+    if (TIER_RANK[t] > TIER_RANK[tier]) tier = t
+  }
+  return tier
+}
 
 // Canonical minimal syndromes → class (sorted-break key → class). Freezing this table
 // freezes the semantics.
@@ -162,7 +192,7 @@ export function syndrome(base: Manifest, currentText: string): Syndrome {
   }
   const cls = classify(breaks)
   const intact = FACET_ORDER.filter((k) => !breaks.has(k))
-  return { breaks: [...breaks].sort(), intact, class: cls, verdict: verdictOf(cls) }
+  return { breaks: [...breaks].sort(), intact, class: cls, verdict: verdictOf(cls), evidence: evidenceTierOf(FACET_ORDER) }
 }
 
 // ─── Extension facets (declared, not implemented — registry contract, §7.2) ─────────
@@ -173,6 +203,9 @@ export const phiAbjad = notImpl('abjad (Arabic value table)')
 export const phiIsopsephy = notImpl('isopsephy (Greek Milesian table)')
 export const phiCjkIds = notImpl('cjk_ids (IDS decomposition → graph)')
 export const phiSctTopology = notImpl('sct_topology (render-dependent, empirical)')
+// atbash = reflection permutation (§7.2). Balanced-ternary-native negation would give it a
+// hardware representation IF Path-B ever goes balanced (§16.6) — v0 assumes unbalanced {0,1,2}.
+export const phiAtbash = notImpl('atbash (reflection permutation)')
 
 // ─── AtomSpace integration — default-on passive seal ────────────────────────────────
 

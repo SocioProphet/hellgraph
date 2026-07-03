@@ -71,6 +71,12 @@ Freeze the canonical semantics, interfaces, projections, and pilot overlays befo
      Rust convergence/kernel surface), not a Rust-only kernel scaffold
    - upstream-state + convergence spec (renumbered from a colliding `08` on merge)
 
+12. `12_Codex_TriTRPC_Reconciliation_v0_1.md`
+   - binds codex (GKG-CODEX) to TriTRPC wire conventions (CTRL243 Path-B profile, not Path-A)
+   - verdict/evidence two-axis mapping (State243.epistemic + CTRL243.evidence); no 3rd vocab
+   - marker-band parity (default 9 only); topic23.v1 residue source; unbalanced ternary v0
+   - dependency ordering; codex past G3 BLOCKED upstream (profile alloc + topic23.v1 freeze)
+
 ## Canonical Kernel Theorem
 
 One canonical core: immutable typed atoms plus versioned valuations.

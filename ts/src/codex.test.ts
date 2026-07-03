@@ -6,8 +6,8 @@ import { fileURLToPath } from 'node:url'
 import { AtomSpace } from './atomspace.js'
 import {
   phiGematria, phiSequence, phiSpacing, phiStructure, phiResidue, COPRIME_MODULI,
-  manifest, syndrome, classify, verdictOf,
-  phiAbjad, phiSctTopology, ERR_FACET_NOT_IMPLEMENTED,
+  manifest, syndrome, classify, verdictOf, evidenceTierOf,
+  phiAbjad, phiSctTopology, phiAtbash, ERR_FACET_NOT_IMPLEMENTED,
   sealAtomContent, verifyAtomContent, attachCodexSealer, type Manifest,
 } from './codex.js'
 
@@ -65,6 +65,21 @@ test('classify/verdict edges: empty→INTACT/POS, compound→ZERO', () => {
 test('extension facets raise ERR_FACET_NOT_IMPLEMENTED until frozen', () => {
   assert.throws(() => phiAbjad('x'), new RegExp(ERR_FACET_NOT_IMPLEMENTED))
   assert.throws(() => phiSctTopology('x', 'profile'), new RegExp(ERR_FACET_NOT_IMPLEMENTED))
+  assert.throws(() => phiAtbash('x'), new RegExp(ERR_FACET_NOT_IMPLEMENTED)) // §16.8 atbash stub
+})
+
+// ─── TriTRPC reconciliation §16.4: verdict and evidence are two separate axes ─────────
+test('syndrome carries evidence tier (CTRL243.evidence) distinct from verdict (State243.epistemic)', () => {
+  const base = manifest('the open gate')
+  const intact = syndrome(base, 'the open gate')
+  assert.equal(intact.verdict, 'POS')
+  assert.equal(intact.evidence, 'exact', 'formal T1 facets → exact')
+  const tampered = syndrome(base, 'the open gaze')
+  assert.equal(tampered.verdict, 'NEG')
+  assert.equal(tampered.evidence, 'exact', 'evidence axis is independent of the verdict')
+  // Unknown/empirical facets weaken the tier; formal-only stays exact.
+  assert.equal(evidenceTierOf(['gematria', 'residue']), 'exact')
+  assert.equal(evidenceTierOf(['gematria', 'sct_topology']), 'sampled')
 })
 
 // ─── AtomSpace integration: default-on passive seal + tamper localization ─────────
