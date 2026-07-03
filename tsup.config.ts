@@ -20,5 +20,5 @@ export default defineConfig({
   // node-gyp-build prebuild path works; hypercore pulls a large P2P dep tree we must
   // not inline), and so absence degrades gracefully to the JSONL backend instead of
   // bloating/breaking the bundle.
-  external: ['rocksdb', 'hypercore'],
+  external: ['rocksdb', 'hypercore', 'autobase', 'corestore', 'hyperbee'],
 })
