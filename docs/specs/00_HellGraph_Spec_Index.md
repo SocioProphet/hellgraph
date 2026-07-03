@@ -66,6 +66,11 @@ Freeze the canonical semantics, interfaces, projections, and pilot overlays befo
    - masking as a HellGraph policy-graph; opt-in default-off vendor/connector egress
    - L3⇄L5 coupling; key-management open decision
 
+11. `11_Upstream_State_And_Convergence_v0_1.md`
+   - positioning correction: HellGraph is a polyglot engine (TS reference surface +
+     Rust convergence/kernel surface), not a Rust-only kernel scaffold
+   - upstream-state + convergence spec (renumbered from a colliding `08` on merge)
+
 ## Canonical Kernel Theorem
 
 One canonical core: immutable typed atoms plus versioned valuations.
