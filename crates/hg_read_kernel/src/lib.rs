@@ -72,7 +72,10 @@ impl ReadKernelStore for JournaledStore {
     }
 }
 
-pub fn incident_links<S: ReadKernelStore>(store: &S, subject_atom: AtomId) -> Vec<IncidentLinkSummary> {
+pub fn incident_links<S: ReadKernelStore>(
+    store: &S,
+    subject_atom: AtomId,
+) -> Vec<IncidentLinkSummary> {
     let mut out = store
         .all_atoms()
         .into_iter()
@@ -100,7 +103,11 @@ pub fn incident_links<S: ReadKernelStore>(store: &S, subject_atom: AtomId) -> Ve
     out
 }
 
-pub fn active_value_count_at<S: ReadKernelStore>(store: &S, subject_atom: AtomId, snapshot_txn: TxnId) -> usize {
+pub fn active_value_count_at<S: ReadKernelStore>(
+    store: &S,
+    subject_atom: AtomId,
+    snapshot_txn: TxnId,
+) -> usize {
     store
         .all_values()
         .iter()
@@ -110,7 +117,11 @@ pub fn active_value_count_at<S: ReadKernelStore>(store: &S, subject_atom: AtomId
         .count()
 }
 
-pub fn snapshot_subject<S: ReadKernelStore>(store: &S, subject_atom: AtomId, snapshot_txn: TxnId) -> SubjectSnapshotSummary {
+pub fn snapshot_subject<S: ReadKernelStore>(
+    store: &S,
+    subject_atom: AtomId,
+    snapshot_txn: TxnId,
+) -> SubjectSnapshotSummary {
     let atom_type = store.atom_by_id(subject_atom).map(|atom| match atom {
         Atom::Node(n) => n.hdr.type_name.clone(),
         Atom::Link(l) => l.hdr.type_name.clone(),
@@ -152,8 +163,16 @@ mod tests {
                 "Owns",
                 LinkSemantics::DirectedBinary,
                 vec![
-                    RoleBinding { role_name: "src".into(), target: service, ordinal: 0 },
-                    RoleBinding { role_name: "dst".into(), target: artifact, ordinal: 1 },
+                    RoleBinding {
+                        role_name: "src".into(),
+                        target: service,
+                        ordinal: 0,
+                    },
+                    RoleBinding {
+                        role_name: "dst".into(),
+                        target: artifact,
+                        ordinal: 1,
+                    },
                 ],
             )
             .unwrap();
@@ -162,7 +181,20 @@ mod tests {
             &mut store,
             service,
             service_txn,
-            &[FieldEvent { dim_index: 0, delta: 0.85 }, FieldEvent { dim_index: 20, delta: 0.9 }, FieldEvent { dim_index: 21, delta: 0.9 }],
+            &[
+                FieldEvent {
+                    dim_index: 0,
+                    delta: 0.85,
+                },
+                FieldEvent {
+                    dim_index: 20,
+                    delta: 0.9,
+                },
+                FieldEvent {
+                    dim_index: 21,
+                    delta: 0.9,
+                },
+            ],
             3,
         )
         .unwrap();
@@ -186,8 +218,16 @@ mod tests {
                 "Trusts",
                 LinkSemantics::DirectedBinary,
                 vec![
-                    RoleBinding { role_name: "src".into(), target: service, ordinal: 0 },
-                    RoleBinding { role_name: "dst".into(), target: peer, ordinal: 1 },
+                    RoleBinding {
+                        role_name: "src".into(),
+                        target: service,
+                        ordinal: 0,
+                    },
+                    RoleBinding {
+                        role_name: "dst".into(),
+                        target: peer,
+                        ordinal: 1,
+                    },
                 ],
             )
             .unwrap();
@@ -195,7 +235,20 @@ mod tests {
             &mut store,
             service,
             service_txn,
-            &[FieldEvent { dim_index: 0, delta: 0.9 }, FieldEvent { dim_index: 20, delta: 0.9 }, FieldEvent { dim_index: 21, delta: 0.9 }],
+            &[
+                FieldEvent {
+                    dim_index: 0,
+                    delta: 0.9,
+                },
+                FieldEvent {
+                    dim_index: 20,
+                    delta: 0.9,
+                },
+                FieldEvent {
+                    dim_index: 21,
+                    delta: 0.9,
+                },
+            ],
             3,
         )
         .unwrap();

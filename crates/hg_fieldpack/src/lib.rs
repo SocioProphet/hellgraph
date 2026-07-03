@@ -236,19 +236,37 @@ impl CanonicalPackDraft {
             if matches!(row.status, CanonicalizationStatus::Unmapped) {
                 errs.push(format!("slot {} is still unmapped", row.slot));
             }
-            if row.canonical_name.as_ref().map(|s| s.trim().is_empty()).unwrap_or(true) {
+            if row
+                .canonical_name
+                .as_ref()
+                .map(|s| s.trim().is_empty())
+                .unwrap_or(true)
+            {
                 errs.push(format!("slot {} missing canonical_name", row.slot));
             }
-            if row.canonical_domain.as_ref().map(|s| s.trim().is_empty()).unwrap_or(true) {
+            if row
+                .canonical_domain
+                .as_ref()
+                .map(|s| s.trim().is_empty())
+                .unwrap_or(true)
+            {
                 errs.push(format!("slot {} missing canonical_domain", row.slot));
             }
-            if row.notes.as_ref().map(|s| s.trim().is_empty()).unwrap_or(true) {
+            if row
+                .notes
+                .as_ref()
+                .map(|s| s.trim().is_empty())
+                .unwrap_or(true)
+            {
                 errs.push(format!("slot {} missing notes", row.slot));
             }
             match (row.lower, row.upper) {
                 (Some(l), Some(u)) => {
                     if l < 0.0 || u > 1.0 || l > u {
-                        errs.push(format!("slot {} has invalid bounds [{}, {}]", row.slot, l, u));
+                        errs.push(format!(
+                            "slot {} has invalid bounds [{}, {}]",
+                            row.slot, l, u
+                        ));
                     }
                 }
                 _ => errs.push(format!("slot {} missing bounds", row.slot)),
@@ -335,32 +353,214 @@ pub fn provisional_pack_0001() -> FieldPack26 {
         basis_version: 1,
         epsilon_limit: 0.45,
         dims: [
-            DimSpec { index: 0, name: "identity_integrity", lower: 0.70, upper: 1.00, polarity: Hi, notes: "principal identity coherence" },
-            DimSpec { index: 1, name: "capability_scope", lower: 0.60, upper: 1.00, polarity: Hi, notes: "least privilege quality" },
-            DimSpec { index: 2, name: "credential_exposure", lower: 0.00, upper: 0.35, polarity: Lo, notes: "credential exposure pressure" },
-            DimSpec { index: 3, name: "secret_residency", lower: 0.70, upper: 1.00, polarity: Hi, notes: "secrets remain in approved residency domains" },
-            DimSpec { index: 4, name: "boundary_permeability", lower: 0.00, upper: 0.35, polarity: Lo, notes: "boundary leakage permeability" },
-            DimSpec { index: 5, name: "privilege_gradient", lower: 0.00, upper: 0.40, polarity: Lo, notes: "privilege discontinuity" },
-            DimSpec { index: 6, name: "egress_pressure", lower: 0.00, upper: 0.55, polarity: Lo, notes: "outbound transfer pressure" },
-            DimSpec { index: 7, name: "ingress_trust", lower: 0.55, upper: 1.00, polarity: Hi, notes: "quality of inbound trust anchors" },
-            DimSpec { index: 8, name: "data_sensitivity", lower: 0.00, upper: 0.65, polarity: Lo, notes: "sensitivity burden in active scope" },
-            DimSpec { index: 9, name: "policy_conformance", lower: 0.75, upper: 1.00, polarity: Hi, notes: "declared policy conformance" },
-            DimSpec { index: 10, name: "provenance_coverage", lower: 0.70, upper: 1.00, polarity: Hi, notes: "provenance completeness" },
-            DimSpec { index: 11, name: "evidence_completeness", lower: 0.70, upper: 1.00, polarity: Hi, notes: "evidentiary coverage" },
-            DimSpec { index: 12, name: "temporal_freshness", lower: 0.65, upper: 1.00, polarity: Hi, notes: "freshness of evidence and state" },
-            DimSpec { index: 13, name: "topology_reachability", lower: 0.20, upper: 0.85, polarity: Lo, notes: "reachable attack/service surface" },
-            DimSpec { index: 14, name: "service_health", lower: 0.60, upper: 1.00, polarity: Hi, notes: "health of governed service" },
-            DimSpec { index: 15, name: "load_saturation", lower: 0.00, upper: 0.80, polarity: Lo, notes: "saturation/backlog pressure" },
-            DimSpec { index: 16, name: "isolation_distance", lower: 0.55, upper: 1.00, polarity: Hi, notes: "isolation from forbidden domains" },
-            DimSpec { index: 17, name: "dependency_fragility", lower: 0.00, upper: 0.55, polarity: Lo, notes: "dependency-chain fragility" },
-            DimSpec { index: 18, name: "contradiction_mass", lower: 0.00, upper: 0.25, polarity: Lo, notes: "explicit contradiction burden" },
-            DimSpec { index: 19, name: "truth_confidence", lower: 0.55, upper: 1.00, polarity: Hi, notes: "confidence derived from truth valuations" },
-            DimSpec { index: 20, name: "replay_determinism", lower: 0.85, upper: 1.00, polarity: Hi, notes: "replay stability" },
-            DimSpec { index: 21, name: "recovery_integrity", lower: 0.75, upper: 1.00, polarity: Hi, notes: "checkpoint/recovery integrity" },
-            DimSpec { index: 22, name: "observability_density", lower: 0.65, upper: 1.00, polarity: Hi, notes: "observability richness" },
-            DimSpec { index: 23, name: "recommendation_stability", lower: 0.55, upper: 1.00, polarity: Hi, notes: "stability of recommended actions" },
-            DimSpec { index: 24, name: "counterexample_pressure", lower: 0.00, upper: 0.40, polarity: Lo, notes: "unresolved adversarial pressure" },
-            DimSpec { index: 25, name: "operator_alignment", lower: 0.65, upper: 1.00, polarity: Hi, notes: "operator/order alignment quality" },
+            DimSpec {
+                index: 0,
+                name: "identity_integrity",
+                lower: 0.70,
+                upper: 1.00,
+                polarity: Hi,
+                notes: "principal identity coherence",
+            },
+            DimSpec {
+                index: 1,
+                name: "capability_scope",
+                lower: 0.60,
+                upper: 1.00,
+                polarity: Hi,
+                notes: "least privilege quality",
+            },
+            DimSpec {
+                index: 2,
+                name: "credential_exposure",
+                lower: 0.00,
+                upper: 0.35,
+                polarity: Lo,
+                notes: "credential exposure pressure",
+            },
+            DimSpec {
+                index: 3,
+                name: "secret_residency",
+                lower: 0.70,
+                upper: 1.00,
+                polarity: Hi,
+                notes: "secrets remain in approved residency domains",
+            },
+            DimSpec {
+                index: 4,
+                name: "boundary_permeability",
+                lower: 0.00,
+                upper: 0.35,
+                polarity: Lo,
+                notes: "boundary leakage permeability",
+            },
+            DimSpec {
+                index: 5,
+                name: "privilege_gradient",
+                lower: 0.00,
+                upper: 0.40,
+                polarity: Lo,
+                notes: "privilege discontinuity",
+            },
+            DimSpec {
+                index: 6,
+                name: "egress_pressure",
+                lower: 0.00,
+                upper: 0.55,
+                polarity: Lo,
+                notes: "outbound transfer pressure",
+            },
+            DimSpec {
+                index: 7,
+                name: "ingress_trust",
+                lower: 0.55,
+                upper: 1.00,
+                polarity: Hi,
+                notes: "quality of inbound trust anchors",
+            },
+            DimSpec {
+                index: 8,
+                name: "data_sensitivity",
+                lower: 0.00,
+                upper: 0.65,
+                polarity: Lo,
+                notes: "sensitivity burden in active scope",
+            },
+            DimSpec {
+                index: 9,
+                name: "policy_conformance",
+                lower: 0.75,
+                upper: 1.00,
+                polarity: Hi,
+                notes: "declared policy conformance",
+            },
+            DimSpec {
+                index: 10,
+                name: "provenance_coverage",
+                lower: 0.70,
+                upper: 1.00,
+                polarity: Hi,
+                notes: "provenance completeness",
+            },
+            DimSpec {
+                index: 11,
+                name: "evidence_completeness",
+                lower: 0.70,
+                upper: 1.00,
+                polarity: Hi,
+                notes: "evidentiary coverage",
+            },
+            DimSpec {
+                index: 12,
+                name: "temporal_freshness",
+                lower: 0.65,
+                upper: 1.00,
+                polarity: Hi,
+                notes: "freshness of evidence and state",
+            },
+            DimSpec {
+                index: 13,
+                name: "topology_reachability",
+                lower: 0.20,
+                upper: 0.85,
+                polarity: Lo,
+                notes: "reachable attack/service surface",
+            },
+            DimSpec {
+                index: 14,
+                name: "service_health",
+                lower: 0.60,
+                upper: 1.00,
+                polarity: Hi,
+                notes: "health of governed service",
+            },
+            DimSpec {
+                index: 15,
+                name: "load_saturation",
+                lower: 0.00,
+                upper: 0.80,
+                polarity: Lo,
+                notes: "saturation/backlog pressure",
+            },
+            DimSpec {
+                index: 16,
+                name: "isolation_distance",
+                lower: 0.55,
+                upper: 1.00,
+                polarity: Hi,
+                notes: "isolation from forbidden domains",
+            },
+            DimSpec {
+                index: 17,
+                name: "dependency_fragility",
+                lower: 0.00,
+                upper: 0.55,
+                polarity: Lo,
+                notes: "dependency-chain fragility",
+            },
+            DimSpec {
+                index: 18,
+                name: "contradiction_mass",
+                lower: 0.00,
+                upper: 0.25,
+                polarity: Lo,
+                notes: "explicit contradiction burden",
+            },
+            DimSpec {
+                index: 19,
+                name: "truth_confidence",
+                lower: 0.55,
+                upper: 1.00,
+                polarity: Hi,
+                notes: "confidence derived from truth valuations",
+            },
+            DimSpec {
+                index: 20,
+                name: "replay_determinism",
+                lower: 0.85,
+                upper: 1.00,
+                polarity: Hi,
+                notes: "replay stability",
+            },
+            DimSpec {
+                index: 21,
+                name: "recovery_integrity",
+                lower: 0.75,
+                upper: 1.00,
+                polarity: Hi,
+                notes: "checkpoint/recovery integrity",
+            },
+            DimSpec {
+                index: 22,
+                name: "observability_density",
+                lower: 0.65,
+                upper: 1.00,
+                polarity: Hi,
+                notes: "observability richness",
+            },
+            DimSpec {
+                index: 23,
+                name: "recommendation_stability",
+                lower: 0.55,
+                upper: 1.00,
+                polarity: Hi,
+                notes: "stability of recommended actions",
+            },
+            DimSpec {
+                index: 24,
+                name: "counterexample_pressure",
+                lower: 0.00,
+                upper: 0.40,
+                polarity: Lo,
+                notes: "unresolved adversarial pressure",
+            },
+            DimSpec {
+                index: 25,
+                name: "operator_alignment",
+                lower: 0.65,
+                upper: 1.00,
+                polarity: Hi,
+                notes: "operator/order alignment quality",
+            },
         ],
     }
 }
@@ -378,7 +578,10 @@ mod tests {
     fn migration_skeleton_has_26_rows() {
         let skel = provisional_to_canonical_skeleton();
         assert_eq!(skel.row_count, 26);
-        assert!(skel.rows.iter().all(|r| r.status == CanonicalizationStatus::Unmapped));
+        assert!(skel
+            .rows
+            .iter()
+            .all(|r| r.status == CanonicalizationStatus::Unmapped));
     }
 
     #[test]

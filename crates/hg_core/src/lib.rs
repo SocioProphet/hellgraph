@@ -217,9 +217,9 @@ pub enum Atom {
 }
 
 pub fn clamp_unit(x: f64) -> f64 {
-    if x.is_nan() {
-        0.0
-    } else if x < 0.0 {
+    // NaN-safe unit clamp: NaN and negatives both floor to 0.0. NOT f64::clamp — that would
+    // propagate NaN (x.clamp(0.0, 1.0) on NaN yields NaN), which this function must map to 0.0.
+    if x.is_nan() || x < 0.0 {
         0.0
     } else if x > 1.0 {
         1.0
