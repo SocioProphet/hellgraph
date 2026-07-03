@@ -1,3 +1,5 @@
 [toolchain]
-channel = "stable"
+# Pinned (not floating "stable") so rustfmt/clippy are deterministic — a floating @stable
+# reformats different lines each new release and repeatedly red-lit CI (see PRs #12, #14).
+channel = "1.96.0"
 components = ["rustfmt", "clippy"]
