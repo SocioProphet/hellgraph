@@ -112,10 +112,7 @@ pub fn pagerank_by_id(
         .filter_map(|&(u, v)| Some((*idx.get(&u)?, *idx.get(&v)?)))
         .collect();
     let pr = pagerank(ids.len(), &e, damping, max_iters, tol);
-    ids.iter()
-        .enumerate()
-        .map(|(i, &id)| (id, pr[i]))
-        .collect()
+    ids.iter().enumerate().map(|(i, &id)| (id, pr[i])).collect()
 }
 
 // ── Betweenness centrality (Brandes, unweighted, undirected) ─────────────────────────────────────────────────
