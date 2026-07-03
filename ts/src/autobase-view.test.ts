@@ -59,6 +59,11 @@ test('FederatedAtomSpace merges two sovereign writers into one materialized Atom
   }
   assert.equal(spaceA.count(), spaceB.count(), 'both participants converge to the same atom count')
 
+  // The causal cut (spec 09) reflects BOTH sovereign writers, each at their own seq.
+  const cut = await alice.currentCut()
+  assert.equal(cut[alice.localWriterKey()], 1, "alice's op is in the cut")
+  assert.equal(cut[bob.localWriterKey()], 1, "bob's op is in the cut")
+
   ;(s1 as { destroy: () => void }).destroy()
   ;(s2 as { destroy: () => void }).destroy()
   await alice.close()

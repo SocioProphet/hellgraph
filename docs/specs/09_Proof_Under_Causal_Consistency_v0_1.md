@@ -123,6 +123,18 @@ results. It MUST NOT collapse an out-of-frame proof into a truth/confidence scor
 - P4. Append-only extension beyond a proof's dependency set never changes its verdict.
 - P5. A read that returns a proof also returns its frame status relative to the read cut.
 
+## Implementation status
+
+The pure contract is implemented and tested in `ts/src/causal-proof.ts`:
+`CausalCut` (version vector), `bindProof` (enforces P1 + dependency coverage), and
+`honorProof` (frame check; surfaces the verdict in-frame, WITHHOLDS it out-of-frame —
+never a downgrade). Cuts and the live linearization come from `FederatedAtomSpace`
+(`currentCut()` / `linearization()`, provenance stamped per op at append time). Invariants
+P1–P4 and the out-of-frame withholding rule are covered by `ts/src/causal-proof.test.ts`.
+
+Not yet done: P5 as an enforced property of the query surface (surfacing frame status in
+query results), and the open questions below.
+
 ## Open questions
 
 - Cut compaction: version vectors grow with the writer set; needs a checkpoint/GC story

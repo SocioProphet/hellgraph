@@ -32,12 +32,18 @@
 
 import { AtomSpace, type AtomLogEntry } from './atomspace.js'
 import { HellGraphStore } from './store.js'
+import { cutFromOrder, type CausalCut, type OpId } from './causal-proof.js'
+
+/** A view block: an AtomLogEntry plus the federation provenance stamped at append time.
+ *  `_fedProv` carries the writer identity + that writer's local sequence, which is what
+ *  causal cuts and proof-binding (spec 09) are computed over. */
+type FederatedBlock = AtomLogEntry & { _fedProv?: { writer: string; seq: number } }
 
 // ─── Structural types for the optional bindings (no hard type dep) ───────────────
 
 interface ViewLog {
   readonly length: number
-  get(index: number): Promise<AtomLogEntry>
+  get(index: number): Promise<FederatedBlock>
   append(value: unknown): Promise<unknown>
 }
 interface AutobaseHost {
@@ -87,6 +93,9 @@ export interface FederatedOptions {
 }
 
 export class FederatedAtomSpace {
+  /** This writer's local federation sequence (1-based), stamped onto each appended op. */
+  private localSeq = 0
+
   private constructor(
     private readonly base: AutobaseInstance,
     private readonly corestore: CorestoreInstance,
@@ -144,10 +153,36 @@ export class FederatedAtomSpace {
     await this.base.update()
   }
 
-  /** Append one AtomSpace mutation to this participant's log. */
+  /** Append one AtomSpace mutation to this participant's log, stamped with federation
+   *  provenance (writer key + local seq) so causal cuts and proofs can bind to it. */
   async appendEntry(entry: AtomLogEntry): Promise<void> {
     if (!this.base.writable) throw new Error('FederatedAtomSpace: not an admitted writer yet')
-    await this.base.append(entry)
+    const op: FederatedBlock = { ...entry, _fedProv: { writer: this.localWriterKey(), seq: ++this.localSeq } }
+    await this.base.append(op)
+  }
+
+  // ─── Causal frame (spec 09) ──────────────────────────────────────────────────
+
+  /**
+   * The current linearization as a list of op ids in causal order — the order proofs
+   * bind to. Reordering here (on a causal fork) is what takes a proof out-of-frame.
+   */
+  async linearization(): Promise<OpId[]> {
+    await this.base.update()
+    const view = this.base.view
+    const out: OpId[] = []
+    for (let i = 0; i < view.length; i++) {
+      let block: FederatedBlock
+      try { block = await view.get(i) } catch { continue }
+      if (block?._fedProv) out.push({ writer: block._fedProv.writer, seq: block._fedProv.seq })
+    }
+    return out
+  }
+
+  /** The current causal cut (version vector over writers) — the frame a proof derived now
+   *  would be bound to, and the read cut for honoring existing proofs. */
+  async currentCut(): Promise<CausalCut> {
+    return cutFromOrder(await this.linearization())
   }
 
   /** Pull the latest linearization from peers. */
