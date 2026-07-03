@@ -127,14 +127,17 @@ Even when opted in, vendor materialization (pushing content to frontier Files AP
 Vendor materialization without the policy/masking layer — or on by default — is a
 sovereignty violation.
 
-## Key management (open decision — blocks reversible masking)
+## Key management (decided: tiered custody)
 
-Reversible masking depends on recoverable key custody. Candidate models (decision pending):
-- **Per-tenant KMS** (cloud KMS / Vault) — simplest; custody sits with the operator.
-- **Sovereign / threshold keys** — participant-held or split so no single party (incl. the
-  super-peer) can unmask alone; strongest sovereignty, most complex.
+Reversible masking depends on recoverable key custody. **Decision: tiered**, matching the
+dedicated→pooled→blended tenancy plan:
+- **Standard tier — per-tenant KMS** (cloud KMS / Vault). Default; simplest; custody sits
+  with the operator.
+- **Premium tier — sovereign / threshold keys**. Participant-held or split so no single
+  party (incl. the super-peer/operator) can unmask alone; strongest sovereignty.
 
-This is a release blocker for the masking policy and MUST be decided before L3.
+The `KeyProvider` abstraction (masking.ts) is already pluggable across both tiers; the KMS
+and threshold implementations are infra/credential-gated and land with L3.
 
 ## Scope & non-negotiables
 
@@ -152,9 +155,12 @@ This is a release blocker for the masking policy and MUST be decided before L3.
 
 1. **This spec** (seam map) — done.
 2. **L5 governance**: Policy Engine + Retention Scheduler + lifecycle FSM (audit = existing
-   evidence spine). The enterprise unlock and the safety layer everything else depends on.
-3. **Masking policy-graph** (this spec) — the egress-safety mechanism; prerequisite for L3.
-4. **L3 vendor materialization** — admissible only after 2 + 3.
+   evidence spine). — done (`lifecycle.ts`, `policy.ts`).
+3. **Masking policy-graph** — the egress-safety mechanism; prerequisite for L3. — done
+   (`masking.ts`).
+4. **L1/L2 hardening** (current): Canonical Object Store (BYOS + residency/ACL catalog),
+   codex-seal at ingest, provenance (codex + causal cut) carried through the derived path.
+5. **L3 vendor materialization** — opt-in; admissible only after 2 + 3 + tiered key custody.
 
 ## Open questions
 
