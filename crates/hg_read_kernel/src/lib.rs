@@ -1,4 +1,6 @@
-use hg_core::{Atom, AtomId, FieldValue, LinkSemantics, ProofValue, TxnId, ValueEnvelope};
+use hg_core::{
+    Atom, AtomId, EdgeClass, FieldValue, LinkSemantics, ProofValue, TxnId, ValueEnvelope,
+};
 use hg_kernel::{JournaledStore, RuntimeStore, SpaceStore};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -6,6 +8,7 @@ pub struct IncidentLinkSummary {
     pub link_atom: AtomId,
     pub link_type: String,
     pub semantics: LinkSemantics,
+    pub edge_class: EdgeClass,
     pub roles: Vec<(String, AtomId, u16)>,
 }
 
@@ -89,6 +92,7 @@ pub fn incident_links<S: ReadKernelStore>(
                     link_atom: link.hdr.atom_id,
                     link_type: link.hdr.type_name.clone(),
                     semantics: link.semantics,
+                    edge_class: link.edge_class,
                     roles: link
                         .members
                         .iter()
@@ -101,6 +105,20 @@ pub fn incident_links<S: ReadKernelStore>(
         .collect::<Vec<_>>();
     out.sort_by_key(|l| l.link_atom);
     out
+}
+
+/// SP-RETR-FIBER-001 (WO_FIBER_002): typed adjacency restricted to one edge class.
+/// `descend` (within a fiber) reads `EdgeClass::Containment`; `traverse` (between fibers)
+/// reads `EdgeClass::Relational`. This is the read primitive the retrieval algebra binds to.
+pub fn incident_links_of_class<S: ReadKernelStore>(
+    store: &S,
+    subject_atom: AtomId,
+    class: EdgeClass,
+) -> Vec<IncidentLinkSummary> {
+    incident_links(store, subject_atom)
+        .into_iter()
+        .filter(|l| l.edge_class == class)
+        .collect()
 }
 
 pub fn active_value_count_at<S: ReadKernelStore>(
@@ -151,6 +169,66 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("{}_{}_{}.log", name, std::process::id(), nanos))
+    }
+
+    // SP-RETR-FIBER-001 (WO_FIBER_002): incident_links_of_class separates E^⊑ from E_R.
+    #[test]
+    fn incident_links_of_class_separates_containment_from_relational() {
+        let mut store = SpaceStore::new();
+        let (parent, _) = store.create_node("Section");
+        let (child, _) = store.create_node("Entity");
+        let (peer, _) = store.create_node("Entity");
+        // containment edge parent ⊑ child (E^⊑)
+        store
+            .create_link_classed(
+                "contains",
+                LinkSemantics::DirectedBinary,
+                EdgeClass::Containment,
+                vec![
+                    RoleBinding {
+                        role_name: "parent".into(),
+                        target: parent,
+                        ordinal: 0,
+                    },
+                    RoleBinding {
+                        role_name: "child".into(),
+                        target: child,
+                        ordinal: 1,
+                    },
+                ],
+            )
+            .unwrap();
+        // relational edge child —owns→ peer (E_R); create_link defaults to Relational
+        store
+            .create_link(
+                "owns",
+                LinkSemantics::DirectedBinary,
+                vec![
+                    RoleBinding {
+                        role_name: "src".into(),
+                        target: child,
+                        ordinal: 0,
+                    },
+                    RoleBinding {
+                        role_name: "dst".into(),
+                        target: peer,
+                        ordinal: 1,
+                    },
+                ],
+            )
+            .unwrap();
+
+        // child is incident to one containment link (as child) and one relational link (as src).
+        let cont = incident_links_of_class(&store, child, EdgeClass::Containment);
+        let rel = incident_links_of_class(&store, child, EdgeClass::Relational);
+        assert_eq!(cont.len(), 1);
+        assert_eq!(cont[0].link_type, "contains");
+        assert_eq!(cont[0].edge_class, EdgeClass::Containment);
+        assert_eq!(rel.len(), 1);
+        assert_eq!(rel[0].link_type, "owns");
+        assert_eq!(rel[0].edge_class, EdgeClass::Relational);
+        // the unfiltered read still returns both.
+        assert_eq!(incident_links(&store, child).len(), 2);
     }
 
     #[test]

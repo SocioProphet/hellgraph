@@ -203,11 +203,24 @@ pub struct RoleBinding {
     pub ordinal: u16,
 }
 
+/// SP-RETR-FIBER-001 (WO_FIBER_002): the two edge classes of the composite graph H.
+/// `Containment` = E^⊑ (single-parent, mereological, the per-document trees);
+/// `Relational` = E_R (typed many-to-many, the cross-document links). Defaults to
+/// `Relational`: every link created before this field existed — and every link restored
+/// from a journal written before it — is relational.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EdgeClass {
+    Containment,
+    #[default]
+    Relational,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LinkAtom {
     pub hdr: AtomHeader,
     pub semantics: LinkSemantics,
     pub members: Vec<RoleBinding>,
+    pub edge_class: EdgeClass,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
