@@ -31,8 +31,16 @@ test('HMAC tokens round-trip; tampered/foreign/expired tokens are rejected', () 
 test('bearer() extracts the token; hasScope() checks scopes', () => {
   assert.equal(bearer('Bearer abc.def'), 'abc.def')
   assert.equal(bearer('bearer abc.def'), 'abc.def')
+  assert.equal(bearer('Bearer\tabc.def'), 'abc.def')   // tab separator
+  assert.equal(bearer('Bearer   abc.def'), 'abc.def')  // multiple spaces
   assert.equal(bearer(undefined), null)
   assert.equal(bearer('Basic xyz'), null)
+  assert.equal(bearer('Bearer'), null)                 // scheme only, no token
+  assert.equal(bearer('Bearer   '), null)              // no token after separator
+  // ReDoS-shaped input must be rejected quickly (linear, not polynomial).
+  const t0 = Date.now()
+  assert.equal(bearer('Bearer' + '\t'.repeat(50000)), null)
+  assert.ok(Date.now() - t0 < 100)
   assert.ok(hasScope({ id: 'u', scopes: ['query'] }, 'query'))
   assert.ok(!hasScope({ id: 'u', scopes: ['read'] }, 'admit'))
 })
@@ -78,6 +86,15 @@ test('super-peer enforces bearer auth: 401 / 403 / 200, denials audited', async 
       body: JSON.stringify({ writerKey: 'a'.repeat(64) }),
     })
     assert.equal(admitAttempt.status, 403)
+
+    // Fail-closed: routes NOT in ROUTE_SCOPE must still require auth, never bypass it.
+    // /cskg (now scoped 'query') and an unmapped path both reject a tokenless request.
+    const cskgNoTok = await fetch(`${base}/cskg`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ op: 'ScanEdges' }),
+    })
+    assert.equal(cskgNoTok.status, 401)
+    const unmapped = await fetch(`${base}/nope`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' })
+    assert.equal(unmapped.status, 401)                 // was a silent 404 bypass before the fix
 
     // Denials were audited to the evidence-spine sink.
     const denials = audit.entries().filter((e) => e.kind === 'blocked')
