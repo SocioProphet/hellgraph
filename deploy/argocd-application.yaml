@@ -1,0 +1,28 @@
+# ArgoCD Application for the HellGraph super-peer (estate GitOps backbone).
+# Replace repoURL/targetRevision. The auth Secret should be managed out-of-band (sealed-secret
+# / external-secrets), NOT synced from git with a real value.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: hellgraph-superpeer
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: git@github.com:SocioProphet/hellgraph.git
+    targetRevision: main
+    path: deploy/k8s
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: hellgraph
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+    retry:
+      limit: 3
+      backoff: { duration: 10s, factor: 2, maxDuration: 2m }

@@ -188,6 +188,9 @@ export class SuperPeer {
     try {
       const url = new URL(req.url ?? '/', 'http://localhost')
 
+      // Public liveness — unauthenticated so k8s/LB probes work even when auth is enforced.
+      if (req.method === 'GET' && url.pathname === '/livez') return send(200, { ok: true })
+
       // AuthN/Z gate — enforced only when a verifier is configured (production).
       const scope = ROUTE_SCOPE[`${req.method} ${url.pathname}`]
       if (scope && this.auth) {

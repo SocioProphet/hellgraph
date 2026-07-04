@@ -50,6 +50,10 @@ test('super-peer enforces bearer auth: 401 / 403 / 200, denials audited', async 
   try {
     assert.equal(sp.authEnforced, true)
 
+    // Public liveness works WITHOUT a token even when auth is enforced (k8s probes).
+    const livez = await fetch(`${base}/livez`)
+    assert.equal(livez.status, 200)
+
     // No token → 401.
     const noTok = await fetch(`${base}/query`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(q) })
     assert.equal(noTok.status, 401)
