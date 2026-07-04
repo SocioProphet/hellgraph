@@ -142,3 +142,59 @@ export function honorProof(
   // In-frame: append-only growth beyond the dependency set never reaches here (P4).
   return { status: 'in-frame', verdict: proof.verdict }
 }
+
+// ─── Cut compaction / GC (spec 09 open question) ─────────────────────────────────────
+// Causal cuts (version vectors over writers) grow with the writer set; long-lived federations
+// accumulate ops and departed-writer entries. Compaction folds a settled, unpinned prefix into a
+// snapshot checkpoint (aligned to the CommitSnapshot anchor) so cuts stay bounded.
+
+/** Componentwise MIN over a set of cuts — the greatest common frontier every reader has passed
+ *  (an op absent from any cut is treated as unobserved → 0). */
+export function cutMeet(cuts: CausalCut[]): CausalCut {
+  if (cuts.length === 0) return {}
+  const writers = new Set<string>()
+  for (const c of cuts) for (const w of Object.keys(c)) writers.add(w)
+  const out: CausalCut = {}
+  for (const w of writers) {
+    let m = Infinity
+    for (const c of cuts) m = Math.min(m, c[w] ?? 0)
+    out[w] = m
+  }
+  return out
+}
+
+/**
+ * The safe GC floor: ops (w, s) with s ≤ floor[w] are compactable — every reader has observed them
+ * (settled) AND no live proof re-checks against them (unpinned). A proof's dependency ops pin the
+ * floor below them so proof re-check under a cut stays sound (spec 09).
+ */
+export function compactionFloor(readerCuts: CausalCut[], proofs: ProofArtifact[] = []): CausalCut {
+  const floor = cutMeet(readerCuts)
+  for (const p of proofs) {
+    for (const dep of p.dependencyOps) {
+      const cap = dep.seq - 1 // cannot compact the pinned op or anything above it
+      floor[dep.writer] = Math.min(floor[dep.writer] ?? cap, cap)
+    }
+  }
+  for (const w of Object.keys(floor)) floor[w] = Math.max(0, floor[w]!)
+  return floor
+}
+
+/** Partition a linearization by the floor: `settled` (folded into the snapshot) vs `live` (retained). */
+export function compact(order: OpId[], floor: CausalCut): { settled: OpId[]; live: OpId[] } {
+  const settled: OpId[] = []
+  const live: OpId[] = []
+  for (const op of order) (op.seq <= (floor[op.writer] ?? 0) ? settled : live).push(op)
+  return { settled, live }
+}
+
+/**
+ * Bound a cut against a snapshot floor: drop writer entries fully covered by the floor (all their
+ * ops folded into the snapshot), keeping only writers with live delta above it. This is what keeps
+ * the version vector from growing without limit as writers come and go.
+ */
+export function boundCut(cut: CausalCut, floor: CausalCut): CausalCut {
+  const out: CausalCut = {}
+  for (const [w, n] of Object.entries(cut)) if (n > (floor[w] ?? 0)) out[w] = n
+  return out
+}
