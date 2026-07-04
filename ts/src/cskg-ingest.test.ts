@@ -44,9 +44,9 @@ test('weight raises confidence, strength stays asserted', () => {
 const REC: CSKGEdgeRecord = {
   id: '/c/en/rain-/r/IsA-/c/en/weather_event-0000',
   node1: '/c/en/rain', relation: '/r/IsA', node2: '/c/en/weather_event',
-  node1Label: 'rain', node2Label: 'weather event',
-  relationLabel: 'is a', relationDimension: 'taxonomic',
-  source: 'CN', sentence: 'rain is a kind of weather event', weight: 3,
+  node1Labels: ['rain'], node2Labels: ['weather event'],
+  relationLabels: ['is a'], relationDimensions: ['taxonomic'],
+  sources: ['CN'], sentences: ['rain is a kind of weather event'], weight: 3,
 }
 
 test('ingestEdgeRecord preserves node ids as identity + labels/metadata as values', () => {
@@ -58,10 +58,19 @@ test('ingestEdgeRecord preserves node ids as identity + labels/metadata as value
   assert.equal(back!.id, REC.id)
   assert.equal(back!.node1, '/c/en/rain')
   assert.equal(back!.relation, 'IsA')                  // normalized
-  assert.equal(back!.node1Label, 'rain')
-  assert.equal(back!.relationDimension, 'taxonomic')
-  assert.equal(back!.source, 'CN')
-  assert.equal(back!.sentence, 'rain is a kind of weather event')
+  assert.deepEqual(back!.node1Labels, ['rain'])
+  assert.deepEqual(back!.relationDimensions, ['taxonomic'])
+  assert.deepEqual(back!.sources, ['CN'])
+  assert.deepEqual(back!.sentences, ['rain is a kind of weather event'])
+})
+
+test('multi-valued cells are canonicalized (dedup + UTF-8 byte sort)', () => {
+  const as = new AtomSpace('cskg-canon', false)
+  const h = ingestEdgeRecord(as, {
+    id: 'e', node1: '/c/en/x', relation: '/r/IsA', node2: '/c/en/y',
+    sources: ['WN', 'CN', 'CN', 'AT'],   // dup + unsorted
+  })
+  assert.deepEqual(edgeRecordFromAtom(as, h)!.sources, ['AT', 'CN', 'WN'])
 })
 
 test('edges are addressable by CSKG id (GetEdge support)', () => {
@@ -97,8 +106,8 @@ test('parseKgtkEdges is header-driven over the canonical columns', () => {
   const recs = parseKgtkEdges(tsv)
   assert.equal(recs.length, 1)
   assert.equal(recs[0].id, 'e1')
-  assert.equal(recs[0].relationDimension, 'lexical')
-  assert.equal(recs[0].node2Label, 'wet')
+  assert.deepEqual(recs[0].relationDimensions, ['lexical'])
+  assert.deepEqual(recs[0].node2Labels, ['wet'])
   const as = new AtomSpace('cskg-kgtk', false)
   const r = ingestKgtk(as, tsv)
   assert.equal(r.edges, 1)
