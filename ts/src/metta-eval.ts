@@ -54,22 +54,38 @@ function unifyS(pattern: SExpr, term: SExpr, b: MettaBinding): MettaBinding | nu
 const isNum = (e: SExpr): e is { kind: 'sym'; name: string } => e.kind === 'sym' && /^-?\d+$/.test(e.name)
 const num = (n: number): SExpr => ({ kind: 'sym', name: String(n) })
 
-/** Reduce a grounded op `(<op> a b)` over integer symbols, or null if not applicable. */
+const bool = (b: boolean): SExpr => ({ kind: 'sym', name: b ? 'True' : 'False' })
+
+/** Reduce a grounded op `(<op> a b)`: arithmetic + comparison over integers, `==` over any two
+ *  normal-form terms. Returns null if not applicable. */
 function grounded(e: SExpr): SExpr | null {
   if (e.kind !== 'list' || e.items.length !== 3) return null
   const [op, a, b] = e.items
-  if (op?.kind !== 'sym' || !isNum(a!) || !isNum(b!)) return null
+  if (op?.kind !== 'sym') return null
+  if (op.name === '==') return bool(serialize(a!) === serialize(b!)) // structural equality
+  if (!isNum(a!) || !isNum(b!)) return null
   const x = Number(a.name), y = Number(b.name)
   switch (op.name) {
     case '+': return num(x + y)
     case '-': return num(x - y)
     case '*': return num(x * y)
+    case '<': return bool(x < y)
+    case '>': return bool(x > y)
+    case '<=': return bool(x <= y)
+    case '>=': return bool(x >= y)
     default: return null
   }
 }
 
 function reduce(expr: SExpr, rules: MettaRule[], budget: { n: number }): SExpr {
   if (budget.n <= 0 || expr.kind !== 'list') return expr
+  // Lazy `(if <cond> <then> <else>)`: reduce only the condition, then the taken branch — so the
+  // untaken branch is never evaluated (essential for recursion base cases to terminate).
+  if (expr.items[0]?.kind === 'sym' && expr.items[0].name === 'if' && expr.items.length === 4) {
+    budget.n--
+    const cond = reduce(expr.items[1]!, rules, budget)
+    return reduce(serialize(cond) === 'True' ? expr.items[2]! : expr.items[3]!, rules, budget)
+  }
   // Eagerly reduce children to normal form.
   const e: SExpr = { kind: 'list', items: expr.items.map((it) => reduce(it, rules, budget)) }
   // Grounded operation?
