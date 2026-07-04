@@ -1,0 +1,16 @@
+[package]
+name = "hg_fiber"
+version = "0.1.0"
+edition = "2021"
+
+# SP-RETR-FIBER-001: ingest a fiber-bundle (emitted by the Python fiber_projection reference)
+# into the hellgraph substrate, materializing the composite graph H (E^⊑ ⊔ E_R) via the real
+# create_link_classed / incident_links_of_class path.
+
+[dependencies]
+hg_core = { path = "../hg_core" }
+hg_kernel = { path = "../hg_kernel" }
+hg_read_kernel = { path = "../hg_read_kernel" }
+
+[lib]
+path = "src/lib.rs"
