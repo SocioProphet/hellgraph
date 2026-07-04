@@ -69,7 +69,9 @@ function tokenize(query: string): string[] {
 
 class Parser {
   private pos = 0
-  private prefixes: Record<string, string> = {}
+  // A Map (not a plain object) so query-derived prefix names can never inject
+  // properties / pollute a prototype (js/remote-property-injection).
+  private prefixes = new Map<string, string>()
   constructor(private tokens: string[]) {}
 
   private peek(): string | undefined { return this.tokens[this.pos] }
@@ -84,7 +86,7 @@ class Parser {
       this.next()
       const prefix = this.next().replace(/:$/, '')
       const iri = this.next().replace(/^<|>$/g, '')
-      this.prefixes[prefix] = iri
+      this.prefixes.set(prefix, iri)
     }
   }
 
@@ -100,7 +102,7 @@ class Parser {
     this.expect('}')
     this.expect('WHERE')
     const where = this.parseGroup()
-    return { prefixes: this.prefixes, template, where }
+    return { prefixes: Object.fromEntries(this.prefixes), template, where }
   }
 
   parse(): SparqlQuery {
@@ -142,7 +144,7 @@ class Parser {
       else break
     }
 
-    return { prefixes: this.prefixes, distinct, projection, where, orderBy, limit, offset }
+    return { prefixes: Object.fromEntries(this.prefixes), distinct, projection, where, orderBy, limit, offset }
   }
 
   private parseGroup(): GroupGraphPattern {
@@ -175,7 +177,7 @@ class Parser {
     // prefixed name (prefix:local) or bareword keyword like rdf:type
     if (tok.includes(':')) {
       const [prefix, local] = tok.split(':')
-      const base = this.prefixes[prefix]
+      const base = this.prefixes.get(prefix)
       if (base) return { kind: 'iri', value: base + local }
       return { kind: 'iri', value: tok } // unresolved prefix — treat literally (e.g. rdf:type)
     }
@@ -413,9 +415,11 @@ export function runSparql(store: HellGraphStore, queryText: string): SparqlResul
     : query.projection
 
   let bindings = solutions.map((s) => {
-    const row: Binding = {}
-    for (const v of variables) row[v] = s[v] ?? null
-    return row
+    // Build via a Map so projection variable names (query-derived) can't inject
+    // properties, then materialize a plain Binding (js/remote-property-injection).
+    const m = new Map<string, PropertyValue | null>()
+    for (const v of variables) m.set(v, s[v] ?? null)
+    return Object.fromEntries(m) as Binding
   })
 
   // DISTINCT
