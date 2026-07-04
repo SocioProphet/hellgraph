@@ -37,9 +37,14 @@ is the convergence contract so we end with **one schema + one spine**, not dupli
 3. **CSKG runtime writes HellGraph** *(memory-mesh)* — use the `discourse.ts` assert/record API
    (`assertClaim`/`addEvidence`/`recordTruth`), which enforces falsifiability + codex sealing, not
    raw atom writes.
-4. **Deployment** *(prophet-platform lane)* — the managed HellGraph service = the super-peer;
-   `deploy/` (Dockerfile + GKE + ArgoCD + CI) is ready. Pipeline services (argument mining,
-   moderation, verification, hygiene) run here and emit onto the one spine.
+4. **Deployment** *(prophet-platform lane)* — ALREADY MERGED (#691 mode-aware `hellgraph-service`
+   image `local | super-peer` vendoring @socioprophet/hellgraph 0.4.3; `infra/k8s/hellgraph-
+   superpeer/`, an emptyDir derived-index twin). **Alignment follow-up when it bumps past 0.4.3:**
+   (a) switch probes `/health` → **`/livez`** (public liveness — `/health` will 401 once auth is
+   enabled); (b) wire `HELLGRAPH_AUTH_SECRET` (currently runs OPEN); (c) optionally scrape
+   `/metrics`. These endpoints (/livez, bearer auth, /metrics) shipped in the sprint work AFTER
+   0.4.3. hellgraph `deploy/` (Dockerfile/GKE/ArgoCD/CI) is a reference; the estate image is
+   `hellgraph-service` — reconcile the ghcr↔GAR naming (already noted in the deployment).
 5. **Truth Record cardinality** *(all)* — confirm: 3-valued (POS/ZERO/NEG) + causal-cut (temporal)
    + tamper-detect (adversary-aware); "multi-valued" = the record OVER TIME, not a weaker proof.
 
