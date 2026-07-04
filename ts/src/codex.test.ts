@@ -82,6 +82,16 @@ test('syndrome carries evidence tier (CTRL243.evidence) distinct from verdict (S
   assert.equal(evidenceTierOf(['gematria', 'sct_topology']), 'sampled')
 })
 
+// ─── byte-exact backstop: digits-only tamper is invisible to the letters-only facets ──
+test('a digits-only change trips the byte-exact backstop (formally INTACT, but NEG)', () => {
+  const base = manifest('ssn 123-45-6789')
+  const syn = syndrome(base, 'ssn 000-00-0000') // only digits changed
+  assert.deepEqual(syn.breaks, [], 'no formal facet broke (letters/spacing identical)')
+  assert.equal(syn.class, 'INTACT', 'formally intact')
+  assert.equal(syn.exact, false, 'but the manifest sha differs')
+  assert.equal(syn.verdict, 'NEG', 'so it is still tamper, not POS')
+})
+
 // ─── AtomSpace integration: default-on passive seal + tamper localization ─────────
 test('passive sealer seals nodes at ingest; verify localizes tamper', async () => {
   const space = new AtomSpace('test-codex', false)

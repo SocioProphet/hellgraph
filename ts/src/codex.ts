@@ -123,7 +123,16 @@ export type Verdict = 'POS' | 'ZERO' | 'NEG'
  * cross-transform validated → verified.
  */
 export type EvidenceTier = 'exact' | 'sampled' | 'verified'
-export interface Syndrome { breaks: string[]; intact: string[]; class: ChangeClass; verdict: Verdict; evidence: EvidenceTier }
+export interface Syndrome {
+  breaks: string[]
+  intact: string[]
+  class: ChangeClass
+  verdict: Verdict
+  evidence: EvidenceTier
+  /** Byte-exact integrity: did the manifest sha match? False with class INTACT = a sub-formal
+   *  change (digits/punctuation only — invisible to the letters-only formal facets). */
+  exact: boolean
+}
 
 // Per-facet evidence tier. v0 formal facets are all T1 deterministic → 'exact'; empirical
 // (sct) and ρ cross-transform facets shift this when added.
@@ -192,7 +201,11 @@ export function syndrome(base: Manifest, currentText: string): Syndrome {
   }
   const cls = classify(breaks)
   const intact = FACET_ORDER.filter((k) => !breaks.has(k))
-  return { breaks: [...breaks].sort(), intact, class: cls, verdict: verdictOf(cls), evidence: evidenceTierOf(FACET_ORDER) }
+  // Byte-exact backstop: the formal facets are letters-only, so a digits/punctuation-only
+  // change can leave every formal facet intact. The manifest sha catches it → tamper (NEG).
+  const exact = base._sha256 === cur._sha256
+  const verdict: Verdict = cls === 'INTACT' && !exact ? 'NEG' : verdictOf(cls)
+  return { breaks: [...breaks].sort(), intact, class: cls, verdict, evidence: evidenceTierOf(FACET_ORDER), exact }
 }
 
 // ─── Extension facets (declared, not implemented — registry contract, §7.2) ─────────
