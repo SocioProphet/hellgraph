@@ -35,6 +35,7 @@ import { bearer, hasScope, type Scope, type TokenVerifier } from './auth.js'
 import type { AuditSink } from './policy.js'
 import { Metrics } from './metrics.js'
 import { RateLimiter } from './rate-limit.js'
+import { loadOptionalDep as loadDep } from './optional-dep.js'
 
 /** Per-route scope requirement (enforced only when an auth verifier is configured). */
 const ROUTE_SCOPE: Record<string, Scope> = {
@@ -54,15 +55,6 @@ export interface SuperPeerOptions extends FederatedOptions {
   metrics?: Metrics
   /** Per-principal rate limiter for /query and /admit (429 on refusal). */
   rateLimit?: RateLimiter
-}
-
-async function loadDep<T>(name: string): Promise<T | null> {
-  try {
-    const mod = (await import(name)) as unknown as T | { default: T }
-    return typeof mod === 'function' ? (mod as T) : (mod as { default: T }).default
-  } catch {
-    return null
-  }
 }
 
 interface SwarmConnection { /* Duplex stream */ }

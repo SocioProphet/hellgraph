@@ -31,6 +31,7 @@
 import * as path from 'node:path'
 import * as fs from 'node:fs'
 import type { AtomSpaceBackend, AtomLogEntry } from './atomspace.js'
+import { loadOptionalDep } from './optional-dep.js'
 
 // Minimal structural type for the `hypercore` binding (avoid a hard type dep on an
 // optional package). Covers only what this backend uses.
@@ -46,16 +47,9 @@ interface HypercoreLog {
 }
 type HypercoreCtor = new (storage: string, opts?: Record<string, unknown>) => HypercoreLog
 
-// Dynamic import works in both the ESM and CJS builds (a bare require() throws in the
-// ESM bundle, which is why the binding must be loaded this way).
-async function loadHypercore(): Promise<HypercoreCtor | null> {
-  try {
-    const mod = (await import('hypercore')) as unknown as HypercoreCtor | { default: HypercoreCtor }
-    return typeof mod === 'function' ? mod : mod.default
-  } catch {
-    return null
-  }
-}
+// Loaded via loadOptionalDep (variable specifier) so a browser bundler can't statically resolve
+// 'hypercore' and hard-fail — it is server-only, tsup-external, and absence falls back to JSONL.
+const loadHypercore = (): Promise<HypercoreCtor | null> => loadOptionalDep<HypercoreCtor>('hypercore')
 
 export class HypercoreBackend implements AtomSpaceBackend {
   private readonly corePath: string

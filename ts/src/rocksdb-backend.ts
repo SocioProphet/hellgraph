@@ -26,6 +26,7 @@
 import * as path from 'node:path'
 import * as fs from 'node:fs'
 import type { AtomSpaceBackend, AtomLogEntry } from './atomspace.js'
+import { loadOptionalDep } from './optional-dep.js'
 
 const SEQ_WIDTH = 16 // zero-pad so lexical order == numeric order up to 1e16 entries
 const keyOf = (seq: number): string => 'e:' + String(seq).padStart(SEQ_WIDTH, '0')
@@ -44,16 +45,9 @@ interface RocksDb {
 }
 type RocksCtor = (location: string) => RocksDb
 
-// Dynamic import works in both the ESM and CJS builds (a bare require() throws in
-// the ESM bundle, which is why the binding must be loaded this way).
-async function loadRocks(): Promise<RocksCtor | null> {
-  try {
-    const mod = (await import('rocksdb')) as unknown as RocksCtor | { default: RocksCtor }
-    return typeof mod === 'function' ? mod : mod.default
-  } catch {
-    return null
-  }
-}
+// Loaded via loadOptionalDep (variable specifier) so a browser bundler can't statically resolve
+// 'rocksdb' and hard-fail — it is server-only, tsup-external, and absence falls back to JSONL.
+const loadRocks = (): Promise<RocksCtor | null> => loadOptionalDep<RocksCtor>('rocksdb')
 
 export class RocksDBBackend implements AtomSpaceBackend {
   private readonly dbPath: string

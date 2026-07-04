@@ -33,6 +33,7 @@
 import { AtomSpace, type AtomLogEntry } from './atomspace.js'
 import { HellGraphStore } from './store.js'
 import { cutFromOrder, type CausalCut, type OpId } from './causal-proof.js'
+import { loadOptionalDep as loadDep } from './optional-dep.js'
 
 /** A view block: an AtomLogEntry plus the federation provenance stamped at append time.
  *  `_fedProv` carries the writer identity + that writer's local sequence, which is what
@@ -67,15 +68,6 @@ type AutobaseHandlers = {
 type AutobaseCtor = new (store: unknown, bootstrap: Uint8Array | null, handlers: AutobaseHandlers) => AutobaseInstance
 interface CorestoreInstance { replicate(initiatorOrStream: boolean | unknown): unknown; close(): Promise<void> }
 type CorestoreCtor = new (storage: string) => CorestoreInstance
-
-async function loadDep<T>(name: string): Promise<T | null> {
-  try {
-    const mod = (await import(name)) as unknown as T | { default: T }
-    return typeof mod === 'function' ? (mod as T) : (mod as { default: T }).default
-  } catch {
-    return null
-  }
-}
 
 const toHex = (k: Uint8Array): string => Buffer.from(k).toString('hex')
 
