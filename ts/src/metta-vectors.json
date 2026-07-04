@@ -1,0 +1,46 @@
+{
+  "_note": "Frozen conformance vectors for the DAS/MeTTa surface (match + eval + program). Any implementation MUST reproduce these outputs exactly — the cross-impl parity contract (cf. codex-vectors.json / the TriTRPC byte-parity discipline). Internal fixture, not shipped.",
+  "eval": [
+    { "label": "grounded arithmetic",        "rules": [], "expr": "(* (+ 1 2) 4)",                                   "expect": "12" },
+    { "label": "rule rewrite",                "rules": ["(= (double $x) (+ $x $x))"], "expr": "(double 21)",         "expect": "42" },
+    { "label": "nested calls reduce eagerly", "rules": ["(= (double $x) (+ $x $x))", "(= (inc $x) (+ $x 1))"], "expr": "(inc (double 4))", "expect": "9" },
+    { "label": "symbolic rewrite",            "rules": ["(= (greet $x) (hello $x))"], "expr": "(greet world)",        "expect": "(hello world)" },
+    { "label": "no rule → normal form",       "rules": [], "expr": "(unknown a b)",                                  "expect": "(unknown a b)" },
+    { "label": "comparison → True/False",     "rules": [], "expr": "(== 2 2)",                                       "expect": "True" },
+    { "label": "if takes the branch",         "rules": [], "expr": "(if (< 3 5) yes no)",                            "expect": "yes" },
+    { "label": "recursive factorial",         "rules": ["(= (fac $n) (if (== $n 0) 1 (* $n (fac (- $n 1)))))"], "expr": "(fac 5)", "expect": "120" },
+    { "label": "recursive sum",               "rules": ["(= (sum $n) (if (== $n 0) 0 (+ $n (sum (- $n 1)))))"],     "expr": "(sum 5)", "expect": "15" }
+  ],
+  "match": [
+    {
+      "label": "variable binds across all solutions",
+      "nodes": ["Dog", "Cat", "Whale", "Mammal", "Water"],
+      "links": [["InheritanceLink", "Dog", "Mammal"], ["InheritanceLink", "Cat", "Mammal"], ["InheritanceLink", "Whale", "Mammal"], ["EvaluationLink", "Whale", "Water"]],
+      "query": "(match &self (InheritanceLink $x (ConceptNode Mammal)) $x)",
+      "expectSorted": ["Cat", "Dog", "Whale"]
+    },
+    {
+      "label": "grounded child filters the match",
+      "nodes": ["Dog", "Cat", "Whale", "Mammal", "Water"],
+      "links": [["InheritanceLink", "Whale", "Mammal"], ["EvaluationLink", "Whale", "Water"]],
+      "query": "(match &self (EvaluationLink $x (ConceptNode Water)) $x)",
+      "expectSorted": ["Whale"]
+    },
+    {
+      "label": "no match → empty",
+      "nodes": ["Dog", "Mammal"],
+      "links": [["InheritanceLink", "Dog", "Mammal"]],
+      "query": "(match &self (InheritanceLink $x (ConceptNode Bird)) $x)",
+      "expectSorted": []
+    }
+  ],
+  "program": [
+    {
+      "label": "rules + space match + eval in one program",
+      "nodes": ["Dog", "Whale", "Mammal"],
+      "links": [["InheritanceLink", "Dog", "Mammal"], ["InheritanceLink", "Whale", "Mammal"]],
+      "program": "(= (double $x) (+ $x $x)) (match &self (InheritanceLink $m (ConceptNode Mammal)) $m) (double 21)",
+      "expectSorted": ["42", "Dog", "Whale"]
+    }
+  ]
+}
