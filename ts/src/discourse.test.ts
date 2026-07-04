@@ -12,12 +12,13 @@ test('falsifiability: a claim without a refutation channel is rejected', () => {
   assert.match((r as { reason: string }).reason, /refutation channel/)
 })
 
-test('assertClaim seals the claim + creates its Test-Obligation channel', () => {
+test('assertClaim seals the claim + creates its Test-Obligation channel; CSKG provenance-bound', () => {
   const s = space()
-  const r = assertClaim(s, { id: 'c1', text: 'water boils at 100C at 1atm', refutationChannel: 'CTEST.thermo.boiling' })
+  const r = assertClaim(s, { id: 'c1', text: 'water boils at 100C at 1atm', refutationChannel: 'CTEST.thermo.boiling', sourceRefs: ['workspace-source:doc-42'] })
   assert.equal(r.ok, true)
   const g = new HellGraphStore(s)
   assert.ok(g.getNode('c1')?.labels.includes('Claim'), 'claim node')
+  assert.equal(g.getNode('c1')?.properties['sourceRefs'], 'workspace-source:doc-42', 'provenance-bound to a WorkspaceSource (CSKG invariant)')
   assert.ok(g.getNode('test-obligation:c1')?.labels.includes('TestObligation'), 'test-obligation node')
   assert.ok(g.allEdges().some((e) => e.label === 'REFUTATION_CHANNEL' && e.from === 'c1'), 'refutation channel edge')
   // codex integrity: untouched → INTACT/POS.

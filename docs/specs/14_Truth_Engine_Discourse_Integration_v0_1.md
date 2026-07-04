@@ -63,15 +63,35 @@ HellGraph **ECAN** (STI=w_fast, LTI=w_slow, `stimulate`=co-occurrence write,
 - **Memini = ECAN.** The associative-memory read/write path uses HellGraph ECAN + semantic —
   no parallel memory engine.
 
+## Discovered (2026-07-04): the contract-first architecture already exists
+
+Recon of the estate (read-only) shows this is NOT greenfield — the layering is already built
+and confirms HellGraph's role:
+- **prophet-workspace** (`feat/personal-context-graph`) holds the canonical **CSKG contract**
+  (`PersonalContextGraph.schema.json`): edges are `CSKGEdge {node1, relation, node2,
+  provenance_refs, source_evidence_refs}`, every element provenance-bound to a WorkspaceSource
+  (`workspace-source:*`), external-KG links reference-only (ProviderProjection). Its own
+  description states: *"the runtime that ingests WorkspaceSource objects and writes HellGraph
+  lives in memory-mesh; deployment (managed HellGraph service) lives in prophet-platform."*
+- **sourceos-spec** (`docs/crdt-over-evidence-fabric`) is actively building the CRDT-over-
+  evidence-fabric contract (our causal/evidence territory).
+- **prophet-platform** (`feat/capability-membrane`) is mid-feature (deployment home; my lane).
+
+**Consequence — conform, do not duplicate:** the discourse schema (`discourse.ts`) is a CSKG
+relation vocabulary (SUPPORTS/REFUTES/CITES/…) over CSKG nodes, provenance-bound via `sourceRefs`
+(WorkspaceSource ids) — DONE. New contracts MUST NOT be drafted in those repos in parallel with
+the concurrent agents; the relation vocabulary is registered with the workspace contract owner.
+
 ## Open decisions
 
 - **Truth Record cardinality.** Ours: 3-valued (POS/ZERO/NEG) + causal-cut (temporal) +
   tamper-detect (adversary-aware). "Multi-valued" applies to the record OVER TIME (many
   claims/verdicts/cuts), not to weakening a single non-downgradable proof. Confirm.
-- **Repo homes.** Truth-Engine substrate → hellgraph; discourse services + bus + registries →
-  prophet-platform; contracts + Truth Record + passport → prophet-workspace/sourceos-spec.
-- **Claim/warrant/evidence atom schema.** Coordinate with the concurrent cypher + CSKG-ingest
-  work (that IS the Discourse Graph DB ingest) so there is one atom schema, not two.
+- **Repo homes (confirmed).** Truth-Engine substrate → hellgraph; CSKG runtime → memory-mesh;
+  discourse services + bus + registries + managed HellGraph deployment → prophet-platform;
+  contracts (CSKG, CRDT-over-evidence, Truth Record, passport) → prophet-workspace/sourceos-spec.
+- **Register the discourse relation vocabulary** in the CSKG `relationVocabulary` — coordination
+  item with the prophet-workspace contract owner (do not fork the contract).
 - **Calibration/Bias Passport** = per-participant reasoning credential — reconcile with the
   Sacred-Capital / portable-reputation model (digital-soul).
 

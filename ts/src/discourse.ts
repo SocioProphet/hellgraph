@@ -11,6 +11,13 @@
  *    rejects a claim without one.
  *  - Telos ≠ Truth: recordTruth writes a verdict that comes from proof/codex + attestations — it
  *    takes NO policy input, so the policy (Telos) layer cannot assert truth through it.
+ *
+ * CSKG conformance (prophet-workspace PersonalContextGraph contract): discourse nodes are CSKG
+ * nodes and the edges are CSKGEdges (a relation vocabulary — SUPPORTS/REFUTES/CITES/…). Per the
+ * CSKG invariant, every element is PROVENANCE-BOUND: `sourceRefs` are WorkspaceSource ids
+ * (`workspace-source:*`, Layer-1 canonical objects), so retention/deletion of a source retracts
+ * its derived discourse elements. The relation vocabulary should be registered in the CSKG
+ * relationVocabulary (a coordination item with the workspace contract owner).
  */
 
 import { AtomSpace, nodeHandle } from './atomspace.js'
@@ -35,6 +42,8 @@ export interface Claim {
   text: string
   /** Falsifiability: how this claim can be refuted (a CTEST id / codex re-verify ref). Required. */
   refutationChannel: string
+  /** CSKG provenance binding: WorkspaceSource ids (`workspace-source:*`) this claim derives from. */
+  sourceRefs?: string[]
 }
 
 export interface Evidence {
@@ -42,6 +51,8 @@ export interface Evidence {
   text: string
   /** true = supports the claim, false = refutes it. */
   supports: boolean
+  /** CSKG provenance binding: WorkspaceSource ids this evidence derives from. */
+  sourceRefs?: string[]
 }
 
 /** A multi-valued, temporal, adversary-aware verdict — from proof/codex, never from policy. */
@@ -64,7 +75,11 @@ export function assertClaim(space: AtomSpace, claim: Claim): { ok: true } | { ok
     return { ok: false, reason: 'falsifiability: a claim requires a refutation channel (Test-Obligation)' }
   }
   const g = new HellGraphStore(space)
-  g.addNode(claim.id, [DISCOURSE_NODE.Claim], { text: claim.text, refutationChannel: claim.refutationChannel })
+  g.addNode(claim.id, [DISCOURSE_NODE.Claim], {
+    text: claim.text,
+    refutationChannel: claim.refutationChannel,
+    sourceRefs: (claim.sourceRefs ?? []).join(','), // CSKG provenance binding (WorkspaceSource ids)
+  })
   sealAtomContent(space, handleOf(claim.id), claim.text) // codex integrity on the claim text
   const obligationId = `test-obligation:${claim.id}`
   g.addNode(obligationId, [DISCOURSE_NODE.TestObligation], { channel: claim.refutationChannel })
@@ -75,7 +90,7 @@ export function assertClaim(space: AtomSpace, claim: Claim): { ok: true } | { ok
 /** Attach evidence (codex-sealed) to a claim with a SUPPORTS/REFUTES edge. */
 export function addEvidence(space: AtomSpace, claimId: string, ev: Evidence): void {
   const g = new HellGraphStore(space)
-  g.addNode(ev.id, [DISCOURSE_NODE.Evidence], { text: ev.text })
+  g.addNode(ev.id, [DISCOURSE_NODE.Evidence], { text: ev.text, sourceRefs: (ev.sourceRefs ?? []).join(',') })
   sealAtomContent(space, handleOf(ev.id), ev.text)
   g.addEdge(ev.supports ? DISCOURSE_EDGE.SUPPORTS : DISCOURSE_EDGE.REFUTES, ev.id, claimId, {})
 }
