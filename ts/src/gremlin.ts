@@ -160,16 +160,30 @@ export function runGremlin(store: HellGraphStore, query: string): GremlinResult 
 
 interface Step { name: string; args: (string | number)[] }
 
+// Linear hand-parser for `name(args).name(args)…` — every character is visited
+// once. The prior global-regex `exec` loop re-scanned the letter run at every
+// failed start position → O(n²) on `g.aaaa…` (js/polynomial-redos). No regex,
+// no backtracking here.
+const isAlpha = (c: number): boolean => (c >= 65 && c <= 90) || (c >= 97 && c <= 122)
+
 function parseSteps(query: string): Step[] {
-  const trimmed = query.trim().replace(/^g\./, '')
+  const s = query.trim().replace(/^g\./, '')
   const steps: Step[] = []
-  const re = /([A-Za-z]+)\s*\(([^)]*)\)/g
-  let m: RegExpExecArray | null
-  while ((m = re.exec(trimmed)) !== null) {
-    const name = m[1]
-    const argStr = m[2].trim()
-    const args = argStr === '' ? [] : splitArgs(argStr).map(parseArg)
-    steps.push({ name, args })
+  let i = 0
+  const n = s.length
+  while (i < n) {
+    // read a maximal step name (letters)
+    const nameStart = i
+    while (i < n && isAlpha(s.charCodeAt(i))) i++
+    if (i === nameStart) { i++; continue }          // not a name here → advance one char
+    const name = s.slice(nameStart, i)
+    if (s[i] !== '(') continue                        // name not followed by '(' → not a step
+    i++                                               // consume '('
+    const argStart = i
+    while (i < n && s[i] !== ')') i++                 // args run up to the first ')'
+    const argStr = s.slice(argStart, i).trim()
+    if (s[i] === ')') i++                             // consume ')'
+    steps.push({ name, args: argStr === '' ? [] : splitArgs(argStr).map(parseArg) })
   }
   return steps
 }
