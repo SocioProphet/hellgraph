@@ -85,6 +85,43 @@ test('onEvidence hook emits a receipt-spine record', () => {
   assert.equal(e.space, 'cypher-test')
 })
 
+// ─── Relationship TruthValue projection + filter + ORDER BY ─────────────────────
+
+function weighted(): AtomSpace {
+  // rain RelatedTo wet (conf high), rain RelatedTo dry (conf low)
+  const as = new AtomSpace('cypher-tv', false)
+  const mk = (rel: string, a: string, b: string, conf: number) => {
+    const an = as.addNode('ConceptNode', a).handle
+    const bn = as.addNode('ConceptNode', b).handle
+    const pred = as.addNode('PredicateNode', rel).handle
+    const list = as.addLink('ListLink', [an, bn]).handle
+    as.addLink('EvaluationLink', [pred, list], { tv: { strength: 1, confidence: conf } })
+  }
+  mk('RelatedTo', 'rain', 'wet', 0.9)
+  mk('RelatedTo', 'rain', 'dry', 0.1)
+  return as
+}
+
+test('bound relationship exposes edge TruthValue as r.confidence', () => {
+  const as = weighted()
+  const r = runCypher(as, 'MATCH (a)-[r:RelatedTo]->(b) WHERE a.form = "rain" RETURN b, r.confidence LIMIT 25')
+  const map = Object.fromEntries(r.rows.map((x) => [x.b, x['r.confidence']]))
+  assert.equal(map.wet, '0.9')
+  assert.equal(map.dry, '0.1')
+})
+
+test('WHERE comparison filters on edge confidence', () => {
+  const as = weighted()
+  const r = runCypher(as, 'MATCH (a)-[r:RelatedTo]->(b) WHERE a.form = "rain" AND r.confidence > 0.5 RETURN b LIMIT 25')
+  assert.deepEqual(r.rows, [{ b: 'wet' }])
+})
+
+test('ORDER BY r.confidence DESC ranks commonsense edges', () => {
+  const as = weighted()
+  const r = runCypher(as, 'MATCH (a)-[r:RelatedTo]->(b) WHERE a.form = "rain" RETURN b ORDER BY r.confidence DESC LIMIT 25')
+  assert.deepEqual(r.rows.map((x) => x.b), ['wet', 'dry'])
+})
+
 // ─── Sentinel policy (bounded, read-only) ──────────────────────────────────────
 
 test('mutation clauses are refused (read-only v0.1)', () => {
