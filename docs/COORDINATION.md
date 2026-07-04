@@ -20,6 +20,15 @@ the super-peer `/query` surface:
   expands `for k=lo..hi` unbounded → CPU/memory DoS. Cap the range (or the result size).
   (Tokenizer ReDoS already fixed — good.)
 
+Annealing epoch 2 additions:
+- **masking.ts — GCM nonce reuse at volume (MED, security-agent's file).** `maskValue` uses a
+  random 96-bit IV; one static key encrypting ~2^32 fields risks an IV collision, catastrophic
+  for GCM (plaintext-XOR leak + forgery). Bound encryptions per key + rotate before the birthday
+  limit, or use AES-GCM-SIV (nonce-misuse-resistant).
+- **turtle.ts / atomese.ts — recursive-parser depth DoS (MED, original engine).** Recursive-descent
+  parsers with no depth bound (same class fixed in metta.ts). Deeply-nested untrusted RDF/Atomese
+  via ingest/query → stack overflow. Add a depth guard.
+
 ## Active workstreams (2026-07-04)
 
 | repo · branch | workstream | converges on |
