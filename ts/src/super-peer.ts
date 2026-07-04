@@ -29,6 +29,8 @@ import type { AtomSpace } from './atomspace.js'
 import type { CausalCut } from './causal-proof.js'
 import { bearer, hasScope, type Scope, type TokenVerifier } from './auth.js'
 import type { AuditSink } from './policy.js'
+import { Metrics } from './metrics.js'
+import { RateLimiter } from './rate-limit.js'
 
 /** Per-route scope requirement (enforced only when an auth verifier is configured). */
 const ROUTE_SCOPE: Record<string, Scope> = {
@@ -43,6 +45,10 @@ export interface SuperPeerOptions extends FederatedOptions {
   auth?: TokenVerifier
   /** Append-only audit sink for auth denials (binds to the evidence spine in prod). */
   audit?: AuditSink
+  /** Prometheus metrics registry; if set, a public GET /metrics endpoint is exposed. */
+  metrics?: Metrics
+  /** Per-principal rate limiter for /query and /admit (429 on refusal). */
+  rateLimit?: RateLimiter
 }
 
 async function loadDep<T>(name: string): Promise<T | null> {
@@ -85,12 +91,14 @@ export class SuperPeer {
     private readonly fed: FederatedAtomSpace,
     private readonly auth: TokenVerifier | null = null,
     private readonly audit: AuditSink | null = null,
+    private readonly metrics: Metrics | null = null,
+    private readonly rateLimit: RateLimiter | null = null,
   ) {}
 
   /** Open (or join) a federation as a super-peer index. */
   static async create(storageDir: string, opts: SuperPeerOptions = {}): Promise<SuperPeer> {
     const fed = await FederatedAtomSpace.create(storageDir, opts)
-    return new SuperPeer(fed, opts.auth ?? null, opts.audit ?? null)
+    return new SuperPeer(fed, opts.auth ?? null, opts.audit ?? null, opts.metrics ?? null, opts.rateLimit ?? null)
   }
 
   /** True if this super-peer enforces authentication. */
@@ -191,6 +199,23 @@ export class SuperPeer {
       // Public liveness — unauthenticated so k8s/LB probes work even when auth is enforced.
       if (req.method === 'GET' && url.pathname === '/livez') return send(200, { ok: true })
 
+      // Public Prometheus metrics (network-restrict in prod).
+      if (req.method === 'GET' && url.pathname === '/metrics' && this.metrics) {
+        res.writeHead(200, { 'content-type': 'text/plain; version=0.0.4' })
+        res.end(this.metrics.render())
+        return
+      }
+      this.metrics?.inc('hellgraph_requests_total', { route: url.pathname })
+
+      // Per-principal rate limiting on the expensive/governance routes (before work).
+      if (this.rateLimit && req.method === 'POST' && (url.pathname === '/query' || url.pathname === '/admit')) {
+        const key = req.headers.authorization ?? req.socket.remoteAddress ?? 'anon'
+        if (!this.rateLimit.allow(key)) {
+          this.metrics?.inc('hellgraph_ratelimited_total', { route: url.pathname })
+          return send(429, { error: 'rate limited' })
+        }
+      }
+
       // AuthN/Z gate — enforced only when a verifier is configured (production).
       const scope = ROUTE_SCOPE[`${req.method} ${url.pathname}`]
       if (scope && this.auth) {
@@ -218,7 +243,9 @@ export class SuperPeer {
         if ((lang !== 'sparql' && lang !== 'gremlin' && lang !== 'metta') || typeof q !== 'string') {
           return send(400, { error: "body must be { lang: 'sparql'|'gremlin'|'metta', query: string }" })
         }
-        return send(200, { results: await this.query(lang, q) })
+        const results = await this.query(lang, q)
+        this.metrics?.inc('hellgraph_queries_total', { lang })
+        return send(200, { results })
       }
 
       if (req.method === 'POST' && url.pathname === '/admit') {
@@ -232,6 +259,7 @@ export class SuperPeer {
       }
       send(404, { error: 'not found' })
     } catch (err) {
+      this.metrics?.inc('hellgraph_errors_total')
       send(500, { error: err instanceof Error ? err.message : String(err) })
     }
   }
