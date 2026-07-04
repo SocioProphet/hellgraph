@@ -54,8 +54,14 @@ export function unmaskValue(wrapped: string, key: Buffer): string {
 }
 
 // ─── Minimal JSONPath (dot-path) resolve/set: $.a.b.c ────────────────────────────────
+// Prototype-pollution guard: a field path like `$.__proto__.x` would otherwise let setAtPath
+// walk into Object.prototype and pollute every object. Reject dangerous segments (defense in
+// depth — field paths come from policy config but must never be a pollution vector).
+const FORBIDDEN_SEGMENTS = new Set(['__proto__', 'constructor', 'prototype'])
 function pathKeys(jpath: string): string[] {
-  return jpath.replace(/^\$\.?/, '').split('.').filter(Boolean)
+  const keys = jpath.replace(/^\$\.?/, '').split('.').filter(Boolean)
+  for (const k of keys) if (FORBIDDEN_SEGMENTS.has(k)) throw new Error(`masking: unsafe path segment "${k}"`)
+  return keys
 }
 export function getAtPath(obj: unknown, jpath: string): unknown {
   return pathKeys(jpath).reduce<unknown>((acc, k) => (acc == null ? undefined : (acc as Record<string, unknown>)[k]), obj)

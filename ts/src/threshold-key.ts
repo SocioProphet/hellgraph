@@ -62,6 +62,16 @@ export function splitSecret(secret: Buffer, n: number, t: number, rand: (len: nu
 export function combineSecret(shares: Share[]): Buffer {
   if (shares.length < 2) throw new Error('need at least 2 shares')
   const len = shares[0]!.y.length
+  // Validate shares: a duplicate/out-of-range x makes a Lagrange denominator (x_j ⊕ x_m) zero,
+  // which SILENTLY reconstructs the WRONG key (no error). x=0 is the secret's own evaluation
+  // point. Reject these — a caller/attacker must not corrupt the key undetectably.
+  const seen = new Set<number>()
+  for (const s of shares) {
+    if (!Number.isInteger(s.x) || s.x < 1 || s.x > 255) throw new Error(`combineSecret: invalid share x=${s.x} (must be 1..255)`)
+    if (seen.has(s.x)) throw new Error(`combineSecret: duplicate share x=${s.x}`)
+    seen.add(s.x)
+    if (s.y.length !== len) throw new Error('combineSecret: inconsistent share length')
+  }
   const out = Buffer.alloc(len)
   for (let b = 0; b < len; b++) {
     let acc = 0

@@ -12,8 +12,16 @@ interface Bucket { tokens: number; last: number }
 export class RateLimiter {
   private readonly buckets = new Map<string, Bucket>()
 
-  constructor(private readonly ratePerSec: number, private readonly burst: number) {
+  constructor(
+    private readonly ratePerSec: number,
+    private readonly burst: number,
+    /** Cap on tracked keys — bounds memory against a flood of unique keys/tokens (DoS). When
+     *  exceeded, the least-recently-used bucket is evicted (a fresh key just gets a full burst,
+     *  so eviction cannot grant an attacker extra allowance). */
+    private readonly maxKeys = 100_000,
+  ) {
     if (ratePerSec <= 0 || burst <= 0) throw new Error('rate and burst must be > 0')
+    if (maxKeys <= 0) throw new Error('maxKeys must be > 0')
   }
 
   /** Consume one token for `key`; true if allowed, false if the bucket is empty. */
@@ -24,7 +32,13 @@ export class RateLimiter {
     b.last = now
     const ok = b.tokens >= 1
     if (ok) b.tokens -= 1
+    // Re-insertion moves the key to the end → Map iteration order gives us LRU for free.
+    this.buckets.delete(key)
     this.buckets.set(key, b)
+    if (this.buckets.size > this.maxKeys) {
+      const lru = this.buckets.keys().next().value
+      if (lru !== undefined) this.buckets.delete(lru)
+    }
     return ok
   }
 
