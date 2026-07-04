@@ -6,28 +6,33 @@ is the convergence contract so we end with **one schema + one spine**, not dupli
 
 ## Security findings for the file owners (adversarial hardening epoch)
 
-Fixed in my lane (codex/masking-path/threshold/rate-limit/policy/metta) with attack tests. These
-remain for the owners of the pre-existing / concurrent parsers — untrusted input reaches them via
-the super-peer `/query` surface:
+Epoch 3 went **cross-lane** (authorized) and closed the query-surface parser findings directly,
+each with an attack test (`security-hardening5.test.ts`). The super-peer `/query` surface takes
+untrusted SPARQL/Atomese/Turtle; these are the paths it reaches.
 
-- **sparql.ts — user-regex ReDoS (HIGH).** `FILTER regex(?x, <pattern>)` compiles a
-  user-supplied pattern (`new RegExp(expr.pattern, expr.flags)`); a query like
-  `FILTER regex(?x, "(a+)+$")` hangs the super-peer. Fix: RE2 / a size+time bound / reject
-  nested quantifiers. Also its tokenizer uses the backtracking `(?:[^"\\]|\\.)*` form — switch to
-  the unrolled `"[^"\\]*(?:\\.[^"\\]*)*"` (as cypher.ts already did).
-- **atomese.ts — tokenizer ReDoS (MED).** Same `(?:[^"\\]|\\.)*` backtracking form; unroll it.
-- **cypher.ts — variable-length path expansion (MED).** `MATCH ()-[*1..N]->()` with a huge N
-  expands `for k=lo..hi` unbounded → CPU/memory DoS. Cap the range (or the result size).
-  (Tokenizer ReDoS already fixed — good.)
+**FIXED in epoch 3:**
+- **sparql.ts — user-regex ReDoS (HIGH). ✅** `FILTER regex(?x, "(a+)+$")` no longer hangs:
+  `safeRegexTest` caps pattern (512) + input (8 KB) length and rejects the nested-quantifier
+  backtracking shape (heuristic, linear-time detector; RE2 remains the fully-general fix). The
+  tokenizer string literal is unrolled to `"[^"\\]*(?:\\.[^"\\]*)*"`. Also bounded the recursive
+  FILTER-expression parser (`MAX_FILTER_DEPTH` 256) — `FILTER((((…))))` was a parse+eval overflow.
+- **atomese.ts — tokenizer ReDoS + recursive-parser depth (MED). ✅** Tokenizer unrolled; `SParser`
+  now carries a `MAX_PARSE_DEPTH` (512) guard (same class as the metta.ts fix). `parseAtomese` has
+  no recovery catch, so deep nesting was an uncontrolled stack overflow → now a clean error.
+- **turtle.ts — recursive-parser depth DoS (MED). ✅** `termFull` (the choke point all `[…]`/`(…)`
+  nesting funnels through) bounds live stack depth (`MAX_TURTLE_DEPTH` 512); `parse()`'s
+  statement-level catch recovers.
+- **cypher.ts — variable-length path expansion (MED). ✅ already guarded** by the owner: unbounded
+  `[*1..]` is rejected and `e.hi > maxHops` (default 3) throws before the expansion loop. No change.
 
-Annealing epoch 2 additions:
-- **masking.ts — GCM nonce reuse at volume (MED, security-agent's file).** `maskValue` uses a
-  random 96-bit IV; one static key encrypting ~2^32 fields risks an IV collision, catastrophic
-  for GCM (plaintext-XOR leak + forgery). Bound encryptions per key + rotate before the birthday
-  limit, or use AES-GCM-SIV (nonce-misuse-resistant).
-- **turtle.ts / atomese.ts — recursive-parser depth DoS (MED, original engine).** Recursive-descent
-  parsers with no depth bound (same class fixed in metta.ts). Deeply-nested untrusted RDF/Atomese
-  via ingest/query → stack overflow. Add a depth guard.
+**REMAINS — coordinate, don't clobber (security-agent's hot files, unpushed work):**
+- **masking.ts — GCM nonce reuse at volume (MED).** `maskValue` uses a random 96-bit IV; one
+  static key encrypting ~2^32 fields risks an IV collision, catastrophic for GCM (plaintext-XOR
+  leak + forgery). Fix: bound encryptions per key + rotate before the birthday limit, or
+  AES-GCM-SIV (nonce-misuse-resistant). Left to the owner to avoid conflicting with the in-flight
+  scrypt-KDF work in this file.
+- **auth.ts — no-exp tokens + empty/short secret (MED).** Enforce `exp` + a minimum secret length.
+  Owner's file; same coordination reason.
 
 ## Active workstreams (2026-07-04)
 

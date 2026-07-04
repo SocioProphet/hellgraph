@@ -67,13 +67,18 @@ function tokenize(text: string): string[] {
   // Strip line comments (; …)
   const stripped = text.replace(/;[^\n]*/g, '')
   const tokens: string[] = []
-  const re = /\s*("(?:[^"\\]|\\.)*"|\(|\)|[^\s()]+)/g
+  // Unrolled string literal (`"[^"\\]*(?:\\.[^"\\]*)*"`) — linear-time, no ReDoS backtracking.
+  const re = /\s*("[^"\\]*(?:\\.[^"\\]*)*"|\(|\)|[^\s()]+)/g
   let m: RegExpExecArray | null
   while ((m = re.exec(stripped)) !== null) {
     if (m[1]) tokens.push(m[1])
   }
   return tokens
 }
+
+// Bound recursion depth: a deeply-nested `(((((…)))))` from untrusted ingest/query would
+// otherwise overflow the stack (a DoS). Same guard class as metta.ts MAX_PARSE_DEPTH.
+const MAX_PARSE_DEPTH = 512
 
 class SParser {
   private pos = 0
@@ -82,7 +87,8 @@ class SParser {
   private peek(): string | undefined { return this.tokens[this.pos] }
   private next(): string { return this.tokens[this.pos++] }
 
-  parseForm(): SExpr | null {
+  parseForm(depth = 0): SExpr | null {
+    if (depth > MAX_PARSE_DEPTH) throw new Error('atomese: expression nesting too deep')
     const tok = this.next()
     if (tok === undefined) return null
     if (tok !== '(') return unquote(tok)
@@ -101,7 +107,7 @@ class SParser {
     }
 
     while (this.peek() && this.peek() !== ')') {
-      const child = this.parseForm()
+      const child = this.parseForm(depth + 1)
       if (child !== null) form.rest.push(child)
     }
     this.next() // consume ')'

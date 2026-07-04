@@ -35,6 +35,9 @@ export function parseTurtle(text: string, baseUri = ''): RdfTriple[] {
   return new TurtleParser(text, baseUri).parse()
 }
 
+// Max term-nesting depth (blank-node lists / collections) before we reject as a stack-overflow DoS.
+const MAX_TURTLE_DEPTH = 512
+
 class TurtleParser {
   private pos = 0
   private bnodeSeq = 0
@@ -168,31 +171,40 @@ class TurtleParser {
     return t as IriTerm
   }
 
+  // All term nesting ([ … ] blank-node lists, ( … ) collections) recurses through termFull, so
+  // its live stack depth = the nesting depth. Bound it: deeply-nested `[[[…]]]` from untrusted
+  // input would otherwise overflow the stack (a DoS). parse()'s statement() catch recovers.
+  private depth = 0
   private termFull(isSubject: boolean): RdfTerm {
-    this.ws()
-    const c = this.ch()
-    if (c === '<') return { kind: 'iri', value: this.resolveIri(this.iriRef()) }
-    if (c === '[') return this.bnodePropertyList()
-    if (c === '(') return this.collection()
-    if (c === '_' && this.text[this.pos + 1] === ':') {
-      this.pos += 2; return { kind: 'bnode', value: '_:' + this.name() }
+    if (++this.depth > MAX_TURTLE_DEPTH) { this.depth--; throw new Error('turtle: term nesting too deep') }
+    try {
+      this.ws()
+      const c = this.ch()
+      if (c === '<') return { kind: 'iri', value: this.resolveIri(this.iriRef()) }
+      if (c === '[') return this.bnodePropertyList()
+      if (c === '(') return this.collection()
+      if (c === '_' && this.text[this.pos + 1] === ':') {
+        this.pos += 2; return { kind: 'bnode', value: '_:' + this.name() }
+      }
+      if (c === '"' || c === "'") return this.literal()
+      // true / false
+      if (this.peek(4) === 'true'  && /\W/.test(this.text[this.pos + 4] ?? '')) { this.pos += 4; return { kind: 'literal', value: 'true',  datatype: XSD_BOOLEAN } }
+      if (this.peek(5) === 'false' && /\W/.test(this.text[this.pos + 5] ?? '')) { this.pos += 5; return { kind: 'literal', value: 'false', datatype: XSD_BOOLEAN } }
+      // numeric
+      const numM = this.text.slice(this.pos).match(/^-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?/)
+      if (numM) {
+        const v = numM[0]; this.pos += v.length
+        return { kind: 'literal', value: v, datatype: v.includes('.') ? XSD_DECIMAL : XSD_INTEGER }
+      }
+      // 'a' shorthand (subject position also valid)
+      if (isSubject && c === 'a' && /[\s\t\n\r]/.test(this.text[this.pos + 1] ?? '')) {
+        this.pos++; return { kind: 'iri', value: RDF_TYPE }
+      }
+      // prefixed name
+      return this.prefixedName()
+    } finally {
+      this.depth--
     }
-    if (c === '"' || c === "'") return this.literal()
-    // true / false
-    if (this.peek(4) === 'true'  && /\W/.test(this.text[this.pos + 4] ?? '')) { this.pos += 4; return { kind: 'literal', value: 'true',  datatype: XSD_BOOLEAN } }
-    if (this.peek(5) === 'false' && /\W/.test(this.text[this.pos + 5] ?? '')) { this.pos += 5; return { kind: 'literal', value: 'false', datatype: XSD_BOOLEAN } }
-    // numeric
-    const numM = this.text.slice(this.pos).match(/^-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?/)
-    if (numM) {
-      const v = numM[0]; this.pos += v.length
-      return { kind: 'literal', value: v, datatype: v.includes('.') ? XSD_DECIMAL : XSD_INTEGER }
-    }
-    // 'a' shorthand (subject position also valid)
-    if (isSubject && c === 'a' && /[\s\t\n\r]/.test(this.text[this.pos + 1] ?? '')) {
-      this.pos++; return { kind: 'iri', value: RDF_TYPE }
-    }
-    // prefixed name
-    return this.prefixedName()
   }
 
   private prefixedName(): IriTerm {

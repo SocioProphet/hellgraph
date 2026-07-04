@@ -57,7 +57,9 @@ interface SparqlQuery {
 
 function tokenize(query: string): string[] {
   const tokens: string[] = []
-  const re = /\s*("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|<[^>]*>|\?[A-Za-z0-9_]+|-?\d+(?:\.\d+)?|[A-Za-z_][A-Za-z0-9_]*:[A-Za-z0-9_]*|[A-Za-z_][A-Za-z0-9_]*|<=|>=|!=|&&|\|\||[<>=]|[(){}.,;]|\S)/g
+  // String literals use the unrolled `"[^"\\]*(?:\\.[^"\\]*)*"` form — a linear-time equivalent
+  // of `"(?:[^"\\]|\\.)*"` that avoids polynomial ReDoS on adversarial input.
+  const re = /\s*("[^"\\]*(?:\\.[^"\\]*)*"|'[^'\\]*(?:\\.[^'\\]*)*'|<[^>]*>|\?[A-Za-z0-9_]+|-?\d+(?:\.\d+)?|[A-Za-z_][A-Za-z0-9_]*:[A-Za-z0-9_]*|[A-Za-z_][A-Za-z0-9_]*|<=|>=|!=|&&|\|\||[<>=]|[(){}.,;]|\S)/g
   let m: RegExpExecArray | null
   while ((m = re.exec(query)) !== null) {
     if (m[1]?.trim()) tokens.push(m[1])
@@ -194,19 +196,22 @@ class Parser {
     return expr
   }
 
-  private parseFilterExpr(): FilterExpr {
-    let left = this.parseFilterTerm()
+  private parseFilterExpr(depth = 0): FilterExpr {
+    // Bound recursion: a deeply-nested `FILTER((((…))))` would overflow the stack at parse time
+    // (and again in evalFilter) — a query-surface DoS. Reject past a sane nesting bound.
+    if (depth > MAX_FILTER_DEPTH) throw new Error('sparql: FILTER expression nesting too deep')
+    let left = this.parseFilterTerm(depth)
     while (this.peek() === '&&' || this.peek() === '||') {
       const op = this.next()
-      const right = this.parseFilterTerm()
+      const right = this.parseFilterTerm(depth)
       left = op === '&&' ? { kind: 'and', left, right } : { kind: 'or', left, right }
     }
     return left
   }
 
-  private parseFilterTerm(): FilterExpr {
+  private parseFilterTerm(depth = 0): FilterExpr {
     const tok = this.peek()
-    if (tok === '(') { this.next(); const e = this.parseFilterExpr(); this.expect(')'); return e }
+    if (tok === '(') { this.next(); const e = this.parseFilterExpr(depth + 1); this.expect(')'); return e }
     const fn = tok?.toLowerCase()
     if (fn === 'regex') {
       this.next(); this.expect('(')
@@ -324,6 +329,19 @@ function resolveValue(expr: ValueExpr, binding: Binding): PropertyValue {
   return expr.kind === 'var' ? (binding[expr.name] ?? null) : expr.value
 }
 
+// ReDoS guard for user-supplied FILTER regex (a query-surface DoS vector). Without an RE2
+// dependency: cap the pattern + input length and reject the classic catastrophic-backtracking
+// shape — a quantifier applied to a group that itself contains a quantifier, e.g. (a+)+, (a*)*,
+// (\d+)+. Heuristic (not exhaustive); the detector itself is linear-time. RE2 is the full fix.
+const MAX_REGEX_PATTERN = 512
+const MAX_REGEX_INPUT = 8192
+const MAX_FILTER_DEPTH = 256
+const NESTED_QUANTIFIER = /\([^)]*[+*][^)]*\)\s*[+*{]/
+function safeRegexTest(pattern: string, flags: string, value: string): boolean {
+  if (pattern.length > MAX_REGEX_PATTERN || NESTED_QUANTIFIER.test(pattern)) return false
+  try { return new RegExp(pattern, flags).test(value.slice(0, MAX_REGEX_INPUT)) } catch { return false }
+}
+
 function evalFilter(expr: FilterExpr, binding: Binding): boolean {
   switch (expr.kind) {
     case 'and': return evalFilter(expr.left, binding) && evalFilter(expr.right, binding)
@@ -332,7 +350,7 @@ function evalFilter(expr: FilterExpr, binding: Binding): boolean {
     case 'bound': return expr.varName in binding && binding[expr.varName] !== null
     case 'regex': {
       const v = resolveValue(expr.varExpr, binding)
-      try { return new RegExp(expr.pattern, expr.flags).test(String(v ?? '')) } catch { return false }
+      return safeRegexTest(expr.pattern, expr.flags, String(v ?? ''))
     }
     case 'contains': {
       const h = String(resolveValue(expr.haystack, binding) ?? '')
