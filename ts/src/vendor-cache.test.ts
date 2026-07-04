@@ -39,6 +39,18 @@ test('materialization is denied without opt-in (default-off egress)', async () =
   assert.equal(store.entry('doc1')!.state, 'Served', 'state unchanged')
 })
 
+test('residency: EU content is denied egress to a vendor approved only for US', async () => {
+  const store = new CanonicalObjectStore()
+  await store.ingest('doc1', PAYLOAD, { mime: 'application/json', residency: 'EU', sensitiveFields: ['$.phones.home'] })
+  store.setState('doc1', 'Served')
+  const vendor = new FakeVendor()
+  const mgr = new VendorCacheManager(store, new Governor(), StaticKeyProvider.fromPassphrase('k'), { gemini: vendor }, { gemini: ['US'] })
+  const r = await mgr.materialize('doc1', 'gemini', { optIn: true, ttlMs: 1000 })
+  assert.equal(r.ok, false)
+  assert.match((r as { reason: string }).reason, /residency-mismatch/)
+  assert.equal(vendor.uploads.size, 0, 'EU content did not leave to a US-only vendor')
+})
+
 test('opted-in materialization masks sensitive fields before egress + records a TTL handle', async () => {
   const { mgr, vendor, store } = await setup()
   const r = await mgr.materialize('doc1', 'gemini', { optIn: true, ttlMs: 1000, now: 0 })

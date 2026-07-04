@@ -245,7 +245,9 @@ export class SuperPeer {
         }
         const results = await this.query(lang, q)
         this.metrics?.inc('hellgraph_queries_total', { lang })
-        return send(200, { results })
+        // P5 (spec 09): results are frame-relative — return the causal cut they were answered
+        // against, so a client can bind them to (or re-check them under) that frame.
+        return send(200, { results, cut: await this.currentCut() })
       }
 
       if (req.method === 'POST' && url.pathname === '/admit') {

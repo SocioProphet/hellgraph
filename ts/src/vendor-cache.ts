@@ -48,6 +48,9 @@ export class VendorCacheManager {
     private readonly governor: Governor,
     private readonly key: KeyProvider,
     private readonly clients: Record<string, VendorFilesClient>,
+    /** Per-vendor approved residencies. When set for a vendor, egress of content whose residency
+     *  is not approved is denied (residency compliance). Unset → residency not enforced here. */
+    private readonly vendorResidencies: Record<string, string[]> = {},
   ) {}
 
   private keyOf(objectId: string, vendor: string): string { return `${objectId}:${vendor}` }
@@ -81,7 +84,7 @@ export class VendorCacheManager {
     const obj: ContentObject = { ...this.store.toPolicyObject(objectId), vendorOptIn: opts.optIn }
 
     // 1. Policy egress gate (opt-in default-deny) → also yields the mask obligations.
-    const eg = decide({ action: 'egress', object: obj, target: { kind: 'vendor', id: vendor } })
+    const eg = decide({ action: 'egress', object: obj, target: { kind: 'vendor', id: vendor, allowedResidencies: this.vendorResidencies[vendor] } })
     if (eg.effect === 'deny') return { ok: false, reason: `egress denied: ${eg.reason}` }
 
     // 2. Mask sensitive fields BEFORE egress.

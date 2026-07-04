@@ -26,7 +26,7 @@ export type Effect = 'allow' | 'deny'
 export interface PolicyContext {
   action: PolicyAction
   object: ContentObject & { legalHold?: boolean; connectorOptIn?: boolean }
-  target?: { kind: 'vendor' | 'connector' | 'internal'; id?: string; region?: string }
+  target?: { kind: 'vendor' | 'connector' | 'internal'; id?: string; region?: string; allowedResidencies?: string[] }
 }
 
 export interface Decision { effect: Effect; reason: string; obligations: string[] }
@@ -100,6 +100,16 @@ export function decide(ctx: PolicyContext, policy: Policy = { rules: [] }): Deci
   const allows = rules.filter((r) => r.effect === 'allow')
   const effect: Effect = allows.length > 0 ? 'allow' : DEFAULT_EFFECT[ctx.action]
   const reason = allows.length > 0 ? allows.map((r) => r.id).join(',') : `default:${effect}`
+
+  // Residency compliance: when the egress target declares its approved residencies
+  // (target.allowedResidencies — supplied by the layer that knows the target, e.g. the vendor
+  // cache), content whose residency is not approved is denied and NOT user-overridable. If no
+  // approval set is declared, residency is not evaluated at this call site.
+  if (effect === 'allow' && ctx.action === 'egress' && ctx.object.residency && ctx.target?.allowedResidencies) {
+    if (!ctx.target.allowedResidencies.includes(ctx.object.residency)) {
+      return { effect: 'deny', reason: 'residency-mismatch', obligations: [] }
+    }
+  }
 
   const obligations: string[] = []
   if (effect === 'allow') for (const r of allows) obligations.push(...(r.obligations ?? []))

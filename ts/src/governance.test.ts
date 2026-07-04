@@ -57,6 +57,19 @@ test('legal hold overrides retention: delete denied while held, allowed after re
   assert.equal(decide(released).effect, 'allow')
 })
 
+test('residency: when a target declares approvals, egress is denied unless the residency is approved', () => {
+  const base = obj({ state: 'Served', vendorOptIn: true, residency: 'EU' })
+  // No approval set declared → residency not evaluated at this call site (opt-in allow stands).
+  assert.equal(decide({ action: 'egress', object: base, target: { kind: 'vendor' } }).effect, 'allow')
+  // Target approved only for US → EU content denied.
+  const d2 = decide({ action: 'egress', object: base, target: { kind: 'vendor', allowedResidencies: ['US'] } })
+  assert.equal(d2.effect, 'deny')
+  assert.equal(d2.reason, 'residency-mismatch')
+  // Target approved for EU → allowed.
+  const ok = decide({ action: 'egress', object: base, target: { kind: 'vendor', allowedResidencies: ['EU', 'US'] } })
+  assert.equal(ok.effect, 'allow')
+})
+
 test('user policy cannot override a non-negotiable deny (deny-overrides)', () => {
   const ctx: PolicyContext = { action: 'egress', object: obj({ state: 'Served' }), target: { kind: 'vendor' } }
   const permissive = { rules: [{ id: 'user-allow-all', action: 'egress' as const, effect: 'allow' as const }] }

@@ -26,8 +26,12 @@ test('super-peer exposes /metrics and rate-limits /query (429)', async (t) => {
     // /livez is always public; a request bumps the counter.
     assert.equal((await fetch(`${base}/livez`)).status, 200)
 
-    // First query allowed, second throttled (burst 1).
-    assert.equal((await post()).status, 200)
+    // First query allowed and carries the causal cut it was answered against (P5, spec 09).
+    const first = await post()
+    assert.equal(first.status, 200)
+    const firstBody = await first.json()
+    assert.ok('cut' in firstBody, 'query response carries the causal frame (cut)')
+    // Second throttled (burst 1).
     assert.equal((await post()).status, 429, 'burst exhausted → 429')
 
     // /metrics is public and shows the recorded series.
