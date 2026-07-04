@@ -144,7 +144,10 @@ class TurtleParser {
       const m = this.base.match(/^(https?:\/\/[^/]+)/)
       return m ? m[1] + iri : iri
     }
-    const dir = this.base.replace(/[^/]*$/, '')
+    // Directory of the base = everything up to and including the last '/'.
+    // Linear slice (not `/[^/]*$/`, which is quadratic against the end anchor — js/polynomial-redos).
+    const slash = this.base.lastIndexOf('/')
+    const dir = slash >= 0 ? this.base.slice(0, slash + 1) : ''
     return dir + iri
   }
 
