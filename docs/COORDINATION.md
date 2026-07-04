@@ -4,6 +4,22 @@ Multiple agents are concurrently building the same conceptual territory across r
 is the convergence contract so we end with **one schema + one spine**, not duplicates. Authority:
 `docs/specs/14_Truth_Engine_Discourse_Integration_v0_1.md`.
 
+## Security findings for the file owners (adversarial hardening epoch)
+
+Fixed in my lane (codex/masking-path/threshold/rate-limit/policy/metta) with attack tests. These
+remain for the owners of the pre-existing / concurrent parsers — untrusted input reaches them via
+the super-peer `/query` surface:
+
+- **sparql.ts — user-regex ReDoS (HIGH).** `FILTER regex(?x, <pattern>)` compiles a
+  user-supplied pattern (`new RegExp(expr.pattern, expr.flags)`); a query like
+  `FILTER regex(?x, "(a+)+$")` hangs the super-peer. Fix: RE2 / a size+time bound / reject
+  nested quantifiers. Also its tokenizer uses the backtracking `(?:[^"\\]|\\.)*` form — switch to
+  the unrolled `"[^"\\]*(?:\\.[^"\\]*)*"` (as cypher.ts already did).
+- **atomese.ts — tokenizer ReDoS (MED).** Same `(?:[^"\\]|\\.)*` backtracking form; unroll it.
+- **cypher.ts — variable-length path expansion (MED).** `MATCH ()-[*1..N]->()` with a huge N
+  expands `for k=lo..hi` unbounded → CPU/memory DoS. Cap the range (or the result size).
+  (Tokenizer ReDoS already fixed — good.)
+
 ## Active workstreams (2026-07-04)
 
 | repo · branch | workstream | converges on |

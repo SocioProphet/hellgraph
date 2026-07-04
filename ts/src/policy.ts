@@ -51,10 +51,15 @@ function getPath(ctx: PolicyContext, path: string): unknown {
   return path.split('.').reduce<unknown>((acc, k) => (acc == null ? undefined : (acc as Record<string, unknown>)[k]), ctx)
 }
 
-export function evalCondition(cond: Condition, ctx: PolicyContext): boolean {
-  if ('all' in cond) return cond.all.every((c) => evalCondition(c, ctx))
-  if ('any' in cond) return cond.any.some((c) => evalCondition(c, ctx))
-  if ('not' in cond) return !evalCondition(cond.not, ctx)
+// Bound recursion so a deeply-nested (tenant-authored) condition fails cleanly instead of
+// overflowing the stack (DoS via `{all:[{all:[…]}]}`).
+const MAX_COND_DEPTH = 64
+
+export function evalCondition(cond: Condition, ctx: PolicyContext, depth = 0): boolean {
+  if (depth > MAX_COND_DEPTH) throw new Error('policy: condition nesting too deep')
+  if ('all' in cond) return cond.all.every((c) => evalCondition(c, ctx, depth + 1))
+  if ('any' in cond) return cond.any.some((c) => evalCondition(c, ctx, depth + 1))
+  if ('not' in cond) return !evalCondition(cond.not, ctx, depth + 1)
   const v = getPath(ctx, cond.attr)
   switch (cond.op) {
     case 'eq': return v === cond.value
