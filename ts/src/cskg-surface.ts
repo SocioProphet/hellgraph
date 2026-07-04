@@ -1,8 +1,8 @@
 import { createHash } from 'node:crypto'
 import { AtomSpace, nodeHandle, type Handle } from './atomspace'
 import {
-  edgeRecordFromAtom, findEdgeById, computeEdgeHandle, ingestEdgeRecord,
-  type CSKGEdgeRecord,
+  edgeRecordFromAtom, findEdgeById, computeEdgeHandle, ingestEdgeRecord, ingestEdgeRecords,
+  normalizeRelation, type CSKGEdgeRecord, type IngestReport,
 } from './cskg-ingest'
 
 /**
@@ -63,6 +63,7 @@ export interface SurfaceOptions {
 
 const now = () => new Date().toISOString()
 const sha256 = (s: string) => 'sha256:' + createHash('sha256').update(s).digest('hex')
+const byteCmp = (a: string, b: string) => Buffer.compare(Buffer.from(a, 'utf8'), Buffer.from(b, 'utf8'))
 const stable = (o: unknown): string => JSON.stringify(o, (_k, v) =>
   v && typeof v === 'object' && !Array.isArray(v)
     ? Object.fromEntries(Object.entries(v as Record<string, unknown>).sort(([a], [b]) => (a < b ? -1 : 1)))
@@ -194,4 +195,87 @@ export function commitSnapshot(as: AtomSpace, manifest: CSKGSnapshotManifest, op
     policyAttestation: attestation(`${manifest.snapshotId}|${manifestDigest}|${cut}`, opts),
   }
   return { result: { snapshotId: manifest.snapshotId, edgeCount: edgeIds.length, manifestDigest, cut }, commit }
+}
+
+// ─── PutAux / GetAux (edge-linked sparse facts) ─────────────────────────────────
+
+export interface CSKGAuxRecord { edgeId: string; key: string; value: string; mediaType?: string; contentHash?: string }
+
+/** PutAux — attach a sparse auxiliary fact by edge id (e.g. a weight, a note). */
+export function putAux(as: AtomSpace, aux: CSKGAuxRecord):
+  { edgeId: string; key: string; contentHash: string; found: boolean } {
+  const h = findEdgeById(as, aux.edgeId)
+  if (!h) return { edgeId: aux.edgeId, key: aux.key, contentHash: '', found: false }
+  const contentHash = aux.contentHash ?? sha256(aux.value)
+  as.setValue(h, `cskg:aux:${aux.key}`, { kind: 'string', value: [JSON.stringify({ value: aux.value, mediaType: aux.mediaType, contentHash })] })
+  return { edgeId: aux.edgeId, key: aux.key, contentHash, found: true }
+}
+
+/** All auxiliary facts attached to an edge. */
+export function getAux(as: AtomSpace, edgeId: string): CSKGAuxRecord[] {
+  const h = findEdgeById(as, edgeId)
+  const atom = h ? as.getAtom(h) : undefined
+  if (!atom) return []
+  const out: CSKGAuxRecord[] = []
+  for (const [k, v] of Object.entries(atom.values)) {
+    if (k.startsWith('cskg:aux:') && v.kind === 'string') {
+      const p = JSON.parse(v.value[0]) as { value: string; mediaType?: string; contentHash?: string }
+      out.push({ edgeId, key: k.slice('cskg:aux:'.length), value: p.value, mediaType: p.mediaType, contentHash: p.contentHash })
+    }
+  }
+  return out.sort((a, b) => byteCmp(a.key, b.key))
+}
+
+// ─── ScanEdges / GetSubgraphStream (QuerySpec-driven, deterministic order) ───────
+
+export interface CSKGQuerySpec {
+  seedIds?: string[]          // restrict to edges touching these node ids
+  relationFilter?: string[]   // canonical or raw relations
+  dimensionFilter?: string[]
+  sourceFilter?: string[]
+  limit?: number
+  cursor?: string             // resume strictly after this edge id (byte order)
+}
+
+/** ScanEdges — filtered edge scan with deterministic (edge-id byte) ordering. */
+export function scanEdges(as: AtomSpace, spec: CSKGQuerySpec = {}): CSKGEdgeRecord[] {
+  const rel = spec.relationFilter?.map(normalizeRelation)
+  const seeds = spec.seedIds ? new Set(spec.seedIds) : undefined
+  let recs: CSKGEdgeRecord[] = []
+  for (const e of as.getByType('EvaluationLink')) {
+    if (isTombstoned(as, e.handle)) continue
+    const r = edgeRecordFromAtom(as, e.handle)
+    if (!r) continue
+    if (seeds && !(seeds.has(r.node1) || seeds.has(r.node2))) continue
+    if (rel && !rel.includes(r.relation)) continue
+    if (spec.dimensionFilter && !(r.relationDimensions ?? []).some((d) => spec.dimensionFilter!.includes(d))) continue
+    if (spec.sourceFilter && !(r.sources ?? []).some((s) => spec.sourceFilter!.includes(s))) continue
+    recs.push(r)
+  }
+  recs.sort((a, b) => byteCmp(a.id, b.id))
+  if (spec.cursor) recs = recs.filter((r) => byteCmp(r.id, spec.cursor!) > 0)
+  return spec.limit != null ? recs.slice(0, spec.limit) : recs
+}
+
+/** GetSubgraphStream — bounded neighborhood expansion from seed node ids. */
+export function getSubgraphStream(as: AtomSpace, spec: CSKGQuerySpec = {}, hops = 1): CSKGEdgeRecord[] {
+  const visited = new Set(spec.seedIds ?? [])
+  const collected = new Map<string, CSKGEdgeRecord>()
+  let frontier = [...visited]
+  for (let hop = 0; hop < hops && frontier.length; hop++) {
+    const next: string[] = []
+    for (const r of scanEdges(as, { ...spec, seedIds: frontier, limit: undefined, cursor: undefined })) {
+      collected.set(r.id, r)
+      for (const n of [r.node1, r.node2]) if (!visited.has(n)) { visited.add(n); next.push(n) }
+    }
+    frontier = next
+  }
+  const out = [...collected.values()].sort((a, b) => byteCmp(a.id, b.id))
+  return spec.limit != null ? out.slice(0, spec.limit) : out
+}
+
+// ─── BulkPutEdges (high-throughput ingest, inherited semantics) ─────────────────
+
+export function bulkPutEdges(as: AtomSpace, recs: Iterable<CSKGEdgeRecord>): IngestReport {
+  return ingestEdgeRecords(as, recs)
 }
