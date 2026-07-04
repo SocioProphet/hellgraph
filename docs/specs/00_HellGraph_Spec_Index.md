@@ -77,6 +77,12 @@ Freeze the canonical semantics, interfaces, projections, and pilot overlays befo
    - marker-band parity (default 9 only); topic23.v1 residue source; unbalanced ternary v0
    - dependency ordering; codex past G3 BLOCKED upstream (profile alloc + topic23.v1 freeze)
 
+13. `13_Reflexive_Loop_and_Convergence_v0_1.md`
+   - bidirectional ontology↔epistemology loop over the kernel; convergence = "truth is what
+     survives the loop" as a checkable graph fixpoint (no new value families/epistemic modes)
+   - Hopf-fibration/S^n imagery is motivating metaphor ONLY — everything is falsifiable graph
+     state; authority stays with ProofValue + authored-canon + reasoning-evidence fabric
+
 ## Canonical Kernel Theorem
 
 One canonical core: immutable typed atoms plus versioned valuations.
