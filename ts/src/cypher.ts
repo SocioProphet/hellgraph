@@ -87,7 +87,10 @@ interface CypherAst {
 // ─── Tokenizer ─────────────────────────────────────────────────────────────────
 
 function tokenize(q: string): string[] {
-  const re = /\s*("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|\d+(?:\.\d+)?|\.\.|->|<-|<=|>=|<>|!=|[A-Za-z_][A-Za-z0-9_]*|[(){}\[\]:,.*=<>$-])/g
+  // String literals use the unrolled-loop form ("[^"\\]*(?:\\.[^"\\]*)*") — a
+  // linear-time equivalent of "(?:[^"\\]|\\.)*" that avoids polynomial ReDoS
+  // backtracking on inputs like `"\"\"\"…` (CodeQL js/polynomial-redos).
+  const re = /\s*("[^"\\]*(?:\\.[^"\\]*)*"|'[^'\\]*(?:\\.[^'\\]*)*'|\d+(?:\.\d+)?|\.\.|->|<-|<=|>=|<>|!=|[A-Za-z_][A-Za-z0-9_]*|[(){}\[\]:,.*=<>$-])/g
   const out: string[] = []
   let m: RegExpExecArray | null
   while ((m = re.exec(q)) !== null) if (m[1] !== undefined) out.push(m[1])
