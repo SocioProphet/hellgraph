@@ -29,16 +29,21 @@ const sym = (name: string): SExpr => ({ kind: 'sym', name })
 
 const tokenize = (text: string): string[] => text.match(/\(|\)|[^\s()]+/g) ?? []
 
+// Bound recursion so adversarial input like `((((…))))` fails cleanly instead of overflowing the
+// stack (DoS on the untrusted /query surface).
+const MAX_PARSE_DEPTH = 512
+
 function makeParser(toks: string[]): () => SExpr {
   let i = 0
-  const parse = (): SExpr => {
+  const parse = (depth = 0): SExpr => {
+    if (depth > MAX_PARSE_DEPTH) throw new Error('metta: expression nesting too deep')
     const t = toks[i++]
     if (t === undefined) throw new Error('metta: unexpected end of input')
     if (t === '(') {
       const items: SExpr[] = []
       while (toks[i] !== ')') {
         if (i >= toks.length) throw new Error('metta: unbalanced parens')
-        items.push(parse())
+        items.push(parse(depth + 1))
       }
       i++ // consume ')'
       return { kind: 'list', items }

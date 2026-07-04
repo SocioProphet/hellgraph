@@ -106,6 +106,15 @@ export function verifyClaim(space: AtomSpace, claimId: string, currentText: stri
  * linked to the claim; multiple records over time form the temporal, adversary-aware record.
  */
 export function recordTruth(space: AtomSpace, rec: TruthRecord): void {
+  // Trust boundary: a Truth Record MUST cite its backing — at least one Witness/Attestation
+  // (provenance + independence) and the causal frame it was derived under. This structurally
+  // blocks an unbacked verdict being asserted as truth (Telos ≠ Truth is not merely a convention).
+  if (!rec.attestations || rec.attestations.length === 0) {
+    throw new Error('recordTruth: a Truth Record requires ≥1 witness/attestation (unbacked verdict rejected)')
+  }
+  if (!rec.cut || Object.keys(rec.cut).length === 0) {
+    throw new Error('recordTruth: a Truth Record requires a non-empty causal frame (cut)')
+  }
   const g = new HellGraphStore(space)
   const recordId = `truth-record:${rec.claimId}:${rec.ts}`
   g.addNode(recordId, [DISCOURSE_NODE.TruthRecord], {

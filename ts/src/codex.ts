@@ -223,11 +223,16 @@ export const phiAtbash = notImpl('atbash (reflection permutation)')
 // ─── AtomSpace integration — default-on passive seal ────────────────────────────────
 
 const CODEX_KEY = 'codex:manifest'
+const INTEGRITY_KEY = 'codex:integrity' // FULL sha256 — the manifest's _sha256 is 64-bit (oracle parity)
 
-/** Seal content onto an atom as a `codex:manifest` value (JSON). Passive: no structural change. */
+const fullHash = (content: string): string => createHash('sha256').update(content, 'utf8').digest('hex')
+
+/** Seal content onto an atom: the `codex:manifest` (parity) + a full-256-bit integrity hash.
+ *  Passive: no structural change. */
 export function sealAtomContent(space: AtomSpace, handle: string, content: string, division?: number): Manifest {
   const m = manifest(content, division)
   space.setValue(handle, CODEX_KEY, { kind: 'string', value: [JSON.stringify(m)] })
+  space.setValue(handle, INTEGRITY_KEY, { kind: 'string', value: [fullHash(content)] })
   return m
 }
 
@@ -236,7 +241,15 @@ export function verifyAtomContent(space: AtomSpace, handle: string, currentConte
   const atom = space.getAtom(handle)
   const raw = atom?.values[CODEX_KEY]
   if (!raw || raw.kind !== 'string' || !raw.value[0]) throw new Error(`${ERR_MANIFEST_MISMATCH}: atom ${handle} is unsealed`)
-  return syndrome(JSON.parse(raw.value[0]) as Manifest, currentContent)
+  const syn = syndrome(JSON.parse(raw.value[0]) as Manifest, currentContent)
+  // Full-256-bit backstop: the manifest's _sha256 is truncated to 64 bits, which is birthday-weak
+  // for tamper-evidence (~2^32 to force a collision that also matches the formal facets). Compare
+  // the full hash — any byte change, including one that fools the 64-bit manifest, forces NEG.
+  const integ = atom!.values[INTEGRITY_KEY]
+  if (integ?.kind === 'string' && integ.value[0] && fullHash(currentContent) !== integ.value[0]) {
+    return { ...syn, exact: false, verdict: 'NEG' }
+  }
+  return syn
 }
 
 /**
