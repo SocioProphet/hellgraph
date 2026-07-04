@@ -83,6 +83,13 @@ Freeze the canonical semantics, interfaces, projections, and pilot overlays befo
    - Hopf-fibration/S^n imagery is motivating metaphor ONLY — everything is falsifiable graph
      state; authority stays with ProofValue + authored-canon + reasoning-evidence fabric
 
+14. `14_Truth_Engine_Discourse_Integration_v0_1.md`
+   - aligns HellGraph as the Truth-Engine/Discourse-Graph substrate for the Telos governance
+     layer + discourse-hygiene pipeline + Memini memory (ECAN); prophet-platform=runtime,
+     prophet-workspace/sourceos-spec=contracts
+   - invariants: one evidence spine · Telos≠Truth (policy gates, proof asserts) · sovereign
+     graph≠event bus · falsifiability=Test-Obligation · Memini=ECAN
+
 ## Canonical Kernel Theorem
 
 One canonical core: immutable typed atoms plus versioned valuations.
