@@ -25,6 +25,7 @@ import { HellGraphStore } from './store.js'
 import { runSparql } from './sparql.js'
 import { runGremlin } from './gremlin.js'
 import { runMetta } from './metta.js'
+import { runCypher } from './cypher.js'
 import type { AtomSpace } from './atomspace.js'
 import type { CausalCut } from './causal-proof.js'
 import { bearer, hasScope, type Scope, type TokenVerifier } from './auth.js'
@@ -69,7 +70,7 @@ interface SwarmInstance {
 }
 type SwarmCtor = new () => SwarmInstance
 
-export type QueryLang = 'sparql' | 'gremlin' | 'metta'
+export type QueryLang = 'sparql' | 'gremlin' | 'metta' | 'cypher'
 
 export interface SuperPeerHealth {
   ok: true
@@ -130,6 +131,7 @@ export class SuperPeer {
    *  the AtomSpace). */
   async query(lang: QueryLang, q: string): Promise<unknown> {
     if (lang === 'metta') return runMetta(await this.atomSpace(), q)
+    if (lang === 'cypher') return runCypher(await this.atomSpace(), q)
     const store = await this.store()
     return lang === 'sparql' ? runSparql(store, q) : runGremlin(store, q)
   }
@@ -240,8 +242,8 @@ export class SuperPeer {
         const body = await readJson(req)
         const lang = body['lang']
         const q = body['query']
-        if ((lang !== 'sparql' && lang !== 'gremlin' && lang !== 'metta') || typeof q !== 'string') {
-          return send(400, { error: "body must be { lang: 'sparql'|'gremlin'|'metta', query: string }" })
+        if ((lang !== 'sparql' && lang !== 'gremlin' && lang !== 'metta' && lang !== 'cypher') || typeof q !== 'string') {
+          return send(400, { error: "body must be { lang: 'sparql'|'gremlin'|'metta'|'cypher', query: string }" })
         }
         const results = await this.query(lang, q)
         this.metrics?.inc('hellgraph_queries_total', { lang })
