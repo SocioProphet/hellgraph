@@ -24,6 +24,8 @@ import { FederatedAtomSpace, type FederatedOptions } from './autobase-view.js'
 import { HellGraphStore } from './store.js'
 import { runSparql } from './sparql.js'
 import { runGremlin } from './gremlin.js'
+import { runMetta } from './metta.js'
+import type { AtomSpace } from './atomspace.js'
 import type { CausalCut } from './causal-proof.js'
 import { bearer, hasScope, type Scope, type TokenVerifier } from './auth.js'
 import type { AuditSink } from './policy.js'
@@ -61,7 +63,7 @@ interface SwarmInstance {
 }
 type SwarmCtor = new () => SwarmInstance
 
-export type QueryLang = 'sparql' | 'gremlin'
+export type QueryLang = 'sparql' | 'gremlin' | 'metta'
 
 export interface SuperPeerHealth {
   ok: true
@@ -76,7 +78,7 @@ export class SuperPeer {
   private server: http.Server | null = null
   private swarm: SwarmInstance | null = null
   // Materialization cache: re-materialize only when the linearization grows.
-  private cachedStore: HellGraphStore | null = null
+  private cachedSpace: AtomSpace | null = null
   private cachedLen = -1
 
   private constructor(
@@ -101,20 +103,25 @@ export class SuperPeer {
 
   // ─── Indexing ────────────────────────────────────────────────────────────────
 
-  /** The current materialized view, re-derived only when new ops have linearized. */
-  async store(): Promise<HellGraphStore> {
+  /** The current materialized AtomSpace, re-derived only when new ops have linearized. */
+  async atomSpace(): Promise<AtomSpace> {
     const len = (await this.fed.linearization()).length
-    if (!this.cachedStore || len !== this.cachedLen) {
-      this.cachedStore = await this.fed.materializeStore()
+    if (!this.cachedSpace || len !== this.cachedLen) {
+      this.cachedSpace = await this.fed.materialize()
       this.cachedLen = len
     }
-    return this.cachedStore
+    return this.cachedSpace
   }
+
+  /** The current materialized view as a property-graph store. */
+  async store(): Promise<HellGraphStore> { return new HellGraphStore(await this.atomSpace()) }
 
   async currentCut(): Promise<CausalCut> { return this.fed.currentCut() }
 
-  /** Run a read query over the materialized view. */
+  /** Run a read query over the materialized view (SPARQL/Gremlin over the store, MeTTa/DAS over
+   *  the AtomSpace). */
   async query(lang: QueryLang, q: string): Promise<unknown> {
+    if (lang === 'metta') return runMetta(await this.atomSpace(), q)
     const store = await this.store()
     return lang === 'sparql' ? runSparql(store, q) : runGremlin(store, q)
   }
@@ -205,8 +212,8 @@ export class SuperPeer {
         const body = await readJson(req)
         const lang = body['lang']
         const q = body['query']
-        if ((lang !== 'sparql' && lang !== 'gremlin') || typeof q !== 'string') {
-          return send(400, { error: "body must be { lang: 'sparql'|'gremlin', query: string }" })
+        if ((lang !== 'sparql' && lang !== 'gremlin' && lang !== 'metta') || typeof q !== 'string') {
+          return send(400, { error: "body must be { lang: 'sparql'|'gremlin'|'metta', query: string }" })
         }
         return send(200, { results: await this.query(lang, q) })
       }
