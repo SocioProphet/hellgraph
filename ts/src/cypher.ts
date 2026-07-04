@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto'
-import { AtomSpace } from './atomspace'
+import { AtomSpace, nodeHandle, linkHandle, type Handle } from './atomspace'
 import { findMatches, V, N, L, type Pattern, type PatternTerm } from './patternMatcher'
 
 /**
@@ -15,17 +15,17 @@ import { findMatches, V, N, L, type Pattern, type PatternTerm } from './patternM
  *   (a)-[:IsA]->(b)
  * lowers to the Atomese standard
  *   EvaluationLink (PredicateNode "IsA") (ListLink (ConceptNode a) (ConceptNode b))
- * so the Archetype's CSKG query — `MATCH (h:Concept {form:$lemma})-[:CSKG*1..2]->(t)`
- * — runs natively as bounded multi-hop pattern matching over ConceptNodes.
+ * so `MATCH (h:Concept {form:$lemma})-[:CSKG*1..2]->(t)` runs as bounded
+ * multi-hop matching. A bound relationship `-[r:IsA]->` exposes the edge's
+ * TruthValue as `r.strength` / `r.confidence`, so CSKG edge weights are
+ * filterable and sortable: `WHERE r.confidence > 0.5 ... ORDER BY r.confidence DESC`.
  *
  * Sentinel discipline (Archetype §3.2 / §14): this v0.1 is READ-ONLY, rejects
  * unbounded traversals, caps hop-count, and requires a LIMIT — so an agent can
- * never issue an accidentally expensive query. Writes (CREATE/MERGE/SET/DELETE)
- * are refused unless explicitly opted in.
+ * never issue an accidentally expensive query.
  *
  * Every query carries a snapshot (`evaluatedAtSeq`) and a `queryHash`, so the
- * result is bindable to the reasoning-evidence receipt spine (a grounded query
- * is a recordable justification: propose → query → justify → decide → record).
+ * result is bindable to the reasoning-evidence receipt spine.
  */
 
 const NODE_TYPE_DEFAULT = 'ConceptNode'
@@ -34,17 +34,11 @@ const REL_PRED = 'PredicateNode'
 const REL_LIST = 'ListLink'
 
 export interface CypherOptions {
-  /** Maximum variable-length hop count (Sentinel). Default 3. */
-  maxHops?: number
-  /** Require an explicit LIMIT clause (Sentinel). Default true. */
-  requireLimit?: boolean
-  /** Hard cap on returned rows regardless of LIMIT. Default 1000. */
-  maxRows?: number
-  /** Allow mutation clauses (CREATE/MERGE/SET/DELETE). Default false. */
-  allowWrite?: boolean
-  /** Declared epistemic mode carried onto the evidence record. */
-  mode?: string
-  /** Optional hook to emit a receipt-spine evidence record for this query. */
+  maxHops?: number          // Sentinel: max variable-length hops. Default 3.
+  requireLimit?: boolean    // Sentinel: require an explicit LIMIT. Default true.
+  maxRows?: number          // Hard row cap. Default 1000.
+  allowWrite?: boolean      // Allow mutation clauses. Default false.
+  mode?: string             // Declared epistemic mode carried onto evidence.
   onEvidence?: (rec: CypherEvidence) => void
 }
 
@@ -64,17 +58,18 @@ export interface CypherResult {
   evaluatedAtSeq: number
   queryHash: string
   useSpace?: string
-  /** Populated instead of rows when the query is `EXPLAIN`. */
-  plan?: Pattern[]
+  plan?: Pattern[]          // populated for EXPLAIN
 }
 
 // ─── AST ─────────────────────────────────────────────────────────────────────
 
 interface NodePat { var?: string; label?: string; props: { key: string; value: string }[] }
-interface EdgePat { rel: string; dir: 'out' | 'in' | 'both'; lo: number; hi: number }
+interface EdgePat { var?: string; rel: string; dir: 'out' | 'in' | 'both'; lo: number; hi: number }
 interface PathPat { nodes: NodePat[]; edges: EdgePat[] }
 interface LinkPat { linkType: string; alias?: string; roleVars: string[] }
-interface WhereEq { var: string; prop: string; value: string }
+interface ColRef { var: string; prop?: string }
+type CmpOp = '=' | '!=' | '<' | '>' | '<=' | '>='
+interface Filter { lhs: ColRef; op: CmpOp; rhs: string | number }
 
 interface CypherAst {
   useSpace?: string
@@ -82,15 +77,17 @@ interface CypherAst {
   write: boolean
   paths: PathPat[]
   links: LinkPat[]
-  where: WhereEq[]
-  ret: { var: string; prop?: string }[] | '*'
+  pins: { var: string; value: string }[]   // form/name equalities → node-name pins
+  filters: Filter[]                          // general comparisons → post-match filter
+  ret: ColRef[] | '*'
+  orderBy: { key: string; desc: boolean }[]
   limit?: number
 }
 
 // ─── Tokenizer ─────────────────────────────────────────────────────────────────
 
 function tokenize(q: string): string[] {
-  const re = /\s*("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|\d+|\.\.|->|<-|<=|>=|!=|[A-Za-z_][A-Za-z0-9_]*|[(){}\[\]:,.*=<>$-])/g
+  const re = /\s*("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|\d+(?:\.\d+)?|\.\.|->|<-|<=|>=|<>|!=|[A-Za-z_][A-Za-z0-9_]*|[(){}\[\]:,.*=<>$-])/g
   const out: string[] = []
   let m: RegExpExecArray | null
   while ((m = re.exec(q)) !== null) if (m[1] !== undefined) out.push(m[1])
@@ -98,8 +95,8 @@ function tokenize(q: string): string[] {
 }
 
 const unquote = (t: string) => t.replace(/^["']|["']$/g, '').replace(/\\(.)/g, '$1')
-
 const WRITE_KW = new Set(['CREATE', 'MERGE', 'SET', 'DELETE', 'REMOVE'])
+const isNum = (t?: string) => t !== undefined && /^\d+(\.\d+)?$/.test(t)
 
 // ─── Parser ────────────────────────────────────────────────────────────────────
 
@@ -115,22 +112,23 @@ class Parser {
   }
 
   parse(): CypherAst {
-    const ast: CypherAst = { explain: false, write: false, paths: [], links: [], where: [], ret: '*' }
+    const ast: CypherAst = { explain: false, write: false, paths: [], links: [], pins: [], filters: [], ret: '*', orderBy: [] }
     if (this.up() === 'EXPLAIN' || this.up() === 'PROFILE') { ast.explain = this.up() === 'EXPLAIN'; this.next() }
     if (this.up() === 'USE') { this.next(); this.expect('SPACE'); ast.useSpace = this.next() }
 
     while (this.peek()) {
       const kw = this.up()!
-      if (WRITE_KW.has(kw)) { ast.write = true; this.next(); continue }        // flagged; refused later
+      if (WRITE_KW.has(kw)) { ast.write = true; this.next(); continue }
       if (kw === 'MATCH') {
         this.next()
         if (this.up() === 'LINK') { this.next(); ast.links.push(this.parseLink()) }
         else ast.paths.push(this.parsePath())
       } else if (kw === 'OPTIONAL') { this.next(); this.expect('MATCH'); ast.paths.push(this.parsePath()) }
-      else if (kw === 'WHERE') { this.next(); ast.where.push(...this.parseWhere()) }
+      else if (kw === 'WHERE') { this.next(); this.parseWhere(ast) }
       else if (kw === 'RETURN') { this.next(); ast.ret = this.parseReturn() }
+      else if (kw === 'ORDER') { this.next(); this.expect('BY'); this.parseOrderBy(ast) }
       else if (kw === 'LIMIT') { this.next(); ast.limit = parseInt(this.next(), 10) }
-      else if (kw === 'WITH' || kw === 'ORDER' || kw === 'UNWIND') { this.next() }  // tolerated no-ops in v0.1
+      else if (kw === 'WITH' || kw === 'UNWIND') { this.next() }
       else this.next()
     }
     return ast
@@ -160,17 +158,17 @@ class Parser {
     const edge: EdgePat = { rel: '', dir: dirIn ? 'in' : 'out', lo: 1, hi: 1 }
     if (this.peek() === '[') {
       this.next()
+      if (this.peek() && this.peek() !== ':' && this.peek() !== '*' && this.peek() !== ']') edge.var = this.next()   // -[r:REL]->
       if (this.peek() === ':') this.next()
       if (this.peek() && this.peek() !== '*' && this.peek() !== ']') edge.rel = this.next()
       if (this.peek() === '*') {
         this.next()
-        edge.lo = this.peek() && /^\d+$/.test(this.peek()!) ? parseInt(this.next(), 10) : 1
-        if (this.peek() === '..') { this.next(); if (!this.peek() || !/^\d+$/.test(this.peek()!)) throw new Error('Cypher: unbounded variable-length path (missing upper hop bound) is rejected'); edge.hi = parseInt(this.next(), 10) }
+        edge.lo = isNum(this.peek()) ? parseInt(this.next(), 10) : 1
+        if (this.peek() === '..') { this.next(); if (!isNum(this.peek())) throw new Error('Cypher: unbounded variable-length path (missing upper hop bound) is rejected'); edge.hi = parseInt(this.next(), 10) }
         else edge.hi = edge.lo
       }
       this.expect(']')
     }
-    // arrow tail
     if (this.peek() === '->') { this.next(); if (dirIn) edge.dir = 'both' }
     else if (this.peek() === '-') { this.next(); if (!dirIn) edge.dir = 'both' }
     return edge
@@ -186,7 +184,6 @@ class Parser {
   }
 
   private parseLink(): LinkPat {
-    // MATCH LINK d:Decrypt(caller=p, key=k)
     let alias: string | undefined
     let first = this.next()
     if (this.peek() === ':') { alias = first; this.next(); first = this.next() }
@@ -200,20 +197,24 @@ class Parser {
     return link
   }
 
-  private parseWhere(): WhereEq[] {
-    const eqs: WhereEq[] = []
+  private parseWhere(ast: CypherAst): void {
     for (;;) {
-      const v = this.next(); this.expect('.'); const prop = this.next(); this.expect('=')
-      eqs.push({ var: v, prop, value: this.resolveVal(this.next()) })
+      const v = this.next(); this.expect('.'); const prop = this.next()
+      const opTok = this.next()
+      const op: CmpOp = (opTok === '<>' ? '!=' : opTok) as CmpOp
+      const rawTok = this.next()
+      const rhs = isNum(rawTok) ? Number(rawTok) : this.resolveVal(rawTok)
+      // form/name equality → node-name pin (compile-time). Everything else → filter.
+      if (op === '=' && (prop === 'form' || prop === 'name') && typeof rhs === 'string') ast.pins.push({ var: v, value: rhs })
+      else ast.filters.push({ lhs: { var: v, prop }, op, rhs })
       if (this.up() === 'AND') { this.next(); continue }
       break
     }
-    return eqs
   }
 
-  private parseReturn(): { var: string; prop?: string }[] | '*' {
+  private parseReturn(): ColRef[] | '*' {
     if (this.peek() === '*') { this.next(); return '*' }
-    const cols: { var: string; prop?: string }[] = []
+    const cols: ColRef[] = []
     while (this.peek() && this.up() !== 'LIMIT' && this.up() !== 'ORDER') {
       const v = this.next()
       let prop: string | undefined
@@ -224,73 +225,103 @@ class Parser {
     return cols
   }
 
+  private parseOrderBy(ast: CypherAst): void {
+    while (this.peek() && this.up() !== 'LIMIT') {
+      const v = this.next()
+      let prop: string | undefined
+      if (this.peek() === '.') { this.next(); prop = this.next() }
+      let desc = false
+      if (this.up() === 'ASC' || this.up() === 'DESC') { desc = this.up() === 'DESC'; this.next() }
+      ast.orderBy.push({ key: prop ? `${v}.${prop}` : v, desc })
+      if (this.peek() === ',') this.next(); else break
+    }
+  }
+
   private resolveVal(tok: string): string {
-    if (tok?.startsWith('$')) return this.params[this.next()] ?? ''  // $ then name
     if (tok === '$') return this.params[this.next()] ?? ''
+    if (tok?.startsWith('$')) return this.params[tok.slice(1)] ?? ''
     return unquote(tok)
   }
 }
 
-// ─── Compiler: AST → native Pattern(s) ──────────────────────────────────────────
+// ─── Compiler: AST → native Pattern(s) + edge specs (for TruthValue projection) ──
 
-function nodeTerm(n: NodePat, pin: Map<string, string>): PatternTerm {
+type TermRef = { kind: 'var'; name: string; type: string } | { kind: 'node'; type: string; name: string }
+interface EdgeSpec { var?: string; rel: string; dir: 'out' | 'in' | 'both'; src: TermRef; tgt: TermRef }
+
+let anon = 0
+function nodeTermRef(n: NodePat, pin: Map<string, string>): TermRef {
   const type = n.label && n.label !== 'Concept' ? n.label : NODE_TYPE_DEFAULT
   const inline = n.props.find((p) => p.key === 'form' || p.key === 'name')?.value
   const pinned = inline ?? (n.var ? pin.get(n.var) : undefined)
-  if (pinned) return N(type, pinned)
-  return V(n.var ?? `_anon${anon++}`, type)
+  if (pinned) return { kind: 'node', type, name: pinned }
+  return { kind: 'var', name: n.var ?? `_anon${anon++}`, type }
 }
-let anon = 0
+const asTerm = (r: TermRef): PatternTerm => (r.kind === 'node' ? N(r.type, r.name) : V(r.name, r.type))
 
 function edgeClause(rel: string, src: PatternTerm, tgt: PatternTerm, dir: 'out' | 'in' | 'both') {
   const [a, b] = dir === 'in' ? [tgt, src] : [src, tgt]
   return L(REL_LINK, N(REL_PRED, rel), L(REL_LIST, a, b))
 }
 
-/** A single path compiles to one-or-more Patterns (variable-length → alternatives). */
-function compilePath(path: PathPat, pin: Map<string, string>): Pattern[] {
+interface Compiled { patterns: Pattern[]; edgeSpecs: EdgeSpec[] }
+
+function compile(ast: CypherAst): Compiled {
   anon = 0
-  const terms = path.nodes.map((n) => nodeTerm(n, pin))
-  // Only a single variable-length edge is expanded (the CSKG multi-hop case);
-  // multi-edge paths use fixed length per edge.
-  if (path.edges.length === 1 && (path.edges[0].lo !== 1 || path.edges[0].hi !== 1)) {
-    const e = path.edges[0]
-    const patterns: Pattern[] = []
-    for (let k = e.lo; k <= e.hi; k++) {
-      const clauses: Extract<PatternTerm, { kind: 'link' }>[] = []
-      let prev = terms[0]
-      for (let i = 0; i < k; i++) {
-        const next = i === k - 1 ? terms[1] : V(`_mid${i}`, NODE_TYPE_DEFAULT)
-        clauses.push(edgeClause(e.rel, prev, next, e.dir))
-        prev = next
+  const pin = new Map<string, string>()
+  for (const p of ast.pins) pin.set(p.var, p.value)
+
+  const fixedClauses: Extract<PatternTerm, { kind: 'link' }>[] = []
+  const edgeSpecs: EdgeSpec[] = []
+  let varAlternatives: Pattern[] | null = null
+
+  for (const path of ast.paths) {
+    const refs = path.nodes.map((n) => nodeTermRef(n, pin))
+    if (path.edges.length === 1 && (path.edges[0].lo !== 1 || path.edges[0].hi !== 1)) {
+      // variable-length: expand to alternatives (no edge-var TV projection here)
+      const e = path.edges[0]
+      const alts: Pattern[] = []
+      for (let k = e.lo; k <= e.hi; k++) {
+        const clauses: Extract<PatternTerm, { kind: 'link' }>[] = []
+        let prev = asTerm(refs[0])
+        for (let i = 0; i < k; i++) {
+          const next = i === k - 1 ? asTerm(refs[1]) : V(`_mid${i}`, NODE_TYPE_DEFAULT)
+          clauses.push(edgeClause(e.rel, prev, next, e.dir))
+          prev = next
+        }
+        alts.push({ clauses })
       }
-      patterns.push({ clauses })
+      varAlternatives = alts
+    } else {
+      path.edges.forEach((e, i) => {
+        fixedClauses.push(edgeClause(e.rel, asTerm(refs[i]), asTerm(refs[i + 1]), e.dir))
+        edgeSpecs.push({ var: e.var, rel: e.rel, dir: e.dir, src: refs[i], tgt: refs[i + 1] })
+      })
     }
-    return patterns
   }
-  const clauses = path.edges.map((e, i) => edgeClause(e.rel, terms[i], terms[i + 1], e.dir))
-  return [{ clauses }]
+  for (const lk of ast.links) fixedClauses.push(L(lk.linkType, ...lk.roleVars.map((v) => V(v))))
+
+  const patterns = varAlternatives
+    ? varAlternatives.map((alt) => ({ clauses: [...fixedClauses, ...alt.clauses] }))
+    : [{ clauses: fixedClauses }]
+  return { patterns, edgeSpecs }
 }
 
-function compile(ast: CypherAst): Pattern[] {
-  const pin = new Map<string, string>()
-  for (const w of ast.where) if (w.prop === 'form' || w.prop === 'name') pin.set(w.var, w.value)
+// ─── Edge TruthValue resolution ──────────────────────────────────────────────
 
-  // A pattern set is the cross of each path's alternatives, merged into one
-  // conjunctive Pattern (plus native links). For simplicity v0.1 supports a
-  // single variable-length path; fixed paths and links all conjoin.
-  const fixedClauses: Extract<PatternTerm, { kind: 'link' }>[] = []
-  let varAlternatives: Pattern[] | null = null
-  for (const p of ast.paths) {
-    const compiled = compilePath(p, pin)
-    if (compiled.length > 1) varAlternatives = compiled
-    else fixedClauses.push(...compiled[0].clauses)
-  }
-  for (const lk of ast.links) {
-    fixedClauses.push(L(lk.linkType, ...lk.roleVars.map((v) => V(v))))
-  }
-  if (varAlternatives) return varAlternatives.map((alt) => ({ clauses: [...fixedClauses, ...alt.clauses] }))
-  return [{ clauses: fixedClauses }]
+function handleOf(ref: TermRef, grounding: Record<string, Handle>): Handle | undefined {
+  return ref.kind === 'node' ? nodeHandle(ref.type, ref.name) : grounding[ref.name]
+}
+
+function edgeTv(as: AtomSpace, spec: EdgeSpec, grounding: Record<string, Handle>): { strength: number; confidence: number } | null {
+  const s = handleOf(spec.src, grounding), t = handleOf(spec.tgt, grounding)
+  if (!s || !t) return null
+  const [h1, h2] = spec.dir === 'in' ? [t, s] : [s, t]
+  const list = linkHandle(REL_LIST, [h1, h2])
+  const pred = nodeHandle(REL_PRED, spec.rel)
+  const evalH = linkHandle(REL_LINK, [pred, list])
+  const atom = as.getAtom(evalH)
+  return atom?.tv ?? null
 }
 
 // ─── Runner ────────────────────────────────────────────────────────────────────
@@ -301,49 +332,80 @@ export function runCypher(as: AtomSpace, query: string, params: Record<string, s
   const maxRows = opts.maxRows ?? 1000
 
   const ast = new Parser(tokenize(query), params).parse()
-
   if (ast.write && !opts.allowWrite) throw new Error('Cypher facade v0.1 is read-only; mutation clauses (CREATE/MERGE/SET/DELETE) are refused')
-  for (const p of ast.paths) for (const e of p.edges) {
-    if (e.hi > maxHops) throw new Error(`Cypher: variable-length hop ${e.hi} exceeds maxHops ${maxHops}`)
-  }
+  for (const p of ast.paths) for (const e of p.edges) if (e.hi > maxHops) throw new Error(`Cypher: variable-length hop ${e.hi} exceeds maxHops ${maxHops}`)
   if (requireLimit && ast.limit === undefined && !ast.explain) throw new Error('Cypher: a LIMIT is required (Sentinel bounded-traversal policy)')
 
-  const patterns = compile(ast)
+  const { patterns, edgeSpecs } = compile(ast)
   const queryHash = 'sha256:' + createHash('sha256').update(query.replace(/\s+/g, ' ').trim()).digest('hex')
+  if (ast.explain) return { columns: [], rows: [], evaluatedAtSeq: as.logicalClock, queryHash, useSpace: ast.useSpace, plan: patterns }
 
-  if (ast.explain) {
-    return { columns: [], rows: [], evaluatedAtSeq: as.logicalClock, queryHash, useSpace: ast.useSpace, plan: patterns }
-  }
-
-  // Union results across variable-length alternatives; dedup rows.
+  const edgeVarSpecs = edgeSpecs.filter((s) => s.var)
+  type RRow = Record<string, string | number>
   const seen = new Set<string>()
-  let rows: Record<string, string>[] = []
-  let columns: string[] = []
+  const resolved: RRow[] = []
+
   for (const pattern of patterns) {
     const res = findMatches(as, pattern)
-    if (columns.length === 0) columns = res.variables.filter((v) => !v.startsWith('_'))
-    for (const row of res.results) {
-      const projected: Record<string, string> = {}
-      for (const c of columns) projected[c] = row[c] ?? ''
-      const key = JSON.stringify(projected)
-      if (!seen.has(key)) { seen.add(key); rows.push(projected) }
-    }
+    res.results.forEach((row, i) => {
+      const rr: RRow = {}
+      for (const [k, v] of Object.entries(row)) if (!k.startsWith('_')) rr[k] = v
+      // edge-var TruthValue projection (single fixed edges)
+      for (const spec of edgeVarSpecs) {
+        const tv = edgeTv(as, spec, res.groundings[i])
+        if (tv) { rr[`${spec.var}.strength`] = tv.strength; rr[`${spec.var}.confidence`] = tv.confidence }
+      }
+      const key = JSON.stringify(rr)
+      if (!seen.has(key)) { seen.add(key); resolved.push(rr) }
+    })
   }
 
-  // Projection (RETURN) — column subset + labels.
-  if (ast.ret !== '*') {
-    const cols = ast.ret.map((r) => r.var)
-    rows = rows.map((r) => { const o: Record<string, string> = {}; for (const c of cols) o[c] = r[c] ?? ''; return o })
-    columns = cols
+  // WHERE filters (comparisons over resolved values)
+  const key = (c: ColRef) => (c.prop && c.prop !== 'form' && c.prop !== 'name' ? `${c.var}.${c.prop}` : c.var)
+  let rows = resolved.filter((r) => ast.filters.every((f) => cmp(r[key(f.lhs)], f.op, f.rhs)))
+
+  // ORDER BY
+  if (ast.orderBy.length) {
+    rows = [...rows].sort((a, b) => {
+      for (const { key: k, desc } of ast.orderBy) {
+        const c = compareVal(a[k], b[k])
+        if (c !== 0) return desc ? -c : c
+      }
+      return 0
+    })
   }
 
-  const limit = Math.min(ast.limit ?? maxRows, maxRows)
-  rows = rows.slice(0, limit)
-
-  const result: CypherResult = { columns, rows, evaluatedAtSeq: as.logicalClock, queryHash, useSpace: ast.useSpace }
-  opts.onEvidence?.({
-    queryHash, space: as.id, mode: opts.mode ?? 'operational', columns, rowCount: rows.length,
-    evaluatedAtSeq: as.logicalClock, useSpace: ast.useSpace,
+  // Projection + stringify
+  const outCols = ast.ret === '*'
+    ? Array.from(new Set(resolved.flatMap((r) => Object.keys(r)).filter((k) => !k.includes('.'))))
+    : ast.ret.map((c) => (c.prop ? `${c.var}.${c.prop}` : c.var))
+  let outRows = rows.map((r) => {
+    const o: Record<string, string> = {}
+    for (const c of outCols) { const v = r[c] ?? r[c.split('.')[0]]; o[c] = v === undefined ? '' : String(v) }
+    return o
   })
-  return result
+
+  outRows = outRows.slice(0, Math.min(ast.limit ?? maxRows, maxRows))
+  opts.onEvidence?.({ queryHash, space: as.id, mode: opts.mode ?? 'operational', columns: outCols, rowCount: outRows.length, evaluatedAtSeq: as.logicalClock, useSpace: ast.useSpace })
+  return { columns: outCols, rows: outRows, evaluatedAtSeq: as.logicalClock, queryHash, useSpace: ast.useSpace }
+}
+
+function cmp(l: string | number | undefined, op: CmpOp, r: string | number): boolean {
+  if (l === undefined) return false
+  const ln = typeof l === 'number' ? l : Number(l), rn = typeof r === 'number' ? r : Number(r)
+  const numeric = !Number.isNaN(ln) && !Number.isNaN(rn) && l !== '' && r !== ''
+  switch (op) {
+    case '=': return String(l) === String(r)
+    case '!=': return String(l) !== String(r)
+    case '<': return numeric ? ln < rn : String(l) < String(r)
+    case '>': return numeric ? ln > rn : String(l) > String(r)
+    case '<=': return numeric ? ln <= rn : String(l) <= String(r)
+    case '>=': return numeric ? ln >= rn : String(l) >= String(r)
+  }
+}
+
+function compareVal(a: string | number | undefined, b: string | number | undefined): number {
+  const an = Number(a), bn = Number(b)
+  if (!Number.isNaN(an) && !Number.isNaN(bn)) return an - bn
+  return String(a ?? '').localeCompare(String(b ?? ''))
 }
