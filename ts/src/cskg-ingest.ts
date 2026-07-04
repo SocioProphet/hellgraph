@@ -63,17 +63,29 @@ export function weightToTruthValue(weight: number): TruthValue {
 // ─── Canonical CSKG edge record (KGTK schema) ───────────────────────────────────
 
 export interface CSKGEdgeRecord {
-  id: string                    // KGTK `id` — the addressable edge identity
-  node1: string                 // node id (identity)
-  relation: string              // raw or canonical; normalized on ingest
+  id: string                     // KGTK `id` — the addressable edge identity
+  node1: string                  // node id (identity)
+  relation: string               // raw or canonical; normalized on ingest
   node2: string
-  node1Label?: string           // node1;label
-  node2Label?: string           // node2;label
-  relationLabel?: string        // relation;label
-  relationDimension?: string    // relation;dimension
-  source?: string               // CN | AT | WN | WD | RG | VG | FN …
-  sentence?: string
+  // Lifted + qualifier cells are MULTI-VALUED (vNext EdgeRecord): KGTK list cells
+  // become canonical arrays (dedup + UTF-8 byte-sorted), not pipe-delimited strings.
+  node1Labels?: string[]         // node1;label
+  node2Labels?: string[]         // node2;label
+  relationLabels?: string[]      // relation;label
+  relationDimensions?: string[]  // relation;dimension
+  sources?: string[]             // CN | AT | WN | WD | RG | VG | FN …
+  sentences?: string[]
   weight?: number
+}
+
+/**
+ * Canonicalize a multi-valued CSKG cell (normative, per the public-source spec):
+ * parse → deduplicate → sort by UTF-8 byte order → serialize. Makes CSKG rows
+ * fixture-stable without changing their set-like meaning.
+ */
+export function canonicalizeCell(values: (string | undefined)[]): string[] {
+  const set = new Set(values.filter((v): v is string => !!v && v.length > 0))
+  return [...set].sort((a, b) => Buffer.compare(Buffer.from(a, 'utf8'), Buffer.from(b, 'utf8')))
 }
 
 // Atom Value keys carrying CSKG edge/node metadata.
@@ -82,9 +94,14 @@ const V = {
   relLabel: 'cskg:relation_label', label: 'cskg:label',
 } as const
 const strVal = (s: string): Value => ({ kind: 'string', value: [s] })
+const arrVal = (xs: (string | undefined)[]): Value => ({ kind: 'string', value: canonicalizeCell(xs) })
 const readStr = (as: AtomSpace, h: Handle, key: string): string | undefined => {
   const v = as.getAtom(h)?.values[key]
   return v && v.kind === 'string' ? v.value[0] : undefined
+}
+const readArr = (as: AtomSpace, h: Handle, key: string): string[] | undefined => {
+  const v = as.getAtom(h)?.values[key]
+  return v && v.kind === 'string' ? v.value : undefined
 }
 
 const REL_LINK = 'EvaluationLink', REL_PRED = 'PredicateNode', REL_LIST = 'ListLink', NODE = 'ConceptNode'
@@ -121,24 +138,24 @@ export function ingestEdgeRecord(as: AtomSpace, rec: CSKGEdgeRecord, report?: In
   const before = as.count()
   const n1 = as.addNode(NODE, rec.node1).handle
   const n2 = as.addNode(NODE, rec.node2).handle
-  as.setValue(n1, V.label, strVal(rec.node1Label ?? labelFromNodeId(rec.node1)))
-  as.setValue(n2, V.label, strVal(rec.node2Label ?? labelFromNodeId(rec.node2)))
+  as.setValue(n1, V.label, arrVal(rec.node1Labels ?? [labelFromNodeId(rec.node1)]))
+  as.setValue(n2, V.label, arrVal(rec.node2Labels ?? [labelFromNodeId(rec.node2)]))
   const pred = as.addNode(REL_PRED, relation).handle
-  if (rec.relationLabel) as.setValue(pred, V.relLabel, strVal(rec.relationLabel))
+  if (rec.relationLabels?.length) as.setValue(pred, V.relLabel, arrVal(rec.relationLabels))
   const list = as.addLink(REL_LIST, [n1, n2]).handle
   const edge = as.addLink(REL_LINK, [pred, list], { tv: weightToTruthValue(rec.weight ?? 1) }).handle
 
   as.setValue(edge, V.id, strVal(rec.id || synthEdgeId(rec.node1, relation, rec.node2)))
-  if (rec.relationDimension) as.setValue(edge, V.dim, strVal(rec.relationDimension))
-  if (rec.source) as.setValue(edge, V.src, strVal(rec.source))
-  if (rec.sentence) as.setValue(edge, V.sent, strVal(rec.sentence))
+  if (rec.relationDimensions?.length) as.setValue(edge, V.dim, arrVal(rec.relationDimensions))
+  if (rec.sources?.length) as.setValue(edge, V.src, arrVal(rec.sources))
+  if (rec.sentences?.length) as.setValue(edge, V.sent, arrVal(rec.sentences))
 
   if (report) {
     report.concepts += Math.max(0, as.count() - before)
     report.edges += 1
     report.relations.add(relation)
     report.byRelation[relation] = (report.byRelation[relation] ?? 0) + 1
-    if (rec.source) report.bySource[rec.source] = (report.bySource[rec.source] ?? 0) + 1
+    for (const s of rec.sources ?? []) report.bySource[s] = (report.bySource[s] ?? 0) + 1
   }
   return edge
 }
@@ -163,12 +180,12 @@ export function edgeRecordFromAtom(as: AtomSpace, edge: Handle): CSKGEdgeRecord 
   return {
     id: readStr(as, edge, V.id) ?? '',
     node1, relation: as.getAtom(predH)?.name ?? '', node2,
-    node1Label: readStr(as, n1, V.label),
-    node2Label: readStr(as, n2, V.label),
-    relationLabel: readStr(as, predH, V.relLabel),
-    relationDimension: readStr(as, edge, V.dim),
-    source: readStr(as, edge, V.src),
-    sentence: readStr(as, edge, V.sent),
+    node1Labels: readArr(as, n1, V.label),
+    node2Labels: readArr(as, n2, V.label),
+    relationLabels: readArr(as, predH, V.relLabel),
+    relationDimensions: readArr(as, edge, V.dim),
+    sources: readArr(as, edge, V.src),
+    sentences: readArr(as, edge, V.sent),
     weight: link.tv?.confidence,
   }
 }
@@ -192,13 +209,15 @@ export function parseKgtkEdges(text: string): CSKGEdgeRecord[] {
   for (let i = 1; i < lines.length; i++) {
     const c = lines[i].split('\t')
     const get = (col: string) => { const j = idx(col); return j >= 0 ? c[j]?.trim() : undefined }
+    // KGTK multi-valued cells are pipe-delimited lists → canonical arrays.
+    const getList = (col: string) => { const v = get(col); return v ? v.split('|').map((s) => s.trim()).filter(Boolean) : undefined }
     const node1 = get('node1'), relation = get('relation'), node2 = get('node2')
     if (!node1 || !relation || !node2) continue
     recs.push({
       id: get('id') || '', node1, relation, node2,
-      node1Label: get('node1;label'), node2Label: get('node2;label'),
-      relationLabel: get('relation;label'), relationDimension: get('relation;dimension'),
-      source: get('source'), sentence: get('sentence'),
+      node1Labels: getList('node1;label'), node2Labels: getList('node2;label'),
+      relationLabels: getList('relation;label'), relationDimensions: getList('relation;dimension'),
+      sources: getList('source'), sentences: getList('sentence'),
     })
   }
   return recs
@@ -215,7 +234,7 @@ export interface CskgEdge { rel: string; start: string; end: string; weight?: nu
 /** Legacy simple-edge ingest — maps to canonical records (start/end kept as node ids). */
 export function ingestCskg(as: AtomSpace, edges: Iterable<CskgEdge>): IngestReport {
   const recs: CSKGEdgeRecord[] = []
-  for (const e of edges) recs.push({ id: '', node1: e.start, relation: e.rel, node2: e.end, source: 'CN', weight: e.weight })
+  for (const e of edges) recs.push({ id: '', node1: e.start, relation: e.rel, node2: e.end, sources: ['CN'], weight: e.weight })
   return ingestEdgeRecords(as, recs)
 }
 
@@ -234,7 +253,7 @@ export function ingestConceptNetTsv(as: AtomSpace, text: string): IngestReport {
   for (const line of text.split('\n')) {
     const t = line.trim(); if (!t) continue
     const e = parseConceptNetLine(t)
-    if (e) recs.push({ id: '', node1: e.start, relation: e.rel, node2: e.end, source: 'CN', weight: e.weight })
+    if (e) recs.push({ id: '', node1: e.start, relation: e.rel, node2: e.end, sources: ['CN'], weight: e.weight })
   }
   return ingestEdgeRecords(as, recs)
 }
@@ -245,7 +264,7 @@ export function ingestAtomic(as: AtomSpace, rows: Iterable<AtomicRow>): IngestRe
   const recs: CSKGEdgeRecord[] = []
   for (const r of rows) {
     if (!r.tail || r.tail.toLowerCase() === 'none') continue
-    recs.push({ id: '', node1: r.head, relation: r.relation, node2: r.tail, source: 'AT', weight: r.weight })
+    recs.push({ id: '', node1: r.head, relation: r.relation, node2: r.tail, sources: ['AT'], weight: r.weight })
   }
   return ingestEdgeRecords(as, recs)
 }
