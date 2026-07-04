@@ -89,6 +89,9 @@ export class CanonicalObjectStore {
 
   /** Ingest content: store bytes content-addressed, codex-seal, catalog at state Normalized. */
   async ingest(id: string, content: string, meta: IngestMeta): Promise<CatalogEntry> {
+    // Overwrite protection: silently replacing an existing canonical object (and its codex seal)
+    // is tamper-by-reingest. Updates MUST go through newVersion(), which is immutable + re-sealed.
+    if (this.catalog.has(id)) throw new Error(`object ${id} already exists — use newVersion() to update`)
     const bytes = Buffer.from(content, 'utf8')
     const contentHash = sha256(bytes)
     await this.backend.put(contentHash, bytes)
@@ -115,6 +118,12 @@ export class CanonicalObjectStore {
     if (!entry) return undefined
     const bytes = await this.backend.get(entry.contentHash)
     if (!bytes) return undefined
+    // Content-address integrity on READ: re-hash the bytes the backend returned and verify they
+    // match the catalog's contentHash. A BYOS/untrusted backend that returns tampered or wrong
+    // bytes for a hash is caught here — content-addressing is only meaningful if verified on read.
+    if (sha256(bytes) !== entry.contentHash) {
+      throw new Error(`object ${id}: content-address mismatch — backend returned bytes that do not hash to ${entry.contentHash.slice(0, 12)}…`)
+    }
     return { content: bytes.toString('utf8'), entry }
   }
 
