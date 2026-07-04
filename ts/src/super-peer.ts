@@ -149,7 +149,11 @@ export class SuperPeer {
       case 'ScanEdges': return scanEdges(as, payload as Parameters<typeof scanEdges>[1])
       case 'GetSubgraphStream': return getSubgraphStream(as, payload as Parameters<typeof getSubgraphStream>[1], Number(payload['hops'] ?? 1))
       case 'ResolveSameAs': return resolveSameAs(as, payload as unknown as Parameters<typeof resolveSameAs>[1])
-      case 'CommitSnapshot': return commitSnapshot(as, payload as unknown as Parameters<typeof commitSnapshot>[1])
+      case 'CommitSnapshot': {
+        // Bind the snapshot's replay anchor to the real federated causal cut.
+        const manifest = { ...(payload as Record<string, unknown>), causalCut: await this.currentCut() }
+        return commitSnapshot(as, manifest as unknown as Parameters<typeof commitSnapshot>[1])
+      }
     }
   }
 

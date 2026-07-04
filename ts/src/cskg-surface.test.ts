@@ -166,3 +166,14 @@ test('BulkPutEdges ingests many records with inherited semantics', () => {
   assert.equal(r.edges, 2)
   assert.equal(getEdge(as, { id: 'b2' })?.node2, '/c/en/c')
 })
+
+test('CommitSnapshot binds the replay anchor to a federated causal cut when given', () => {
+  const as = seed()
+  const withoutCut = commitSnapshot(as, { snapshotId: 's' })
+  const withCut = commitSnapshot(as, { snapshotId: 's', causalCut: { writerA: 5, writerB: 2 } })
+  assert.deepEqual(withCut.result.replayAnchor.causalCut, { writerA: 5, writerB: 2 })
+  assert.notEqual(withCut.result.manifestDigest, withoutCut.result.manifestDigest)  // cut folded into digest
+  // deterministic under the same cut
+  const again = commitSnapshot(as, { snapshotId: 's', causalCut: { writerA: 5, writerB: 2 } })
+  assert.equal(again.result.manifestDigest, withCut.result.manifestDigest)
+})

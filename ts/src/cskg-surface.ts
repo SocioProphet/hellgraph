@@ -52,7 +52,12 @@ export interface CSKGEdgeLookupRequest { id?: string; node1?: string; relation?:
 export interface CSKGDeleteRequest extends CSKGEdgeLookupRequest { commitKind?: 'tombstone' | 'invalidate'; authoritative?: boolean }
 export interface CSKGSameAsRequest { nodeId: string; maxHops?: number }
 export interface CSKGNodeSetResult { canonical: string; aliases: string[]; evidence: { edgeId: string; via: string; sources?: string[] }[] }
-export interface CSKGSnapshotManifest { snapshotId: string; scope?: string; datasetVersion?: string; authoritative?: boolean }
+export interface CSKGSnapshotManifest {
+  snapshotId: string; scope?: string; datasetVersion?: string; authoritative?: boolean
+  /** Federated causal cut (version vector over writer cores) — the replay frame.
+   *  When absent, the local logical clock is the only anchor. */
+  causalCut?: unknown
+}
 
 export interface SurfaceOptions {
   /** Inject a signer to produce a signed policy_attestation.v1 (else hash-only). */
@@ -177,24 +182,30 @@ export function resolveSameAs(as: AtomSpace, req: CSKGSameAsRequest): CSKGNodeSe
  * NOT a route_policy_delta; posture change is a separate event.
  */
 export function commitSnapshot(as: AtomSpace, manifest: CSKGSnapshotManifest, opts?: SurfaceOptions):
-  { result: { snapshotId: string; edgeCount: number; manifestDigest: string; cut: number }; commit: SemanticCommitV1 } {
+  { result: { snapshotId: string; edgeCount: number; manifestDigest: string; cut: number; replayAnchor: { logicalCut: number; causalCut?: unknown } }; commit: SemanticCommitV1 } {
   const edgeIds: string[] = []
   for (const e of as.getByType('EvaluationLink')) {
     if (isTombstoned(as, e.handle)) continue
     const rec = edgeRecordFromAtom(as, e.handle)
     if (rec?.id) edgeIds.push(rec.id)
   }
-  edgeIds.sort((a, b) => Buffer.compare(Buffer.from(a, 'utf8'), Buffer.from(b, 'utf8')))
+  edgeIds.sort((a, b) => byteCmp(a, b))
 
   const cut = as.logicalClock
-  const manifestDigest = sha256(stable({ snapshotId: manifest.snapshotId, datasetVersion: manifest.datasetVersion ?? '', edgeIds }))
-  const receiptHash = sha256(`${manifest.snapshotId}|${manifestDigest}|${cut}`)
+  // The replay anchor binds to the FEDERATED causal cut when one is supplied
+  // (version vector over writer cores); otherwise the local logical clock alone.
+  const causalDigest = manifest.causalCut !== undefined ? sha256(stable(manifest.causalCut)) : ''
+  const manifestDigest = sha256(stable({ snapshotId: manifest.snapshotId, datasetVersion: manifest.datasetVersion ?? '', edgeIds, causalDigest }))
+  const receiptHash = sha256(`${manifest.snapshotId}|${manifestDigest}|${cut}|${causalDigest}`)
   const commit: SemanticCommitV1 = {
     kind: 'semantic.commit.v1', commitKind: 'replay_anchor', subjectId: manifest.snapshotId,
     receiptHash, at: now(),
-    policyAttestation: attestation(`${manifest.snapshotId}|${manifestDigest}|${cut}`, opts),
+    policyAttestation: attestation(`${manifest.snapshotId}|${manifestDigest}|${cut}|${causalDigest}`, opts),
   }
-  return { result: { snapshotId: manifest.snapshotId, edgeCount: edgeIds.length, manifestDigest, cut }, commit }
+  return {
+    result: { snapshotId: manifest.snapshotId, edgeCount: edgeIds.length, manifestDigest, cut, replayAnchor: { logicalCut: cut, causalCut: manifest.causalCut } },
+    commit,
+  }
 }
 
 // ─── PutAux / GetAux (edge-linked sparse facts) ─────────────────────────────────
