@@ -26,6 +26,9 @@ import { runSparql } from './sparql.js'
 import { runGremlin } from './gremlin.js'
 import { runMetta } from './metta.js'
 import { runCypher } from './cypher.js'
+import { getEdge, scanEdges, getSubgraphStream, resolveSameAs, commitSnapshot } from './cskg-surface.js'
+
+export type CskgReadOp = 'GetEdge' | 'ScanEdges' | 'GetSubgraphStream' | 'ResolveSameAs' | 'CommitSnapshot'
 import type { AtomSpace } from './atomspace.js'
 import type { CausalCut } from './causal-proof.js'
 import { bearer, hasScope, type Scope, type TokenVerifier } from './auth.js'
@@ -134,6 +137,20 @@ export class SuperPeer {
     if (lang === 'cypher') return runCypher(await this.atomSpace(), q)
     const store = await this.store()
     return lang === 'sparql' ? runSparql(store, q) : runGremlin(store, q)
+  }
+
+  /** Read-only CSKG root-surface ops over the materialized view. Mutating routes
+   *  (PutEdge/PutAux/DeleteEdge/BulkPutEdges) run on a participant's local write
+   *  path, not here — the super-peer is never a data owner. */
+  async cskg(op: CskgReadOp, payload: Record<string, unknown>): Promise<unknown> {
+    const as = await this.atomSpace()
+    switch (op) {
+      case 'GetEdge': return getEdge(as, payload as Parameters<typeof getEdge>[1])
+      case 'ScanEdges': return scanEdges(as, payload as Parameters<typeof scanEdges>[1])
+      case 'GetSubgraphStream': return getSubgraphStream(as, payload as Parameters<typeof getSubgraphStream>[1], Number(payload['hops'] ?? 1))
+      case 'ResolveSameAs': return resolveSameAs(as, payload as unknown as Parameters<typeof resolveSameAs>[1])
+      case 'CommitSnapshot': return commitSnapshot(as, payload as unknown as Parameters<typeof commitSnapshot>[1])
+    }
   }
 
   /** Admit a sovereign participant (signed addWriter control op). */
@@ -250,6 +267,16 @@ export class SuperPeer {
         // P5 (spec 09): results are frame-relative — return the causal cut they were answered
         // against, so a client can bind them to (or re-check them under) that frame.
         return send(200, { results, cut: await this.currentCut() })
+      }
+
+      if (req.method === 'POST' && url.pathname === '/cskg') {
+        const body = await readJson(req)
+        const op = body['op']
+        const READ_OPS = ['GetEdge', 'ScanEdges', 'GetSubgraphStream', 'ResolveSameAs', 'CommitSnapshot']
+        if (typeof op !== 'string' || !READ_OPS.includes(op)) {
+          return send(400, { error: `body must be { op: ${READ_OPS.map((o) => `'${o}'`).join('|')}, ...payload }. Mutating routes (PutEdge/PutAux/DeleteEdge/BulkPutEdges) run on the participant's local write path.` })
+        }
+        return send(200, { result: await this.cskg(op as CskgReadOp, body) })
       }
 
       if (req.method === 'POST' && url.pathname === '/admit') {

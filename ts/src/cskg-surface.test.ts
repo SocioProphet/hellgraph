@@ -4,6 +4,7 @@ import { AtomSpace } from './atomspace'
 import { ingestEdgeRecord } from './cskg-ingest'
 import {
   ROUTE_HANDLES, putEdge, getEdge, deleteEdge, resolveSameAs, commitSnapshot,
+  putAux, getAux, scanEdges, getSubgraphStream, bulkPutEdges,
 } from './cskg-surface'
 
 function seed(): AtomSpace {
@@ -106,4 +107,62 @@ test('CommitSnapshot excludes tombstoned edges and reflects the cut', () => {
   assert.equal(after.edgeCount, before.edgeCount - 1)
   assert.notEqual(after.manifestDigest, before.manifestDigest)
   assert.ok(after.cut >= before.cut)                // logical clock advanced by the tombstone write
+})
+
+// ─── PutAux / GetAux ─────────────────────────────────────────────────────────
+
+test('PutAux attaches a sparse fact by edge id; GetAux reads it back', () => {
+  const as = seed()
+  const r = putAux(as, { edgeId: 'e1', key: 'weight', value: '2.5' })
+  assert.equal(r.found, true)
+  assert.match(r.contentHash, /^sha256:/)
+  const aux = getAux(as, 'e1')
+  assert.equal(aux.length, 1)
+  assert.equal(aux[0].key, 'weight')
+  assert.equal(aux[0].value, '2.5')
+})
+
+test('PutAux on a missing edge is a no-op', () => {
+  const as = seed()
+  assert.equal(putAux(as, { edgeId: 'nope', key: 'k', value: 'v' }).found, false)
+})
+
+// ─── ScanEdges (QuerySpec, deterministic) ────────────────────────────────────
+
+test('ScanEdges filters by relation / source / seed and orders by edge id', () => {
+  const as = seed()
+  assert.deepEqual(scanEdges(as, { relationFilter: ['IsA'] }).map((e) => e.id), ['e1'])
+  assert.deepEqual(scanEdges(as, { relationFilter: ['/r/SameAs'] }).map((e) => e.id), ['e2', 'e3'])
+  assert.deepEqual(scanEdges(as, { sourceFilter: ['WN'] }).map((e) => e.id), ['e2'])
+  assert.deepEqual(scanEdges(as, { seedIds: ['/c/en/rain'] }).map((e) => e.id).sort(), ['e1', 'e2'])
+})
+
+test('ScanEdges honors limit + cursor and skips tombstoned', () => {
+  const as = seed()
+  assert.deepEqual(scanEdges(as, { limit: 2 }).map((e) => e.id), ['e1', 'e2'])
+  assert.deepEqual(scanEdges(as, { cursor: 'e1', limit: 1 }).map((e) => e.id), ['e2'])
+  deleteEdge(as, { id: 'e2' })
+  assert.equal(scanEdges(as).some((e) => e.id === 'e2'), false)
+})
+
+// ─── GetSubgraphStream ───────────────────────────────────────────────────────
+
+test('GetSubgraphStream expands the neighborhood by hops', () => {
+  const as = seed()
+  const oneHop = getSubgraphStream(as, { seedIds: ['/c/en/rain'] }, 1).map((e) => e.id).sort()
+  assert.deepEqual(oneHop, ['e1', 'e2'])                       // rain's direct edges
+  const twoHop = getSubgraphStream(as, { seedIds: ['/c/en/rain'] }, 2).map((e) => e.id).sort()
+  assert.deepEqual(twoHop, ['e1', 'e2', 'e3'])                 // + wn:rain.n.01 → Q7907
+})
+
+// ─── BulkPutEdges ────────────────────────────────────────────────────────────
+
+test('BulkPutEdges ingests many records with inherited semantics', () => {
+  const as = new AtomSpace('cskg-bulk', false)
+  const r = bulkPutEdges(as, [
+    { id: 'b1', node1: '/c/en/a', relation: '/r/IsA', node2: '/c/en/b', sources: ['CN'] },
+    { id: 'b2', node1: '/c/en/b', relation: '/r/IsA', node2: '/c/en/c', sources: ['CN'] },
+  ])
+  assert.equal(r.edges, 2)
+  assert.equal(getEdge(as, { id: 'b2' })?.node2, '/c/en/c')
 })
