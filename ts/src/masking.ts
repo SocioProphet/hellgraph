@@ -14,7 +14,7 @@
  * KeyProvider is injected; the default is a passphrase-derived static key for local/test use.
  */
 
-import { createCipheriv, createDecipheriv, createHash, randomBytes } from 'node:crypto'
+import { createCipheriv, createDecipheriv, randomBytes, scryptSync } from 'node:crypto'
 import type { HellGraphStore } from './store.js'
 
 // ─── Key custody (injected; production model is an open decision) ────────────────────
@@ -23,7 +23,13 @@ export interface KeyProvider { getKey(keyId?: string): Buffer }
 export class StaticKeyProvider implements KeyProvider {
   private constructor(private readonly key: Buffer) {}
   static fromPassphrase(passphrase: string): StaticKeyProvider {
-    return new StaticKeyProvider(createHash('sha256').update(passphrase, 'utf8').digest())
+    // Derive the AES-256 key with a memory-hard KDF (scrypt), not a bare SHA-256
+    // (js/insufficient-password-hash) — a weak passphrase is then far costlier to
+    // brute-force. Deterministic (fixed domain salt) so the same passphrase
+    // reproduces the key for reversible masking. NOTE: this changes the derived
+    // key vs the prior SHA-256 derivation — data masked under the old scheme must
+    // be re-masked.
+    return new StaticKeyProvider(scryptSync(passphrase, 'hellgraph.masking.kdf.v1', 32))
   }
   getKey(): Buffer { return this.key }
 }
