@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use hg_core::{
     fnv1a64_str, ArtifactId, ArtifactPayload, Atom, AtomHeader, AtomId, AtomKind,
-    BoundViolationRecord, EpistemicMode, FieldValue, LinkAtom, LinkSemantics, NodeAtom,
+    BoundViolationRecord, EdgeClass, EpistemicMode, FieldValue, LinkAtom, LinkSemantics, NodeAtom,
     ProofArtifactRecord, ProofValue, ProofVerdict, RoleBinding, SecurityLabel, StoredArtifact,
     TxnId, ValueEnvelope, ValueKey, ValuePayload,
 };
@@ -149,6 +149,19 @@ impl SpaceStore {
         semantics: LinkSemantics,
         members: Vec<RoleBinding>,
     ) -> Result<(AtomId, TxnId), String> {
+        self.create_link_classed(type_name, semantics, EdgeClass::Relational, members)
+    }
+
+    /// SP-RETR-FIBER-001 (WO_FIBER_002): create a link with an explicit edge class.
+    /// `create_link` delegates here with `EdgeClass::Relational`, so existing callers are
+    /// unchanged; containment (E^⊑) links are created by passing `EdgeClass::Containment`.
+    pub fn create_link_classed(
+        &mut self,
+        type_name: impl Into<String>,
+        semantics: LinkSemantics,
+        edge_class: EdgeClass,
+        members: Vec<RoleBinding>,
+    ) -> Result<(AtomId, TxnId), String> {
         for member in &members {
             if !self.atoms.contains_key(&member.target) {
                 return Err(format!("unknown target atom {}", member.target));
@@ -167,6 +180,7 @@ impl SpaceStore {
             },
             semantics,
             members,
+            edge_class,
         };
         self.atoms.insert(atom_id, Atom::Link(link));
         Ok((atom_id, txn))
@@ -421,21 +435,35 @@ impl JournaledStore {
         semantics: LinkSemantics,
         members: Vec<RoleBinding>,
     ) -> Result<(AtomId, TxnId), String> {
+        self.create_link_classed(type_name, semantics, EdgeClass::Relational, members)
+    }
+
+    /// SP-RETR-FIBER-001 (WO_FIBER_002): journaled classed link creation. The edge class
+    /// is appended as a 7th LINK field; journals written before this field decode as
+    /// `Relational` (see `decode_edge_class`), so old logs replay unchanged.
+    pub fn create_link_classed(
+        &mut self,
+        type_name: impl Into<String>,
+        semantics: LinkSemantics,
+        edge_class: EdgeClass,
+        members: Vec<RoleBinding>,
+    ) -> Result<(AtomId, TxnId), String> {
         let type_name = type_name.into();
         let members_clone = members.clone();
-        let (atom_id, txn) = self
-            .inner
-            .create_link(type_name.clone(), semantics, members)?;
+        let (atom_id, txn) =
+            self.inner
+                .create_link_classed(type_name.clone(), semantics, edge_class, members)?;
         self.append_frame(
             "ATOM",
             txn,
             &[format!(
-                "LINK\t{}\t{}\t{}\t{}\t{}",
+                "LINK\t{}\t{}\t{}\t{}\t{}\t{}",
                 atom_id,
                 txn,
                 esc(&type_name),
                 encode_link_semantics(semantics),
                 encode_members(&members_clone),
+                encode_edge_class(edge_class),
             )],
         )?;
         Ok((atom_id, txn))
@@ -577,12 +605,13 @@ pub fn save_checkpoint(store: &SpaceStore, path: impl AsRef<Path>) -> Result<(),
             Atom::Link(l) => {
                 writeln!(
                     f,
-                    "LINK\t{}\t{}\t{}\t{}\t{}",
+                    "LINK\t{}\t{}\t{}\t{}\t{}\t{}",
                     l.hdr.atom_id,
                     l.hdr.created_txn,
                     esc(&l.hdr.type_name),
                     encode_link_semantics(l.semantics),
                     encode_members(&l.members),
+                    encode_edge_class(l.edge_class),
                 )
                 .map_err(|e| e.to_string())?;
             }
@@ -761,6 +790,9 @@ fn restore_link_line(store: &mut SpaceStore, parts: &[&str]) -> Result<(), Strin
             .ok_or_else(|| "missing link semantics".to_string())?,
     )?;
     let members = decode_members(parts.get(5).copied().unwrap_or(""))?;
+    // SP-RETR-FIBER-001 (WO_FIBER_002): the 7th field is the edge class. Journals written
+    // before this field lack it → `decode_edge_class(None)` yields `Relational`.
+    let edge_class = decode_edge_class(parts.get(6).copied())?;
     let link = LinkAtom {
         hdr: AtomHeader {
             atom_id,
@@ -770,6 +802,7 @@ fn restore_link_line(store: &mut SpaceStore, parts: &[&str]) -> Result<(), Strin
         },
         semantics,
         members,
+        edge_class,
     };
     store.atoms.insert(atom_id, Atom::Link(link));
     store.next_atom = store.next_atom.max(atom_id);
@@ -1171,6 +1204,25 @@ fn encode_link_semantics(s: LinkSemantics) -> &'static str {
     }
 }
 
+// SP-RETR-FIBER-001 (WO_FIBER_002): edge-class journal codec.
+fn encode_edge_class(c: EdgeClass) -> &'static str {
+    match c {
+        EdgeClass::Containment => "C",
+        EdgeClass::Relational => "R",
+    }
+}
+
+fn decode_edge_class(s: Option<&str>) -> Result<EdgeClass, String> {
+    match s {
+        // Absent or empty = a journal written before the field existed: every such link
+        // is relational (E_R). This is the WO_FIBER_002 backward-compat migration.
+        None | Some("") => Ok(EdgeClass::Relational),
+        Some("R") => Ok(EdgeClass::Relational),
+        Some("C") => Ok(EdgeClass::Containment),
+        Some(other) => Err(format!("unknown edge class {}", other)),
+    }
+}
+
 fn decode_link_semantics(s: &str) -> Result<LinkSemantics, String> {
     match s {
         "DB" => Ok(LinkSemantics::DirectedBinary),
@@ -1458,5 +1510,53 @@ mod tests {
         assert!(loaded.atom(a).is_some());
         assert!(loaded.atom(b).is_some());
         std::fs::remove_file(ckpt).ok();
+    }
+
+    // SP-RETR-FIBER-001 (WO_FIBER_002): the edge class survives a checkpoint round-trip.
+    #[test]
+    fn checkpoint_roundtrip_preserves_edge_class() {
+        let ckpt = temp_path("hellgraph_ckpt_edgeclass");
+        let mut store = SpaceStore::new();
+        let (a, _) = store.create_node("Section");
+        let (b, _) = store.create_node("Entity");
+        let (link, _) = store
+            .create_link_classed(
+                "contains",
+                LinkSemantics::DirectedBinary,
+                EdgeClass::Containment,
+                vec![
+                    RoleBinding {
+                        role_name: "parent".into(),
+                        target: a,
+                        ordinal: 0,
+                    },
+                    RoleBinding {
+                        role_name: "child".into(),
+                        target: b,
+                        ordinal: 1,
+                    },
+                ],
+            )
+            .unwrap();
+        save_checkpoint(&store, &ckpt).unwrap();
+        let loaded = load_checkpoint(&ckpt).unwrap();
+        match loaded.atom(link).unwrap() {
+            Atom::Link(l) => assert_eq!(l.edge_class, EdgeClass::Containment),
+            _ => panic!("expected a link atom"),
+        }
+        std::fs::remove_file(ckpt).ok();
+    }
+
+    // WO_FIBER_002 backward-compat migration: a LINK line written before the edge-class
+    // field (6 tab fields, no 7th) must restore as Relational, not error.
+    #[test]
+    fn restore_link_line_defaults_legacy_line_to_relational() {
+        let mut store = SpaceStore::new();
+        let legacy = ["LINK", "7", "3", "LegacyType", "DB", ""];
+        restore_link_line(&mut store, &legacy).unwrap();
+        match store.atom(7).unwrap() {
+            Atom::Link(l) => assert_eq!(l.edge_class, EdgeClass::Relational),
+            _ => panic!("expected a link atom"),
+        }
     }
 }
