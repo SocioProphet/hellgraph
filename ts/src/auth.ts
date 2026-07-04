@@ -71,9 +71,15 @@ export class HmacTokenVerifier implements TokenVerifier {
   }
 }
 
-/** Extract a bearer token from an Authorization header value. */
+/** Extract a bearer token from an Authorization header value.
+ *  Linear-time scan (no backtracking quantifiers) — avoids js/polynomial-redos
+ *  on adversarial headers like `Bearer\t\t\t…`. */
 export function bearer(authHeader: string | undefined): string | null {
   if (!authHeader) return null
-  const m = /^Bearer\s+(.+)$/i.exec(authHeader.trim())
-  return m ? m[1]! : null
+  const s = authHeader.trim()
+  const sp = s.search(/\s/)                            // first whitespace: end of the scheme token
+  if (sp < 0) return null
+  if (s.slice(0, sp).toLowerCase() !== 'bearer') return null
+  const token = s.slice(sp + 1).trim()
+  return token.length ? token : null
 }

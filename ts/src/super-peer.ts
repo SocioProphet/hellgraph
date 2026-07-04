@@ -41,6 +41,7 @@ const ROUTE_SCOPE: Record<string, Scope> = {
   'GET /health': 'read',
   'GET /cut': 'read',
   'POST /query': 'query',
+  'POST /cskg': 'query',
   'POST /admit': 'admit',
 }
 
@@ -240,17 +241,21 @@ export class SuperPeer {
       }
 
       // AuthN/Z gate — enforced only when a verifier is configured (production).
-      const scope = ROUTE_SCOPE[`${req.method} ${url.pathname}`]
-      if (scope && this.auth) {
-        const principal = ((): ReturnType<TokenVerifier['verify']> => {
-          const token = bearer(req.headers.authorization)
-          return token ? this.auth!.verify(token) : null
-        })()
+      // Fail-CLOSED: the public probes (/livez, /metrics) already returned above,
+      // so every route reaching here is sensitive and REQUIRES a valid token. The
+      // user-controlled path must never decide *whether* auth runs (only which
+      // scope) — an unmapped route still demands authentication, not a bypass.
+      if (this.auth) {
+        // verify() runs unconditionally on the (possibly empty) header value, so a
+        // user-controlled token never gates whether the check happens
+        // (js/user-controlled-bypass). An empty/invalid token verifies to null → 401.
+        const principal = this.auth.verify(bearer(req.headers.authorization) ?? '')
         if (!principal) {
           this.audit?.append({ ts: Date.now(), kind: 'blocked', objectId: url.pathname, reason: 'unauthenticated' })
           return send(401, { error: 'unauthenticated' })
         }
-        if (!hasScope(principal, scope)) {
+        const scope = ROUTE_SCOPE[`${req.method} ${url.pathname}`]
+        if (scope && !hasScope(principal, scope)) {
           this.audit?.append({ ts: Date.now(), kind: 'blocked', objectId: url.pathname, reason: `forbidden:${scope}` })
           return send(403, { error: `missing scope: ${scope}` })
         }
@@ -295,7 +300,11 @@ export class SuperPeer {
       send(404, { error: 'not found' })
     } catch (err) {
       this.metrics?.inc('hellgraph_errors_total')
-      send(500, { error: err instanceof Error ? err.message : String(err) })
+      // Don't leak internal error/stack detail to the client (js/stack-trace-exposure);
+      // log a newline-stripped, bounded detail server-side (no CR/LF → no log-injection).
+      const detail = (err instanceof Error ? err.message : String(err)).replace(/[\r\n\t]+/g, ' ').slice(0, 500)
+      console.error('[super-peer] request error:', detail)
+      send(500, { error: 'internal error' })
     }
   }
 
