@@ -27,8 +27,9 @@ export type SExpr =
 
 const sym = (name: string): SExpr => ({ kind: 'sym', name })
 
-export function parseSExpr(text: string): SExpr {
-  const toks = text.match(/\(|\)|[^\s()]+/g) ?? []
+const tokenize = (text: string): string[] => text.match(/\(|\)|[^\s()]+/g) ?? []
+
+function makeParser(toks: string[]): () => SExpr {
   let i = 0
   const parse = (): SExpr => {
     const t = toks[i++]
@@ -45,7 +46,22 @@ export function parseSExpr(text: string): SExpr {
     if (t === ')') throw new Error('metta: unexpected )')
     return t.startsWith('$') ? { kind: 'var', name: t.slice(1) } : { kind: 'sym', name: t }
   }
-  return parse()
+  ;(parse as unknown as { pos: () => number }).pos = () => i
+  return parse
+}
+
+export function parseSExpr(text: string): SExpr {
+  return makeParser(tokenize(text))()
+}
+
+/** Parse a whole program — several top-level S-expressions. */
+export function parseProgram(text: string): SExpr[] {
+  const toks = tokenize(text)
+  const parse = makeParser(toks)
+  const pos = (parse as unknown as { pos: () => number }).pos
+  const forms: SExpr[] = []
+  while (pos() < toks.length) forms.push(parse())
+  return forms
 }
 
 export function serialize(e: SExpr): string {

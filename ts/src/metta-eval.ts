@@ -11,7 +11,8 @@
  *   !(double 21)   ⇒   42
  */
 
-import { parseSExpr, serialize, instantiate, type SExpr, type MettaBinding } from './metta.js'
+import { parseSExpr, parseProgram, matchPattern, serialize, instantiate, type SExpr, type MettaBinding } from './metta.js'
+import type { AtomSpace } from './atomspace.js'
 
 export interface MettaRule { lhs: SExpr; rhs: SExpr }
 
@@ -82,7 +83,37 @@ function reduce(expr: SExpr, rules: MettaRule[], budget: { n: number }): SExpr {
   return e
 }
 
+/** Reduce an S-expression to normal form under a ruleset. */
+export function evalSExpr(expr: SExpr, ruleset: MettaRuleset, maxSteps = 10_000): SExpr {
+  return reduce(expr, ruleset.rules, { n: maxSteps })
+}
+
 /** Evaluate a MeTTa expression to normal form under a ruleset. `maxSteps` bounds rewrites. */
 export function evalMetta(exprText: string, ruleset: MettaRuleset, maxSteps = 10_000): string {
-  return serialize(reduce(parseSExpr(exprText), ruleset.rules, { n: maxSteps }))
+  return serialize(evalSExpr(parseSExpr(exprText), ruleset, maxSteps))
+}
+
+const isForm = (e: SExpr, head: string): e is { kind: 'list'; items: SExpr[] } =>
+  e.kind === 'list' && e.items[0]?.kind === 'sym' && e.items[0].name === head
+
+/**
+ * Run a whole MeTTa program against a space: `(= …)` forms accumulate as rules, `(match …)`
+ * forms query the space, and any other top-level expression is evaluated against the rules so
+ * far. Returns the outputs (from match + eval forms), in order — the unified DAS/MeTTa surface.
+ */
+export function runMettaProgram(space: AtomSpace, programText: string): string[] {
+  const ruleset = new MettaRuleset()
+  const out: string[] = []
+  for (const form of parseProgram(programText)) {
+    if (isForm(form, '=') && form.items.length === 3) {
+      ruleset.rules.push({ lhs: form.items[1]!, rhs: form.items[2]! })
+    } else if (isForm(form, 'match')) {
+      const pattern = form.items[2]
+      const template = form.items[3] ?? pattern
+      if (pattern && template) for (const b of matchPattern(space, pattern)) out.push(serialize(instantiate(template, b)))
+    } else {
+      out.push(serialize(evalSExpr(form, ruleset)))
+    }
+  }
+  return out
 }
