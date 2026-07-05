@@ -169,21 +169,59 @@ pub fn ingest_bundle(store: &mut SpaceStore, text: &str) -> Result<IngestResult,
     Ok(out)
 }
 
+/// Verdict configuration (mirrors the Python `glue_verdict` params, axis-binding §2.2).
+#[derive(Debug, Clone)]
+pub struct VerdictCfg {
+    /// Reject a shared claim graded below this (`exact` > `verified` > `sampled`) — the
+    /// forced-ZERO extraction floor (§3.4.3): a below-floor claim means no test is possible.
+    pub e_floor: String,
+    /// Value-agreement tolerance; `0.0` = exact. `|a - b| <= tol` counts as agreement.
+    pub tol: f64,
+}
+
+impl Default for VerdictCfg {
+    fn default() -> Self {
+        Self {
+            e_floor: "sampled".to_string(),
+            tol: 0.0,
+        }
+    }
+}
+
+/// Evidence-grade rank (axis-binding §2.2). Unknown grades rank below the floor (untrusted).
+fn egrade_rank(g: &str) -> i8 {
+    match g {
+        "exact" => 2,
+        "verified" => 1,
+        "sampled" => 0,
+        _ => -1,
+    }
+}
+
 /// The fiber-product verdict over two endpoints' claims (§3.3/§3.4): POS if every shared claim
-/// variable agrees, NEG (with a disagreeing witness) if any shared variable provably differs,
-/// ZERO if there is no shared variable at all. Structural v0: exact value compare, no E-grade
-/// floor yet (grade gating is a follow-up).
-pub fn glue_verdict(a: &[Claim], b: &[Claim]) -> (Verdict, Option<(String, f64, f64)>) {
-    let bmap: BTreeMap<&str, f64> = b.iter().map(|c| (c.var.as_str(), c.value)).collect();
+/// variable agrees (within `cfg.tol`), NEG (with a disagreeing witness) if any shared variable
+/// provably differs, ZERO if there is no shared variable — or if any shared claim is below
+/// `cfg.e_floor` (the forced-ZERO floor: an untrusted claim can't settle the test).
+pub fn glue_verdict(
+    a: &[Claim],
+    b: &[Claim],
+    cfg: &VerdictCfg,
+) -> (Verdict, Option<(String, f64, f64)>) {
+    let floor = egrade_rank(&cfg.e_floor);
+    let bmap: BTreeMap<&str, &Claim> = b.iter().map(|c| (c.var.as_str(), c)).collect();
     let mut agree: Option<(String, f64, f64)> = None;
     let mut shared = false;
     for c in a {
-        if let Some(&bv) = bmap.get(c.var.as_str()) {
+        if let Some(cb) = bmap.get(c.var.as_str()) {
             shared = true;
-            if (c.value - bv).abs() > f64::EPSILON {
-                return (Verdict::Neg, Some((c.var.clone(), c.value, bv)));
+            // forced-ZERO floor (§3.4.3): a below-floor claim on either side ⇒ no test possible.
+            if egrade_rank(&c.egrade) < floor || egrade_rank(&cb.egrade) < floor {
+                return (Verdict::Zero, None);
             }
-            agree = Some((c.var.clone(), c.value, bv));
+            if (c.value - cb.value).abs() > cfg.tol {
+                return (Verdict::Neg, Some((c.var.clone(), c.value, cb.value)));
+            }
+            agree = Some((c.var.clone(), c.value, cb.value));
         }
     }
     if shared {
@@ -200,6 +238,7 @@ pub fn verdict_relational(
     store: &SpaceStore,
     r: &IngestResult,
     rel_type: &str,
+    cfg: &VerdictCfg,
 ) -> Vec<EdgeVerdict> {
     let mut edges: BTreeMap<AtomId, (AtomId, AtomId)> = BTreeMap::new(); // link_atom -> (src,dst)
     for &atom in r.ids.values() {
@@ -229,6 +268,7 @@ pub fn verdict_relational(
             let (verdict, witness) = glue_verdict(
                 r.claims.get(&src).unwrap_or(&empty),
                 r.claims.get(&dst).unwrap_or(&empty),
+                cfg,
             );
             EdgeVerdict {
                 src,
@@ -305,7 +345,7 @@ mod tests {
     fn verdict_is_pos_and_doubly_grounded_on_agreement() {
         let mut store = SpaceStore::new();
         let r = ingest_bundle(&mut store, BUNDLE).unwrap();
-        let verdicts = verdict_relational(&store, &r, REL);
+        let verdicts = verdict_relational(&store, &r, REL, &VerdictCfg::default());
         assert_eq!(verdicts.len(), 1);
         let e = &verdicts[0];
         assert_eq!(e.verdict, Verdict::Pos);
@@ -328,7 +368,7 @@ mod tests {
         );
         let mut store = SpaceStore::new();
         let r = ingest_bundle(&mut store, &bundle).unwrap();
-        let e = &verdict_relational(&store, &r, REL)[0];
+        let e = &verdict_relational(&store, &r, REL, &VerdictCfg::default())[0];
         assert_eq!(e.verdict, Verdict::Neg);
         assert_eq!(
             e.witness,
@@ -346,9 +386,53 @@ mod tests {
         );
         let mut store = SpaceStore::new();
         let r = ingest_bundle(&mut store, &bundle).unwrap();
-        let e = &verdict_relational(&store, &r, REL)[0];
+        let e = &verdict_relational(&store, &r, REL, &VerdictCfg::default())[0];
         assert_eq!(e.verdict, Verdict::Zero);
         assert_eq!(e.witness, None);
+    }
+
+    #[test]
+    fn forced_zero_when_a_shared_claim_is_below_the_e_floor() {
+        // SubCo's claim is only `sampled`; with an E_floor of `verified` the claim can't
+        // settle the test → ZERO (not a POS on an untrusted number).
+        let bundle = BUNDLE.replace(
+            "K\tentity/subco\towns_pct:parentco|subco\t100\tverified",
+            "K\tentity/subco\towns_pct:parentco|subco\t100\tsampled",
+        );
+        let mut store = SpaceStore::new();
+        let r = ingest_bundle(&mut store, &bundle).unwrap();
+        let cfg = VerdictCfg {
+            e_floor: "verified".to_string(),
+            tol: 0.0,
+        };
+        let e = &verdict_relational(&store, &r, REL, &cfg)[0];
+        assert_eq!(e.verdict, Verdict::Zero);
+        // ...but at the default `sampled` floor the same data is testable, and agrees → POS.
+        let e2 = &verdict_relational(&store, &r, REL, &VerdictCfg::default())[0];
+        assert_eq!(e2.verdict, Verdict::Pos);
+    }
+
+    #[test]
+    fn tolerance_turns_a_small_disagreement_into_agreement() {
+        // SubCo reports 100.4 vs ParentCo's 100.
+        let bundle = BUNDLE.replace(
+            "K\tentity/subco\towns_pct:parentco|subco\t100\tverified",
+            "K\tentity/subco\towns_pct:parentco|subco\t100.4\tverified",
+        );
+        let mut store = SpaceStore::new();
+        let r = ingest_bundle(&mut store, &bundle).unwrap();
+        // exact (tol 0.0) → NEG (a real 0.4 disagreement)
+        let exact = &verdict_relational(&store, &r, REL, &VerdictCfg::default())[0];
+        assert_eq!(exact.verdict, Verdict::Neg);
+        // within a 0.5 tolerance → POS
+        let loose = VerdictCfg {
+            e_floor: "sampled".to_string(),
+            tol: 0.5,
+        };
+        assert_eq!(
+            verdict_relational(&store, &r, REL, &loose)[0].verdict,
+            Verdict::Pos
+        );
     }
 
     #[test]
