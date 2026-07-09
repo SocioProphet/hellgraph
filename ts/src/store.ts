@@ -45,6 +45,34 @@ function decodeValue(val: Value | undefined): PropertyValue {
 export class HellGraphStore {
   constructor(private as: AtomSpace) {}
 
+  /** Registered uniqueness constraints: label → set of property keys that must be unique among
+   *  nodes carrying that label. Opt-in (nothing enforced until addUniqueConstraint is called), so
+   *  existing callers are unaffected. */
+  private readonly uniqueConstraints = new Map<string, Set<string>>()
+
+  /** Declare that `propKey` must be unique among nodes labelled `label` (Neo4j-style constraint).
+   *  Enforced at write time by addNode/setNodeProperty via the secondary value index. */
+  addUniqueConstraint(label: string, propKey: string): void {
+    let keys = this.uniqueConstraints.get(label)
+    if (!keys) { keys = new Set(); this.uniqueConstraints.set(label, keys) }
+    keys.add(propKey)
+  }
+
+  /** Throw if writing `properties` onto node `id` (with effective `labels`) would break a
+   *  uniqueness constraint. Runs BEFORE any write so a violation can't leave a partial node. */
+  private assertUniqueOk(id: string, labels: string[], properties: Record<string, PropertyValue>): void {
+    for (const label of labels) {
+      const keys = this.uniqueConstraints.get(label)
+      if (!keys) continue
+      for (const k of keys) {
+        const v = properties[k]
+        if (v === undefined) continue
+        const clash = this.nodesByProperty(k, v).find((n) => n.id !== id && n.labels.includes(label))
+        if (clash) throw new Error(`uniqueness constraint (${label}.${k}) violated: value already held by node "${clash.id}"`)
+      }
+    }
+  }
+
   // ─── Projection helpers ─────────────────────────────────────────────────
 
   private projectNode(atom: Atom): GraphNode {
@@ -75,10 +103,14 @@ export class HellGraphStore {
   // ─── Write path ───────────────────────────────────────────────────────────
 
   addNode(id: string, labels: string[], properties: Record<string, PropertyValue> = {}): GraphNode {
-    const atom = this.as.addNode(ENTITY, id)
-    const existing = atom.values[LABELS_KEY]
-    const existingLabels = existing?.kind === 'string' ? existing.value : []
+    // Compute effective labels from a READ-ONLY lookup and validate constraints BEFORE any write,
+    // so a uniqueness violation throws without having created a partial node.
+    const priorAtom = this.as.getNode(ENTITY, id)
+    const prior = priorAtom?.values[LABELS_KEY]
+    const existingLabels = prior?.kind === 'string' ? prior.value : []
     const merged = Array.from(new Set([...existingLabels, ...labels]))
+    this.assertUniqueOk(id, merged, properties)
+    const atom = this.as.addNode(ENTITY, id)
     this.as.setValue(atom.handle, LABELS_KEY, { kind: 'string', value: merged })
     for (const [k, v] of Object.entries(properties)) {
       const enc = encodeValue(v)
@@ -101,6 +133,7 @@ export class HellGraphStore {
   }
 
   setNodeProperty(id: string, key: string, value: PropertyValue): void {
+    this.assertUniqueOk(id, this.getNode(id)?.labels ?? [], { [key]: value })
     const enc = encodeValue(value)
     if (enc) this.as.setValue(nodeHandle(ENTITY, id), PROP_PREFIX + key, enc)
   }
