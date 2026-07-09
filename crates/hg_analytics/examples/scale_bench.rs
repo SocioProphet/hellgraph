@@ -6,8 +6,8 @@
 //! Run: `cargo run --release --example scale_bench`.
 
 use hg_analytics::{
-    betweenness, betweenness_parallel, distributed_pagerank, pagerank, pagerank_parallel,
-    partition_edges,
+    betweenness, betweenness_parallel, distributed_pagerank, pagerank, pagerank_mmap,
+    pagerank_parallel, partition_edges, write_csr, MmapCsr,
 };
 use std::time::{Duration, Instant};
 
@@ -136,4 +136,28 @@ fn main() {
         "  deterministic run==run: {}",
         dist == distributed_pagerank(n, &shards, &out_deg, d, iters, tol)
     );
+    println!();
+
+    // ── Out-of-core: the O(E) edges live on disk (mmap), only O(n) rank vectors in heap ──────────
+    let path = std::env::temp_dir().join("hg_scale_bench.csr");
+    let (tw, _) = timed(|| write_csr(&path, n, &edges).unwrap());
+    let csr = MmapCsr::open(&path).unwrap();
+    let (to, oocpr) = timed(|| pagerank_mmap(&csr, d, iters, tol));
+    let ooc_diff = pr_serial
+        .iter()
+        .zip(&oocpr)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0, f64::max);
+    println!("Out-of-core PageRank  (edges mmap'd from disk, NOT in heap)");
+    println!(
+        "  CSR file: {} MB on disk   |   heap resident: ~{} MB (only the O(n) rank vectors)",
+        csr.mapped_bytes() / 1_000_000,
+        (n * 8 * 2) / 1_000_000
+    );
+    println!("  write {:>7.3?}   pagerank_mmap {:>7.3?}", tw, to);
+    println!(
+        "  == in-memory PageRank: max|Δ| {:.2e}   → graphs LARGER than RAM are processable",
+        ooc_diff
+    );
+    std::fs::remove_file(&path).ok();
 }

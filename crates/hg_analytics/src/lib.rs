@@ -10,6 +10,9 @@ use hg_core::AtomId;
 use rayon::prelude::*;
 use std::collections::HashMap;
 
+mod ooc;
+pub use ooc::{pagerank_mmap, write_csr, MmapCsr};
+
 /// Cold PageRank over a 0..n indexed graph. Dangling nodes (no out-edges) redistribute their mass uniformly.
 pub fn pagerank(
     n: usize,
@@ -591,6 +594,36 @@ mod tests {
             distributed_pagerank(n, &s, &o, D, IT, TOL),
             "deterministic run-to-run"
         );
+    }
+
+    #[test]
+    fn out_of_core_mmap_pagerank_matches_in_memory() {
+        let edges = vec![
+            (0, 1),
+            (1, 2),
+            (2, 0),
+            (2, 3),
+            (3, 1),
+            (0, 3),
+            (3, 4),
+            (4, 2),
+        ];
+        let n = 5;
+        let tmp = std::env::temp_dir().join(format!("hg_ooc_{}.csr", std::process::id()));
+        write_csr(&tmp, n, &edges).unwrap();
+        let csr = MmapCsr::open(&tmp).unwrap();
+        assert_eq!(csr.n(), n);
+        assert_eq!(csr.edge_count(), edges.len());
+        let a = pagerank(n, &edges, D, IT, TOL);
+        let b = pagerank_mmap(&csr, D, IT, TOL); // edges read from the mmap, not heap
+        for i in 0..n {
+            assert!(
+                (a[i] - b[i]).abs() < 1e-9,
+                "out-of-core PR must match in-memory at {i}"
+            );
+        }
+        drop(csr);
+        std::fs::remove_file(&tmp).ok();
     }
 
     #[test]
