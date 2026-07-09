@@ -49,6 +49,25 @@ test('HNSW: recall@5 contains the brute-force nearest for perturbed queries', ()
   assert.ok(hit / trials >= 0.9, `recall@5 ${(hit / trials).toFixed(3)} >= 0.9`)
 })
 
+test('HNSW: metadata-filtered search returns only accepted ids, recall preserved', () => {
+  const vecs = seededVecs(100, 16, 555)
+  const idx = new HnswIndex({ seed: 3, efSearch: 40 })
+  for (const v of vecs) idx.add(v.id, v.vec)
+  const even = new Set(vecs.filter((_, i) => i % 2 === 0).map((v) => v.id))
+  const filter = (id: string): boolean => even.has(id)
+  const evenVecs = vecs.filter((v) => even.has(v.id))
+
+  let hit = 0
+  const trials = 30
+  for (let t = 0; t < trials; t++) {
+    const q = vecs[t * 2 + 1]!.vec // an ODD vector's coords (not itself in the filtered set)
+    const res = idx.search(q, 3, filter)
+    assert.ok(res.every((r) => even.has(r.id)), 'ONLY accepted ids are returned')
+    if (res[0]?.id === bruteTop(evenVecs, q)) hit++
+  }
+  assert.ok(hit / trials >= 0.8, `filtered recall@1 ${(hit / trials).toFixed(2)} >= 0.8`)
+})
+
 test('HNSW: exact match + edge cases', () => {
   const idx = new HnswIndex()
   assert.deepEqual(idx.search([1, 0, 0]), [], 'empty index → []')

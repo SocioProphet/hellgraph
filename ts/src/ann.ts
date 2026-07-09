@@ -83,14 +83,14 @@ export class HnswIndex {
     return 1 - dot
   }
 
-  private searchLayer(q: number[], entryPoints: string[], ef: number, layer: number): Cand[] {
+  private searchLayer(q: number[], entryPoints: string[], ef: number, layer: number, accept?: (id: string) => boolean): Cand[] {
     const visited = new Set<string>(entryPoints)
-    const candidates: Cand[] = []
-    const results: Cand[] = []
+    const candidates: Cand[] = [] // traversal frontier (ALL nodes, for connectivity)
+    const results: Cand[] = [] // accepted results only (bounded to ef)
     for (const id of entryPoints) {
       const c = { id, d: this.dist(q, this.nodes.get(id)!.vec) }
       insertSorted(candidates, c)
-      insertSorted(results, c)
+      if (!accept || accept(id)) { insertSorted(results, c); if (results.length > ef) results.pop() }
     }
     while (candidates.length > 0) {
       const c = candidates.shift()! // nearest unexpanded
@@ -102,11 +102,14 @@ export class HnswIndex {
         visited.add(nid)
         const d = this.dist(q, this.nodes.get(nid)!.vec)
         const worst = results[results.length - 1]
-        if (results.length < ef || (worst && d < worst.d)) {
-          const item = { id: nid, d }
-          insertSorted(candidates, item)
-          insertSorted(results, item)
-          if (results.length > ef) results.pop()
+        // keep exploring through non-matching nodes; only ACCEPTED nodes enter the result set —
+        // in-traversal filtering preserves recall vs naive post-filtering of a top-K.
+        if (results.length < ef || !worst || d < worst.d) {
+          insertSorted(candidates, { id: nid, d })
+          if (!accept || accept(nid)) {
+            insertSorted(results, { id: nid, d })
+            if (results.length > ef) results.pop()
+          }
         }
       }
     }
@@ -153,8 +156,11 @@ export class HnswIndex {
     if (level > this.maxLevel) { this.maxLevel = level; this.entry = id }
   }
 
-  /** Approximate top-K nearest by cosine similarity (score = cosine, descending). */
-  search(query: number[], topK = 10): Scored[] {
+  /** Approximate top-K nearest by cosine similarity (score = cosine, descending). Pass `filter`
+   *  for metadata-filtered ANN (Pinecone/Weaviate/Qdrant-style): only ids the predicate accepts are
+   *  returned, while the graph is still traversed through non-matching nodes (recall-preserving).
+   *  Compose with the property index: `filter = new Set(store.nodesByProperty(k,v).map(n=>n.id))`. */
+  search(query: number[], topK = 10, filter?: (id: string) => boolean): Scored[] {
     if (this.entry === null) return []
     const q = HnswIndex.norm(query)
     let ep = [this.entry]
@@ -162,7 +168,9 @@ export class HnswIndex {
       const w = this.searchLayer(q, ep, 1, lc)
       if (w[0]) ep = [w[0].id]
     }
-    const w = this.searchLayer(q, ep, Math.max(this.efS, topK), 0)
+    // A selective filter needs a wider search to still surface topK matches.
+    const ef0 = filter ? Math.max(this.efS * 4, topK * 4) : Math.max(this.efS, topK)
+    const w = this.searchLayer(q, ep, ef0, 0, filter)
     return w.slice(0, Math.max(0, topK)).map((x) => ({ id: x.id, score: 1 - x.d }))
   }
 }
