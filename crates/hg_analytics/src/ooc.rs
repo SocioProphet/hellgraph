@@ -7,11 +7,69 @@
 //!   [n: u64, m: u64] header · offsets: (n+1) × u64 · in_neighbors: m × u32 · out_deg: n × u32
 //! `offsets`/`in_neighbors` are the in-edge CSR (pull PageRank reads in-neighbours per node).
 
-use memmap2::Mmap;
+use memmap2::{Mmap, MmapMut};
 use rayon::prelude::*;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Write};
 use std::path::Path;
+
+/// Build the out-of-core CSR from a re-iterable edge STREAM using only O(n) heap — it never holds all
+/// edges, so you can INGEST a graph larger than RAM (not just query one). Two streaming passes:
+/// (1) count degrees → offsets; (2) place in-neighbours via random writes into the disk-backed
+/// (mmap'd) neighbours region. `edges` is invoked twice and MUST yield the same stream both times.
+/// Produces a byte-identical file to `write_csr` (verified in tests).
+pub fn write_csr_streaming<I, F>(path: &Path, n: usize, edges: F) -> io::Result<()>
+where
+    I: Iterator<Item = (usize, usize)>,
+    F: Fn() -> I,
+{
+    let mut in_deg = vec![0u64; n];
+    let mut out_deg = vec![0u32; n];
+    for (u, v) in edges() {
+        if u < n && v < n {
+            in_deg[v] += 1;
+            out_deg[u] += 1;
+        }
+    }
+    let mut offsets = vec![0u64; n + 1];
+    for v in 0..n {
+        offsets[v + 1] = offsets[v] + in_deg[v];
+    }
+    drop(in_deg);
+    let m = offsets[n] as usize;
+
+    let (header, off_bytes, nbr_bytes, deg_bytes) = (16, (n + 1) * 8, m * 4, n * 4);
+    let (off_start, nbr_start, deg_start) =
+        (header, header + off_bytes, header + off_bytes + nbr_bytes);
+    let total = header + off_bytes + nbr_bytes + deg_bytes;
+
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)?;
+    file.set_len(total as u64)?;
+    // SAFETY: exclusive writable map of a freshly-sized file we own.
+    let mut mmap = unsafe { MmapMut::map_mut(&file)? };
+    mmap[0..8].copy_from_slice(bytemuck::bytes_of(&(n as u64)));
+    mmap[8..16].copy_from_slice(bytemuck::bytes_of(&(m as u64)));
+    mmap[off_start..off_start + off_bytes].copy_from_slice(bytemuck::cast_slice(&offsets));
+    mmap[deg_start..deg_start + deg_bytes].copy_from_slice(bytemuck::cast_slice(&out_deg));
+
+    // Pass 2: random-write in-neighbours into the disk-backed region (O(n) cursor heap only).
+    let mut cursor: Vec<u64> = offsets.clone();
+    {
+        let nbr: &mut [u32] = bytemuck::cast_slice_mut(&mut mmap[nbr_start..nbr_start + nbr_bytes]);
+        for (u, v) in edges() {
+            if u < n && v < n {
+                nbr[cursor[v] as usize] = u as u32;
+                cursor[v] += 1;
+            }
+        }
+    }
+    mmap.flush()
+}
 
 /// Serialize the in-edge CSR of a graph to `path` (ready to mmap). O(n+m) temp heap during build,
 /// but the resulting file is what gets processed out-of-core.

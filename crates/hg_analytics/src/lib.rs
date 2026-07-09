@@ -11,7 +11,7 @@ use rayon::prelude::*;
 use std::collections::HashMap;
 
 mod ooc;
-pub use ooc::{pagerank_mmap, write_csr, MmapCsr};
+pub use ooc::{pagerank_mmap, write_csr, write_csr_streaming, MmapCsr};
 
 /// Cold PageRank over a 0..n indexed graph. Dangling nodes (no out-edges) redistribute their mass uniformly.
 pub fn pagerank(
@@ -624,6 +624,43 @@ mod tests {
         }
         drop(csr);
         std::fs::remove_file(&tmp).ok();
+    }
+
+    #[test]
+    fn streaming_csr_builder_is_byte_identical_to_batch_and_bounded_heap() {
+        let edges = vec![
+            (0, 1),
+            (1, 2),
+            (2, 0),
+            (2, 3),
+            (3, 1),
+            (0, 3),
+            (3, 4),
+            (4, 2),
+        ];
+        let n = 5;
+        let batch = std::env::temp_dir().join(format!("hg_batch_{}.csr", std::process::id()));
+        let stream = std::env::temp_dir().join(format!("hg_stream_{}.csr", std::process::id()));
+        write_csr(&batch, n, &edges).unwrap();
+        // O(n)-heap streaming build: the closure yields the edge stream, never held whole.
+        write_csr_streaming(&stream, n, || edges.iter().copied()).unwrap();
+        assert_eq!(
+            std::fs::read(&batch).unwrap(),
+            std::fs::read(&stream).unwrap(),
+            "streaming builder must produce a byte-identical CSR to the batch builder"
+        );
+        let csr = MmapCsr::open(&stream).unwrap();
+        let a = pagerank(n, &edges, D, IT, TOL);
+        let b = pagerank_mmap(&csr, D, IT, TOL);
+        for i in 0..n {
+            assert!(
+                (a[i] - b[i]).abs() < 1e-9,
+                "streamed-CSR PR must match in-memory at {i}"
+            );
+        }
+        drop(csr);
+        std::fs::remove_file(&batch).ok();
+        std::fs::remove_file(&stream).ok();
     }
 
     #[test]
