@@ -143,7 +143,13 @@ export interface AuditSink { append(e: AuditEvent): void }
 /** Default sink — in production, bind to the evidence spine (a Hypercore). */
 export class InMemoryAuditLog implements AuditSink {
   private readonly log: AuditEvent[] = []
-  append(e: AuditEvent): void { this.log.push(e) }
+  /** Bound the buffer: at the super-peer, an attacker flooding auth denials would otherwise grow
+   *  this without limit (OOM). Oldest entries drop first once the cap is hit. */
+  constructor(private readonly maxEntries = 10_000) {}
+  append(e: AuditEvent): void {
+    this.log.push(e)
+    if (this.log.length > this.maxEntries) this.log.shift()
+  }
   entries(): AuditEvent[] { return [...this.log] }
 }
 

@@ -16,6 +16,9 @@
  */
 import { SuperPeer } from './super-peer.js'
 import { HmacTokenVerifier } from './auth.js'
+import { Metrics } from './metrics.js'
+import { RateLimiter } from './rate-limit.js'
+import { InMemoryAuditLog } from './policy.js'
 
 export interface SuperPeerServiceEnv {
   HELLGRAPH_STORAGE_DIR?: string
@@ -24,6 +27,12 @@ export interface SuperPeerServiceEnv {
   HELLGRAPH_JOIN_SWARM?: string
   /** HMAC secret for bearer-token auth. Omit → endpoints run OPEN (dev only). */
   HELLGRAPH_AUTH_SECRET?: string
+  /** Prometheus /metrics. On by default (the deploy scrapes it); set "0" to disable. */
+  HELLGRAPH_METRICS?: string
+  /** Per-principal token-bucket rate limit on /query + /admit. On by default; set "0" to disable. */
+  HELLGRAPH_RATE_LIMIT?: string
+  HELLGRAPH_RATE_PER_SEC?: string
+  HELLGRAPH_RATE_BURST?: string
 }
 
 export interface RunningSuperPeer {
@@ -42,7 +51,26 @@ export async function startSuperPeerFromEnv(env: SuperPeerServiceEnv = process.e
   if (!secret) console.warn('[superpeer] HELLGRAPH_AUTH_SECRET unset — endpoints are OPEN (dev only)')
   const auth = secret ? HmacTokenVerifier.fromSecret(secret) : undefined
 
-  const superPeer = await SuperPeer.create(dir, { ...(bootstrap ? { bootstrap } : {}), ...(auth ? { auth } : {}) })
+  // Public Prometheus metrics — ON by default so the deploy's scrape annotations resolve (the
+  // /metrics route only becomes public when a registry is configured; otherwise it 401s).
+  const metrics = env.HELLGRAPH_METRICS === '0' ? undefined : new Metrics()
+
+  // Per-principal rate limit on the expensive routes (/query, /admit) — ON by default.
+  const rate = Number(env.HELLGRAPH_RATE_PER_SEC ?? '50') || 50
+  const burst = Number(env.HELLGRAPH_RATE_BURST ?? '100') || 100
+  const rateLimit = env.HELLGRAPH_RATE_LIMIT === '0' ? undefined : new RateLimiter(rate, burst)
+
+  // Audit sink for auth denials → bounded in-memory (production binds to the evidence spine).
+  // Only meaningful when auth is enforced (denials are the events it records).
+  const audit = secret ? new InMemoryAuditLog() : undefined
+
+  const superPeer = await SuperPeer.create(dir, {
+    ...(bootstrap ? { bootstrap } : {}),
+    ...(auth ? { auth } : {}),
+    ...(audit ? { audit } : {}),
+    ...(metrics ? { metrics } : {}),
+    ...(rateLimit ? { rateLimit } : {}),
+  })
 
   if (env.HELLGRAPH_JOIN_SWARM !== '0') {
     try {

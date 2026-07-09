@@ -46,6 +46,10 @@ const ROUTE_SCOPE: Record<string, Scope> = {
   'POST /admit': 'admit',
 }
 
+/** Fixed route set for metric labels — bounds `hellgraph_requests_total` cardinality against
+ *  attacker-controlled paths (unknown paths bucket to "other"). */
+const KNOWN_ROUTES = new Set(['/livez', '/metrics', '/health', '/cut', '/query', '/cskg', '/admit'])
+
 export interface SuperPeerOptions extends FederatedOptions {
   /** Bearer-token verifier. If omitted, endpoints run OPEN (dev mode); production MUST set it. */
   auth?: TokenVerifier
@@ -221,13 +225,17 @@ export class SuperPeer {
         res.end(this.metrics.render())
         return
       }
-      this.metrics?.inc('hellgraph_requests_total', { route: url.pathname })
+      // Bucket the metric label to a fixed route set: a raw attacker-controlled pathname would
+      // otherwise explode label cardinality and grow the registry without bound (memory DoS).
+      const route = KNOWN_ROUTES.has(url.pathname) ? url.pathname : 'other'
+      this.metrics?.inc('hellgraph_requests_total', { route })
 
-      // Per-principal rate limiting on the expensive/governance routes (before work).
-      if (this.rateLimit && req.method === 'POST' && (url.pathname === '/query' || url.pathname === '/admit')) {
+      // Per-principal rate limiting on the expensive/governance routes (before work). /cskg runs
+      // scan/subgraph read ops over the materialized view, so it is throttled alongside /query.
+      if (this.rateLimit && req.method === 'POST' && (url.pathname === '/query' || url.pathname === '/cskg' || url.pathname === '/admit')) {
         const key = req.headers.authorization ?? req.socket.remoteAddress ?? 'anon'
         if (!this.rateLimit.allow(key)) {
-          this.metrics?.inc('hellgraph_ratelimited_total', { route: url.pathname })
+          this.metrics?.inc('hellgraph_ratelimited_total', { route })
           return send(429, { error: 'rate limited' })
         }
       }
@@ -316,8 +324,18 @@ export class SuperPeer {
 function readJson(req: http.IncomingMessage): Promise<Record<string, unknown>> {
   return new Promise((resolve, reject) => {
     let raw = ''
-    req.on('data', (c) => { raw += c; if (raw.length > 1_000_000) reject(new Error('body too large')) })
-    req.on('end', () => { try { resolve(raw ? JSON.parse(raw) : {}) } catch { reject(new Error('invalid JSON')) } })
-    req.on('error', reject)
+    let done = false
+    const fail = (msg: string): void => {
+      if (done) return
+      done = true
+      // Destroy the request so ingestion STOPS — without this the 'data' handler keeps appending
+      // past the cap and buffers the whole oversized body in memory anyway (the reject alone does
+      // not pause the stream).
+      req.destroy()
+      reject(new Error(msg))
+    }
+    req.on('data', (c) => { if (done) return; raw += c; if (raw.length > 1_000_000) fail('body too large') })
+    req.on('end', () => { if (done) return; done = true; try { resolve(raw ? JSON.parse(raw) : {}) } catch { reject(new Error('invalid JSON')) } })
+    req.on('error', () => fail('request error'))
   })
 }
