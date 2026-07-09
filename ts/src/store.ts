@@ -126,6 +126,16 @@ export class HellGraphStore {
     return this.allNodes().filter((n) => n.labels.includes(label))
   }
 
+  /** Nodes whose property `key` equals `value` — O(1) via the AtomSpace secondary value index,
+   *  instead of the O(n) scan `nodesByLabel` does. Returns [] for unencodable values. */
+  nodesByProperty(key: string, value: PropertyValue): GraphNode[] {
+    const enc = encodeValue(value)
+    if (!enc) return []
+    return this.as.findByValue(PROP_PREFIX + key, enc)
+      .filter((a) => a.type === ENTITY)
+      .map((a) => this.projectNode(a))
+  }
+
   outEdges(nodeId: string, label?: string): GraphEdge[] {
     const conceptH = nodeHandle(ENTITY, nodeId)
     return this.adjacentEdges(conceptH, 0, label)
