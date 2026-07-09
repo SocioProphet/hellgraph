@@ -7,6 +7,7 @@
 //! two engines reconcile while both exist; once the edge binds to this kernel, only this determinism matters.
 
 use hg_core::AtomId;
+use rayon::prelude::*;
 use std::collections::HashMap;
 
 /// Cold PageRank over a 0..n indexed graph. Dangling nodes (no out-edges) redistribute their mass uniformly.
@@ -95,6 +96,60 @@ fn pagerank_from(
     rank
 }
 
+/// Parallel (rayon) PageRank — the multi-core scale-out of `pagerank`. Pull-based: each node's next
+/// rank is computed independently from its IN-neighbours, so the O(E) work parallelises with no write
+/// contention. The O(n) dangling + convergence reductions stay serial, which keeps the result
+/// deterministic (same output every run) AND identical to the serial `pagerank` fixed point. This is
+/// the leg that turns "Rust is faster" from a claim into a number: linear-ish speedup in cores.
+pub fn pagerank_parallel(
+    n: usize,
+    edges: &[(usize, usize)],
+    damping: f64,
+    max_iters: usize,
+    tol: f64,
+) -> Vec<f64> {
+    if n == 0 {
+        return Vec::new();
+    }
+    let mut out_deg = vec![0usize; n];
+    let mut in_adj: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for &(u, v) in edges {
+        if u < n && v < n {
+            out_deg[u] += 1;
+            in_adj[v].push(u);
+        }
+    }
+    let base = (1.0 - damping) / n as f64;
+    let mut rank = vec![1.0 / n as f64; n];
+    for _ in 0..max_iters {
+        // Dangling mass + share: serial O(n), deterministic.
+        let mut dangling = 0.0;
+        for u in 0..n {
+            if out_deg[u] == 0 {
+                dangling += rank[u];
+            }
+        }
+        let add = base + damping * dangling / n as f64;
+        // Parallel pull over the O(E) work: next[v] = add + damping·Σ_{u→v} rank[u]/out_deg[u].
+        let next: Vec<f64> = (0..n)
+            .into_par_iter()
+            .map(|v| {
+                let mut acc = 0.0;
+                for &u in &in_adj[v] {
+                    acc += rank[u] / out_deg[u] as f64; // out_deg[u] ≥ 1 (u has edge u→v)
+                }
+                add + damping * acc
+            })
+            .collect();
+        let diff: f64 = (0..n).map(|i| (next[i] - rank[i]).abs()).sum();
+        rank = next;
+        if diff < tol {
+            break;
+        }
+    }
+    rank
+}
+
 /// AtomId-facing wrapper: map ids → dense indices (sorted for determinism), run PageRank, return id → score.
 pub fn pagerank_by_id(
     node_ids: &[AtomId],
@@ -164,6 +219,87 @@ pub fn betweenness(n: usize, edges: &[(usize, usize)]) -> Vec<f64> {
     }
     for x in bc.iter_mut() {
         *x /= 2.0; // undirected: each pair counted from both endpoints
+    }
+    bc
+}
+
+/// Single-source Brandes accumulation into `bc` (shared helper for serial + parallel betweenness).
+fn brandes_source(s: usize, adj: &[Vec<usize>], n: usize, bc: &mut [f64]) {
+    let mut stack: Vec<usize> = Vec::new();
+    let mut preds: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut sigma = vec![0.0f64; n];
+    let mut dist = vec![-1i64; n];
+    sigma[s] = 1.0;
+    dist[s] = 0;
+    let mut queue: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
+    queue.push_back(s);
+    while let Some(v) = queue.pop_front() {
+        stack.push(v);
+        for &w in &adj[v] {
+            if dist[w] < 0 {
+                dist[w] = dist[v] + 1;
+                queue.push_back(w);
+            }
+            if dist[w] == dist[v] + 1 {
+                sigma[w] += sigma[v];
+                preds[w].push(v);
+            }
+        }
+    }
+    let mut delta = vec![0.0f64; n];
+    while let Some(w) = stack.pop() {
+        for &v in &preds[w] {
+            delta[v] += (sigma[v] / sigma[w]) * (1.0 + delta[w]);
+        }
+        if w != s {
+            bc[w] += delta[w];
+        }
+    }
+}
+
+/// Parallel (rayon) Brandes betweenness — the source loop is embarrassingly parallel and
+/// COMPUTE-bound (each BFS is real work, not a memory gather), so this scales near-linearly in
+/// cores. Determinism is preserved: sources are split into fixed contiguous chunks, each chunk
+/// accumulates a partial vector, and the partials are summed back IN CHUNK ORDER (independent of
+/// thread scheduling) → same output every run. This is the leg that actually buries them on
+/// "we scale with cores".
+pub fn betweenness_parallel(n: usize, edges: &[(usize, usize)]) -> Vec<f64> {
+    if n == 0 {
+        return Vec::new();
+    }
+    let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for &(u, v) in edges {
+        if u < n && v < n && u != v {
+            adj[u].push(v);
+            adj[v].push(u);
+        }
+    }
+    // FIXED chunk count (independent of thread count) so the deterministic in-order sum of partials
+    // yields the SAME result on any core count — determinism must not depend on the machine. rayon
+    // load-balances the fixed chunks across whatever threads are available.
+    let chunks = 64usize.min(n).max(1);
+    let chunk_size = n.div_ceil(chunks);
+    // Each chunk → a partial bc vector; collect() preserves chunk order for a deterministic sum.
+    let partials: Vec<Vec<f64>> = (0..chunks)
+        .into_par_iter()
+        .map(|c| {
+            let mut local = vec![0.0f64; n];
+            let start = c * chunk_size;
+            let end = ((c + 1) * chunk_size).min(n);
+            for s in start..end {
+                brandes_source(s, &adj, n, &mut local);
+            }
+            local
+        })
+        .collect();
+    let mut bc = vec![0.0f64; n];
+    for p in &partials {
+        for i in 0..n {
+            bc[i] += p[i];
+        }
+    }
+    for x in bc.iter_mut() {
+        *x /= 2.0;
     }
     bc
 }
@@ -289,6 +425,28 @@ mod tests {
     const D: f64 = 0.85;
     const IT: usize = 200;
     const TOL: f64 = 1e-12;
+
+    #[test]
+    fn parallel_pagerank_matches_serial_and_is_deterministic() {
+        let edges = vec![(0, 1), (1, 2), (2, 0), (2, 3), (3, 1), (0, 3)];
+        let a = pagerank(4, &edges, D, IT, TOL);
+        let b = pagerank_parallel(4, &edges, D, IT, TOL);
+        for i in 0..4 {
+            assert!((a[i] - b[i]).abs() < 1e-9, "parallel PR must match serial fixed point");
+        }
+        assert_eq!(b, pagerank_parallel(4, &edges, D, IT, TOL), "deterministic run-to-run");
+    }
+
+    #[test]
+    fn parallel_betweenness_matches_serial_and_is_deterministic() {
+        let edges = vec![(0, 1), (1, 2), (2, 3), (3, 4), (1, 3), (0, 4)];
+        let a = betweenness(5, &edges);
+        let b = betweenness_parallel(5, &edges);
+        for i in 0..5 {
+            assert!((a[i] - b[i]).abs() < 1e-9, "parallel betweenness must match serial");
+        }
+        assert_eq!(b, betweenness_parallel(5, &edges), "deterministic run-to-run");
+    }
 
     #[test]
     fn symmetric_cycle_is_uniform() {
