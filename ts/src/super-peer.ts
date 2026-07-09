@@ -41,6 +41,7 @@ import { loadOptionalDep as loadDep } from './optional-dep.js'
 const ROUTE_SCOPE: Record<string, Scope> = {
   'GET /health': 'read',
   'GET /cut': 'read',
+  'GET /changes': 'read',
   'POST /query': 'query',
   'POST /cskg': 'query',
   'POST /admit': 'admit',
@@ -48,7 +49,7 @@ const ROUTE_SCOPE: Record<string, Scope> = {
 
 /** Fixed route set for metric labels — bounds `hellgraph_requests_total` cardinality against
  *  attacker-controlled paths (unknown paths bucket to "other"). */
-const KNOWN_ROUTES = new Set(['/livez', '/metrics', '/health', '/cut', '/query', '/cskg', '/admit'])
+const KNOWN_ROUTES = new Set(['/livez', '/metrics', '/health', '/cut', '/changes', '/query', '/cskg', '/admit'])
 
 export interface SuperPeerOptions extends FederatedOptions {
   /** Bearer-token verifier. If omitted, endpoints run OPEN (dev mode); production MUST set it. */
@@ -126,6 +127,13 @@ export class SuperPeer {
   async store(): Promise<HellGraphStore> { return new HellGraphStore(await this.atomSpace()) }
 
   async currentCut(): Promise<CausalCut> { return this.fed.currentCut() }
+
+  /** CDC change-feed from an opaque cursor: the op entries linearized since `since`, the next
+   *  cursor, and the causal cut those changes are framed by. Pull/poll model (Neptune-Streams-style). */
+  async changes(since: number): Promise<{ changes: unknown[]; cursor: number; cut: CausalCut }> {
+    const { ops, length } = await this.fed.changesSince(since)
+    return { changes: ops, cursor: length, cut: await this.currentCut() }
+  }
 
   /** Run a read query over the materialized view (SPARQL/Gremlin over the store, MeTTa/DAS over
    *  the AtomSpace). */
@@ -263,6 +271,10 @@ export class SuperPeer {
 
       if (req.method === 'GET' && url.pathname === '/health') return send(200, await this.health())
       if (req.method === 'GET' && url.pathname === '/cut') return send(200, await this.currentCut())
+      if (req.method === 'GET' && url.pathname === '/changes') {
+        const since = Number(url.searchParams.get('since') ?? '0')
+        return send(200, await this.changes(Number.isFinite(since) ? since : 0))
+      }
 
       if (req.method === 'POST' && url.pathname === '/query') {
         const body = await readJson(req)

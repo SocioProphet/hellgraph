@@ -37,8 +37,9 @@ import { loadOptionalDep as loadDep } from './optional-dep.js'
 
 /** A view block: an AtomLogEntry plus the federation provenance stamped at append time.
  *  `_fedProv` carries the writer identity + that writer's local sequence, which is what
- *  causal cuts and proof-binding (spec 09) are computed over. */
-type FederatedBlock = AtomLogEntry & { _fedProv?: { writer: string; seq: number } }
+ *  causal cuts and proof-binding (spec 09) are computed over. Also the shape the CDC
+ *  change-feed (changesSince) yields per op. */
+export type FederatedBlock = AtomLogEntry & { _fedProv?: { writer: string; seq: number } }
 
 // ─── Structural types for the optional bindings (no hard type dep) ───────────────
 
@@ -175,6 +176,31 @@ export class FederatedAtomSpace {
    *  would be bound to, and the read cut for honoring existing proofs. */
   async currentCut(): Promise<CausalCut> {
     return cutFromOrder(await this.linearization())
+  }
+
+  /**
+   * CDC change-feed: linearized op entries from causal position `since` to the end, each with its
+   * writer/seq provenance, plus `length` — the caller's next cursor. Pull-based over the append-only
+   * causal log, so it is robust across re-materialization (no ephemeral listeners) and frame-aware
+   * (pair the cursor with currentCut()). The cursor is an opaque monotonic view position; `since`
+   * clamps into [0, length].
+   */
+  async changesSince(since = 0): Promise<{ ops: FederatedBlock[]; length: number }> {
+    await this.base.update()
+    const view = this.base.view
+    // autobase's live view.length is unreliable to read back AFTER the async view.get() loop, so we
+    // do not use it as the cursor. Collect the data ops; the cursor is their running count — which
+    // is monotonic (ops only append) and is what the caller pages against. Snapshot the loop bound
+    // once up front (valid before any await mutates the view).
+    const bound: number = typeof view?.length === 'number' ? view.length : 0
+    const all: FederatedBlock[] = []
+    for (let i = 0; i < bound; i++) {
+      let block: FederatedBlock
+      try { block = await view.get(i) } catch { continue }
+      if (block?._fedProv) all.push(block)
+    }
+    const from = Math.max(0, Math.min(Math.floor(since) || 0, all.length))
+    return { ops: all.slice(from), length: all.length }
   }
 
   /** Pull the latest linearization from peers. */
