@@ -304,6 +304,105 @@ pub fn betweenness_parallel(n: usize, edges: &[(usize, usize)]) -> Vec<f64> {
     bc
 }
 
+// ── Distributed (partition-parallel, BSP) PageRank ────────────────────────────────────────────────────────────
+/// A graph partition owned by ONE federation participant: the node range `[lo, hi)` it owns, plus the
+/// in-edges TO those owned nodes (edge sources may be remote — read from the exchanged halo). This is
+/// the unit of sharding — a sovereign Autobase log IS one of these. Edges never leave their shard.
+pub struct Shard {
+    pub lo: usize,
+    pub hi: usize,
+    /// Per owned node (local index `v - lo`) → global source ids of its in-edges.
+    pub in_adj: Vec<Vec<usize>>,
+}
+
+/// Range-partition a global edge list into `k` shards (each owns a contiguous node range). Returns the
+/// shards + the global out-degree vector (small O(n) metadata replicated to every participant).
+pub fn partition_edges(n: usize, edges: &[(usize, usize)], k: usize) -> (Vec<Shard>, Vec<u32>) {
+    if n == 0 {
+        return (Vec::new(), Vec::new());
+    }
+    let k = k.clamp(1, n);
+    let size = n.div_ceil(k);
+    let mut out_deg = vec![0u32; n];
+    let mut shards: Vec<Shard> = (0..k)
+        .map(|c| {
+            let lo = c * size;
+            let hi = ((c + 1) * size).min(n);
+            Shard {
+                lo,
+                hi,
+                in_adj: vec![Vec::new(); hi - lo],
+            }
+        })
+        .collect();
+    for &(u, v) in edges {
+        if u < n && v < n {
+            out_deg[u] += 1;
+            let sh = &mut shards[v / size]; // shard owning v
+            let li = v - sh.lo;
+            sh.in_adj[li].push(u);
+        }
+    }
+    (shards, out_deg)
+}
+
+/// Distributed PageRank over sharded partitions (Pregel/BSP model). Each superstep: every shard
+/// computes its OWNED nodes' ranks locally IN PARALLEL from a globally-exchanged rank halo (the only
+/// thing that crosses shard boundaries — O(n) per superstep, not the O(E) edges), then the owned
+/// ranges are gathered into the next global vector. Matches single-graph `pagerank` exactly.
+///
+/// This is the move the centralized incumbents can't make: the data (edges) stays sovereign per
+/// participant; only ranks are exchanged. Deterministic (disjoint owned ranges, fixed source order).
+pub fn distributed_pagerank(
+    n: usize,
+    shards: &[Shard],
+    out_deg: &[u32],
+    damping: f64,
+    max_iters: usize,
+    tol: f64,
+) -> Vec<f64> {
+    if n == 0 {
+        return Vec::new();
+    }
+    let base = (1.0 - damping) / n as f64;
+    let mut rank = vec![1.0 / n as f64; n]; // the exchanged halo (post-gather global state)
+    for _ in 0..max_iters {
+        let mut dangling = 0.0;
+        for u in 0..n {
+            if out_deg[u] == 0 {
+                dangling += rank[u];
+            }
+        }
+        let add = base + damping * dangling / n as f64;
+        // SCATTER: each shard computes its owned partial locally, in parallel (rayon = participants).
+        let partials: Vec<(usize, Vec<f64>)> = shards
+            .par_iter()
+            .map(|sh| {
+                let mut local = vec![0.0f64; sh.hi - sh.lo];
+                for (i, srcs) in sh.in_adj.iter().enumerate() {
+                    let mut acc = 0.0;
+                    for &u in srcs {
+                        acc += rank[u] / out_deg[u] as f64; // remote source rank ← the halo
+                    }
+                    local[i] = add + damping * acc;
+                }
+                (sh.lo, local)
+            })
+            .collect();
+        // GATHER: stitch disjoint owned ranges into the next global vector.
+        let mut next = vec![0.0f64; n];
+        for (lo, local) in &partials {
+            next[*lo..*lo + local.len()].copy_from_slice(local);
+        }
+        let diff: f64 = (0..n).map(|i| (next[i] - rank[i]).abs()).sum();
+        rank = next;
+        if diff < tol {
+            break;
+        }
+    }
+    rank
+}
+
 // ── Louvain community detection (full: local-moving + aggregation, deterministic) ─────────────────────────────
 /// Modularity-optimizing community detection. Deterministic (nodes visited in index order, ties broken by lowest
 /// community id). Unweighted, undirected, resolution 1.0. Returns a flat community id per original node.
@@ -458,6 +557,38 @@ mod tests {
         assert_eq!(
             b,
             betweenness_parallel(5, &edges),
+            "deterministic run-to-run"
+        );
+    }
+
+    #[test]
+    fn distributed_pagerank_matches_single_graph_at_any_shard_count() {
+        let edges = vec![
+            (0, 1),
+            (1, 2),
+            (2, 0),
+            (2, 3),
+            (3, 1),
+            (0, 3),
+            (3, 4),
+            (4, 2),
+        ];
+        let n = 5;
+        let single = pagerank(n, &edges, D, IT, TOL);
+        for k in [1usize, 2, 3, 5] {
+            let (shards, out_deg) = partition_edges(n, &edges, k);
+            let dist = distributed_pagerank(n, &shards, &out_deg, D, IT, TOL);
+            for i in 0..n {
+                assert!(
+                    (single[i] - dist[i]).abs() < 1e-9,
+                    "sharded (k={k}) must equal single-graph at node {i}"
+                );
+            }
+        }
+        let (s, o) = partition_edges(n, &edges, 3);
+        assert_eq!(
+            distributed_pagerank(n, &s, &o, D, IT, TOL),
+            distributed_pagerank(n, &s, &o, D, IT, TOL),
             "deterministic run-to-run"
         );
     }

@@ -5,7 +5,10 @@
 //! Also checks the parallel results match the serial fixed point and are deterministic run-to-run.
 //! Run: `cargo run --release --example scale_bench`.
 
-use hg_analytics::{betweenness, betweenness_parallel, pagerank, pagerank_parallel};
+use hg_analytics::{
+    betweenness, betweenness_parallel, distributed_pagerank, pagerank, pagerank_parallel,
+    partition_edges,
+};
 use std::time::{Duration, Instant};
 
 fn with_threads<R: Send>(k: usize, f: impl FnOnce() -> R + Send) -> R {
@@ -94,5 +97,43 @@ fn main() {
         "  parallel == serial: max|Δ| {:.2e}   deterministic run==run: {}",
         maxdiff,
         br1 == brn
+    );
+    println!();
+
+    // ── Distributed PageRank: partition = shard, only the halo is exchanged (the wedge) ──────────
+    let shards_k = cores;
+    let (shards, out_deg) = partition_edges(n, &edges, shards_k);
+    let owned: Vec<usize> = shards
+        .iter()
+        .map(|s| s.in_adj.iter().map(|a| a.len()).sum())
+        .collect();
+    let (td, dist) = timed(|| distributed_pagerank(n, &shards, &out_deg, d, iters, tol));
+    let dist_diff = pr_serial
+        .iter()
+        .zip(&dist)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0, f64::max);
+    println!(
+        "Distributed PageRank  {} shards (partition = participant)",
+        shards_k
+    );
+    println!(
+        "  time: {:>8.3?}   (edges stay sharded; each superstep exchanges only the O(n) halo)",
+        td
+    );
+    println!(
+        "  per-shard edges: ~{} each   |   halo/superstep: {} f64 ({} MB)  vs  edges kept local: {}",
+        owned.iter().sum::<usize>() / shards_k,
+        n,
+        n * 8 / 1_000_000,
+        m
+    );
+    println!(
+        "  == single-graph PageRank: max|Δ| {:.2e}  (sharded answer is EXACT)",
+        dist_diff
+    );
+    println!(
+        "  deterministic run==run: {}",
+        dist == distributed_pagerank(n, &shards, &out_deg, d, iters, tol)
     );
 }
