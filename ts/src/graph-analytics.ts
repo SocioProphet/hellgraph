@@ -243,3 +243,59 @@ export function shortestPathWeighted(store: HellGraphStore, source: string, targ
     }
   }
 }
+
+// ─── Personalized (seeded) PageRank — HippoRAG-style associative retrieval ───────────
+/**
+ * Personalized PageRank: the teleport/restart distribution is concentrated on `seeds` (e.g. the
+ * query's entity nodes) instead of uniform, so scores measure multi-hop graph proximity to the
+ * seeds — the associative-retrieval primitive GraphRAG/HippoRAG peers use. `seeds` is a node-id
+ * list (uniform weight) or an id→weight map. Deterministic; dangling mass is redistributed by the
+ * teleport distribution. Falls back to uniform teleport if no seed resolves (→ plain PageRank).
+ */
+export function personalizedPageRank(store: HellGraphStore, seeds: string[] | Map<string, number>, opts: PageRankOptions = {}): Map<string, number> {
+  const nodes = store.allNodes().map((n) => n.id)
+  const n = nodes.length
+  const out = new Map<string, number>()
+  if (n === 0) return out
+  const idx = new Map(nodes.map((id, i) => [id, i]))
+
+  const teleport = new Array<number>(n).fill(0)
+  const seedMap = seeds instanceof Map ? seeds : new Map(seeds.map((s) => [s, 1]))
+  let sum = 0
+  for (const [id, w] of seedMap) {
+    const i = idx.get(id)
+    if (i !== undefined && Number.isFinite(w) && w > 0) { teleport[i]! += w; sum += w }
+  }
+  if (sum <= 0) { for (let i = 0; i < n; i++) teleport[i] = 1 / n }
+  else { for (let i = 0; i < n; i++) teleport[i]! /= sum }
+
+  const outAdj: number[][] = Array.from({ length: n }, () => [])
+  const outDeg = new Array<number>(n).fill(0)
+  for (const e of store.allEdges()) {
+    const u = idx.get(e.from), v = idx.get(e.to)
+    if (u !== undefined && v !== undefined) { outAdj[u]!.push(v); outDeg[u]!++ }
+  }
+  const d = opts.damping ?? 0.85
+  const maxIters = opts.iters ?? 100
+  const tol = opts.tol ?? 1e-9
+  let rank = teleport.slice()
+  for (let it = 0; it < maxIters; it++) {
+    const next = new Array<number>(n)
+    for (let v = 0; v < n; v++) next[v] = (1 - d) * teleport[v]!
+    let dangling = 0
+    for (let u = 0; u < n; u++) if (outDeg[u] === 0) dangling += rank[u]!
+    for (let v = 0; v < n; v++) next[v]! += d * dangling * teleport[v]!
+    for (let u = 0; u < n; u++) {
+      if (outDeg[u]! > 0) {
+        const share = (d * rank[u]!) / outDeg[u]!
+        for (const v of outAdj[u]!) next[v]! += share
+      }
+    }
+    let diff = 0
+    for (let v = 0; v < n; v++) diff += Math.abs(next[v]! - rank[v]!)
+    rank = next
+    if (diff < tol) break
+  }
+  for (let i = 0; i < n; i++) out.set(nodes[i]!, rank[i]!)
+  return out
+}
