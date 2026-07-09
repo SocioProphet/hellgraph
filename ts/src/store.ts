@@ -42,6 +42,13 @@ function decodeValue(val: Value | undefined): PropertyValue {
   return String(s)
 }
 
+/** A node write in a transaction batch. */
+export interface TxNode { id: string; labels: string[]; properties?: Record<string, PropertyValue> }
+/** An edge write in a transaction batch. */
+export interface TxEdge { label: string; from: string; to: string; properties?: Record<string, PropertyValue> }
+/** An atomic (all-or-none) batch of graph writes. */
+export interface TxBatch { nodes?: TxNode[]; edges?: TxEdge[] }
+
 export class HellGraphStore {
   constructor(private as: AtomSpace) {}
 
@@ -136,6 +143,47 @@ export class HellGraphStore {
     this.assertUniqueOk(id, this.getNode(id)?.labels ?? [], { [key]: value })
     const enc = encodeValue(value)
     if (enc) this.as.setValue(nodeHandle(ENTITY, id), PROP_PREFIX + key, enc)
+  }
+
+  /**
+   * Apply a batch of node/edge writes atomically (all-or-none). The WHOLE batch is validated first
+   * — uniqueness constraints against the store AND intra-batch conflicts (two batch nodes claiming
+   * the same unique value) — and only if every check passes are the writes applied. On any
+   * violation nothing is written. Honest atomicity for an append-only store: validate-then-apply
+   * (no post-commit rollback; the single-writer AtomSpace gives isolation within one writer).
+   */
+  transaction(batch: TxBatch): { nodes: GraphNode[]; edges: GraphEdge[] } {
+    const nodes = batch.nodes ?? []
+    const edges = batch.edges ?? []
+    // Phase 1 — validate everything, writing nothing.
+    const claimed = new Map<string, string>() // `label\0key\0encoded` → nodeId
+    for (const spec of nodes) {
+      const prior = this.as.getNode(ENTITY, spec.id)?.values[LABELS_KEY]
+      const priorLabels = prior?.kind === 'string' ? prior.value : []
+      const merged = Array.from(new Set([...priorLabels, ...spec.labels]))
+      this.assertUniqueOk(spec.id, merged, spec.properties ?? {})
+      for (const label of merged) {
+        const keys = this.uniqueConstraints.get(label)
+        if (!keys) continue
+        for (const k of keys) {
+          const v = spec.properties?.[k]
+          if (v === undefined) continue
+          const enc = encodeValue(v)
+          if (!enc) continue
+          const ck = `${label} ${k} ${JSON.stringify(enc)}`
+          const other = claimed.get(ck)
+          if (other !== undefined && other !== spec.id) {
+            throw new Error(`batch uniqueness conflict (${label}.${k}): "${spec.id}" and "${other}" claim the same value`)
+          }
+          claimed.set(ck, spec.id)
+        }
+      }
+    }
+    // Phase 2 — apply (validation guarantees these won't throw on constraints).
+    return {
+      nodes: nodes.map((s) => this.addNode(s.id, s.labels, s.properties ?? {})),
+      edges: edges.map((s) => this.addEdge(s.label, s.from, s.to, s.properties ?? {})),
+    }
   }
 
   // ─── Read path ────────────────────────────────────────────────────────────
