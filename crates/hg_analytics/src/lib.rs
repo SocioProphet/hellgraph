@@ -10,7 +10,11 @@ use hg_core::AtomId;
 use rayon::prelude::*;
 use std::collections::HashMap;
 
+mod cc;
 mod ooc;
+pub use cc::{
+    connected_components, distributed_connected_components, partition_undirected, CcShard,
+};
 pub use ooc::{pagerank_mmap, write_csr, write_csr_bucketed, write_csr_streaming, MmapCsr};
 
 /// Cold PageRank over a 0..n indexed graph. Dangling nodes (no out-edges) redistribute their mass uniformly.
@@ -696,6 +700,27 @@ mod tests {
             std::fs::remove_file(&out).ok();
         }
         std::fs::remove_file(&reference).ok();
+    }
+
+    #[test]
+    fn distributed_connected_components_matches_single_graph() {
+        // component {0,1,2} triangle · component {3,4} edge · node 5 isolated
+        let edges = vec![(0, 1), (1, 2), (2, 0), (3, 4)];
+        let n = 6;
+        let single = connected_components(n, &edges);
+        for k in [1usize, 2, 3, 6] {
+            let shards = partition_undirected(n, &edges, k);
+            assert_eq!(
+                distributed_connected_components(n, &shards),
+                single,
+                "sharded CC (k={k}) must equal single-graph"
+            );
+        }
+        assert_eq!(single[0], single[1]);
+        assert_eq!(single[1], single[2]);
+        assert_eq!(single[3], single[4]);
+        assert_ne!(single[0], single[3], "distinct components differ");
+        assert_ne!(single[5], single[0], "isolated node is its own component");
     }
 
     #[test]
