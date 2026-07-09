@@ -432,9 +432,16 @@ mod tests {
         let a = pagerank(4, &edges, D, IT, TOL);
         let b = pagerank_parallel(4, &edges, D, IT, TOL);
         for i in 0..4 {
-            assert!((a[i] - b[i]).abs() < 1e-9, "parallel PR must match serial fixed point");
+            assert!(
+                (a[i] - b[i]).abs() < 1e-9,
+                "parallel PR must match serial fixed point"
+            );
         }
-        assert_eq!(b, pagerank_parallel(4, &edges, D, IT, TOL), "deterministic run-to-run");
+        assert_eq!(
+            b,
+            pagerank_parallel(4, &edges, D, IT, TOL),
+            "deterministic run-to-run"
+        );
     }
 
     #[test]
@@ -443,9 +450,16 @@ mod tests {
         let a = betweenness(5, &edges);
         let b = betweenness_parallel(5, &edges);
         for i in 0..5 {
-            assert!((a[i] - b[i]).abs() < 1e-9, "parallel betweenness must match serial");
+            assert!(
+                (a[i] - b[i]).abs() < 1e-9,
+                "parallel betweenness must match serial"
+            );
         }
-        assert_eq!(b, betweenness_parallel(5, &edges), "deterministic run-to-run");
+        assert_eq!(
+            b,
+            betweenness_parallel(5, &edges),
+            "deterministic run-to-run"
+        );
     }
 
     #[test]
