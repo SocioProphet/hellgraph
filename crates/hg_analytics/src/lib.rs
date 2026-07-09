@@ -11,7 +11,7 @@ use rayon::prelude::*;
 use std::collections::HashMap;
 
 mod ooc;
-pub use ooc::{pagerank_mmap, write_csr, write_csr_streaming, MmapCsr};
+pub use ooc::{pagerank_mmap, write_csr, write_csr_bucketed, write_csr_streaming, MmapCsr};
 
 /// Cold PageRank over a 0..n indexed graph. Dangling nodes (no out-edges) redistribute their mass uniformly.
 pub fn pagerank(
@@ -661,6 +661,41 @@ mod tests {
         drop(csr);
         std::fs::remove_file(&batch).ok();
         std::fs::remove_file(&stream).ok();
+    }
+
+    #[test]
+    fn bucketed_builder_is_byte_identical_across_bucket_counts() {
+        let edges = vec![
+            (0, 1),
+            (1, 2),
+            (2, 0),
+            (2, 3),
+            (3, 1),
+            (0, 3),
+            (3, 4),
+            (4, 2),
+            (1, 4),
+        ];
+        let n = 5;
+        let reference = std::env::temp_dir().join(format!("hg_ref_{}.csr", std::process::id()));
+        write_csr(&reference, n, &edges).unwrap();
+        let want = std::fs::read(&reference).unwrap();
+        // Sequential-I/O external build must match the batch build at ANY bucket count.
+        for buckets in [1usize, 2, 3, 5, 8] {
+            let out = std::env::temp_dir().join(format!(
+                "hg_buck_{}_{}.csr",
+                buckets,
+                std::process::id()
+            ));
+            write_csr_bucketed(&out, n, || edges.iter().copied(), buckets).unwrap();
+            assert_eq!(
+                std::fs::read(&out).unwrap(),
+                want,
+                "bucketed (b={buckets}) must be byte-identical"
+            );
+            std::fs::remove_file(&out).ok();
+        }
+        std::fs::remove_file(&reference).ok();
     }
 
     #[test]

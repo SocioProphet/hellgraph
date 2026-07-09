@@ -103,6 +103,65 @@ pub fn write_csr(path: &Path, n: usize, edges: &[(usize, usize)]) -> io::Result<
     w.flush()
 }
 
+/// Bucketed (external-memory) CSR builder — the fully-SEQUENTIAL-I/O ingest for a truly larger-than-
+/// RAM graph. Destination nodes are split into `num_buckets` contiguous ranges; the neighbours region
+/// is emitted one bucket at a time, in order, so ALL output writes are sequential (no random-write
+/// page-thrash like the mmap `write_csr_streaming`). Peak heap is O(n) + O(m / num_buckets) — the
+/// per-bucket neighbour buffer — independent of total edge count. `edges` is streamed once per bucket
+/// (cheap for a generator; sequential re-read for a file). Byte-identical output to `write_csr`.
+pub fn write_csr_bucketed<I, F>(
+    path: &Path,
+    n: usize,
+    edges: F,
+    num_buckets: usize,
+) -> io::Result<()>
+where
+    I: Iterator<Item = (usize, usize)>,
+    F: Fn() -> I,
+{
+    let buckets = num_buckets.clamp(1, n.max(1));
+    let mut in_deg = vec![0u64; n];
+    let mut out_deg = vec![0u32; n];
+    for (u, v) in edges() {
+        if u < n && v < n {
+            in_deg[v] += 1;
+            out_deg[u] += 1;
+        }
+    }
+    let mut offsets = vec![0u64; n + 1];
+    for v in 0..n {
+        offsets[v + 1] = offsets[v] + in_deg[v];
+    }
+    drop(in_deg);
+    let m = offsets[n] as usize;
+
+    let mut w = BufWriter::new(File::create(path)?);
+    w.write_all(bytemuck::cast_slice(&[n as u64, m as u64]))?;
+    w.write_all(bytemuck::cast_slice(&offsets))?;
+
+    // Neighbours, emitted bucket-by-bucket in destination order → sequential writes.
+    let range = n.div_ceil(buckets);
+    let mut cursor = offsets.clone(); // O(n)
+    for b in 0..buckets {
+        let blo = b * range;
+        let bhi = ((b + 1) * range).min(n);
+        if blo >= bhi {
+            continue;
+        }
+        let base = offsets[blo] as usize;
+        let mut buf = vec![0u32; offsets[bhi] as usize - base]; // O(m / buckets)
+        for (u, v) in edges() {
+            if v >= blo && v < bhi && u < n {
+                buf[cursor[v] as usize - base] = u as u32;
+                cursor[v] += 1;
+            }
+        }
+        w.write_all(bytemuck::cast_slice(&buf))?;
+    }
+    w.write_all(bytemuck::cast_slice(&out_deg))?;
+    w.flush()
+}
+
 /// A read-only, memory-mapped CSR graph. The edge structure is NOT in heap — it is paged from the
 /// file on demand. Only the caller's O(n) rank vectors are resident.
 pub struct MmapCsr {
