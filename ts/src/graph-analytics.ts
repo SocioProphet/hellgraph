@@ -159,3 +159,87 @@ export function louvain(store: HellGraphStore, maxPasses = 20): Map<string, stri
   }
   return comm
 }
+
+// ─── Pathfinding (parity gap vs mainstream graph DBs: shortest path / Dijkstra) ──────
+export interface PathOptions {
+  /** Traverse edges in both directions (default: directed, following from→to). */
+  undirected?: boolean
+}
+export interface WeightedPathOptions extends PathOptions {
+  /** Edge property holding a non-negative numeric weight (default "weight"); missing/non-numeric → 1. */
+  weightProp?: string
+}
+
+function buildAdjacency(store: HellGraphStore, undirected: boolean): Map<string, string[]> {
+  const adj = new Map<string, string[]>()
+  const add = (a: string, b: string): void => { const l = adj.get(a) ?? []; l.push(b); adj.set(a, l) }
+  for (const e of store.allEdges()) { add(e.from, e.to); if (undirected) add(e.to, e.from) }
+  for (const l of adj.values()) l.sort() // deterministic neighbour order
+  return adj
+}
+
+function reconstruct(prev: Map<string, string>, source: string, target: string): string[] {
+  const path = [target]
+  let cur = target
+  while (cur !== source) { const p = prev.get(cur)!; path.push(p); cur = p }
+  return path.reverse()
+}
+
+/** Unweighted shortest path (BFS) from `source` to `target`. Returns the inclusive node-id path,
+ *  or null if either endpoint is absent or the target is unreachable. Deterministic: neighbours
+ *  are expanded in ascending node-id order. */
+export function shortestPath(store: HellGraphStore, source: string, target: string, opts: PathOptions = {}): string[] | null {
+  if (!store.getNode(source) || !store.getNode(target)) return null
+  if (source === target) return [source]
+  const adj = buildAdjacency(store, opts.undirected ?? false)
+  const prev = new Map<string, string>()
+  const seen = new Set<string>([source])
+  const queue = [source]
+  while (queue.length) {
+    const u = queue.shift()!
+    for (const v of adj.get(u) ?? []) {
+      if (seen.has(v)) continue
+      seen.add(v); prev.set(v, u)
+      if (v === target) return reconstruct(prev, source, target)
+      queue.push(v)
+    }
+  }
+  return null
+}
+
+/** Weighted shortest path (Dijkstra, non-negative weights). Returns `{ path, cost }` or null.
+ *  O(V²) min-extraction (deterministic, id-tie-break) — consistent with this module's Brandes/
+ *  Louvain scale. Throws on a negative edge weight (Dijkstra's invariant). */
+export function shortestPathWeighted(store: HellGraphStore, source: string, target: string, opts: WeightedPathOptions = {}): { path: string[]; cost: number } | null {
+  if (!store.getNode(source) || !store.getNode(target)) return null
+  const wprop = opts.weightProp ?? 'weight'
+  const undirected = opts.undirected ?? false
+  const adj = new Map<string, { to: string; w: number }[]>()
+  const add = (a: string, b: string, w: number): void => { const l = adj.get(a) ?? []; l.push({ to: b, w }); adj.set(a, l) }
+  for (const e of store.allEdges()) {
+    const raw = Number(e.properties[wprop])
+    if (raw < 0) throw new Error(`shortestPathWeighted: negative edge weight ${raw} on ${e.from}->${e.to} (Dijkstra requires ≥ 0)`)
+    const w = Number.isFinite(raw) && raw >= 0 ? raw : 1
+    add(e.from, e.to, w); if (undirected) add(e.to, e.from, w)
+  }
+  const dist = new Map<string, number>([[source, 0]])
+  const prev = new Map<string, string>()
+  const done = new Set<string>()
+  for (;;) {
+    let u: string | undefined
+    let best = Infinity
+    for (const [node, dd] of dist) {
+      if (done.has(node)) continue
+      if (dd < best || (dd === best && (u === undefined || node < u))) { best = dd; u = node }
+    }
+    if (u === undefined) return null
+    if (u === target) return { path: reconstruct(prev, source, target), cost: best }
+    done.add(u)
+    for (const { to, w } of adj.get(u) ?? []) {
+      if (done.has(to)) continue
+      const nd = best + w
+      const cur = dist.get(to)
+      if (cur === undefined || nd < cur) { dist.set(to, nd); prev.set(to, u) }
+    }
+  }
+}
