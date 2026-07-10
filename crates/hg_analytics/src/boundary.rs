@@ -354,10 +354,90 @@ pub fn distributed_cc_boundary(n: usize, shards: &[BoundaryCcShard]) -> Vec<u32>
     label
 }
 
+/// Distributed breadth-first search (hop distance from `source`) with a boundary-only halo, over the
+/// undirected CC shards. This is the TRAVERSAL shape — a frontier expansion, not a fixpoint smoothing like
+/// PageRank — so it proves the boundary-halo model covers the LDBC traversal class too. Each superstep is
+/// a Bellman-Ford-style relaxation (`dist[v] = min(dist[v], min_{u~v} dist[u] + 1)`); only ghost distances
+/// (u32) cross shard boundaries. Deterministic; converges in O(diameter) supersteps to the exact BFS tree.
+/// Unreachable vertices stay `u32::MAX`. (Weighted SSSP is the same loop with `+ w(u,v)` instead of `+ 1`.)
+pub fn distributed_bfs_boundary(n: usize, shards: &[BoundaryCcShard], source: usize) -> Vec<u32> {
+    if n == 0 {
+        return Vec::new();
+    }
+    let mut dist = vec![u32::MAX; n];
+    if source < n {
+        dist[source] = 0;
+    }
+    loop {
+        let partials: Vec<(usize, Vec<u32>)> = shards
+            .par_iter()
+            .map(|sh| {
+                let owned = sh.owned();
+                let mut local_dist = vec![u32::MAX; owned + sh.ghosts.len()];
+                local_dist[..owned].copy_from_slice(&dist[sh.lo..sh.hi]);
+                for (i, &g) in sh.ghosts.iter().enumerate() {
+                    local_dist[owned + i] = dist[g];
+                }
+                let mut out = vec![u32::MAX; owned];
+                for (i, nbrs) in sh.adj.iter().enumerate() {
+                    let mut m = local_dist[i];
+                    for &li in nbrs {
+                        let du = local_dist[li];
+                        if du != u32::MAX && du + 1 < m {
+                            m = du + 1;
+                        }
+                    }
+                    out[i] = m;
+                }
+                (sh.lo, out)
+            })
+            .collect();
+        let mut changed = false;
+        let mut next = dist.clone();
+        for (lo, local) in &partials {
+            for (i, &dv) in local.iter().enumerate() {
+                if dv < next[lo + i] {
+                    next[lo + i] = dv;
+                    changed = true;
+                }
+            }
+        }
+        dist = next;
+        if !changed {
+            break;
+        }
+    }
+    dist
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{connected_components, pagerank, Kronecker};
+
+    /// Serial reference BFS (hop distance) for verification.
+    fn serial_bfs(n: usize, edges: &[(usize, usize)], source: usize) -> Vec<u32> {
+        let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for &(u, v) in edges {
+            if u < n && v < n && u != v {
+                adj[u].push(v);
+                adj[v].push(u);
+            }
+        }
+        let mut dist = vec![u32::MAX; n];
+        let mut q = std::collections::VecDeque::new();
+        dist[source] = 0;
+        q.push_back(source);
+        while let Some(u) = q.pop_front() {
+            for &w in &adj[u] {
+                if dist[w] == u32::MAX {
+                    dist[w] = dist[u] + 1;
+                    q.push_back(w);
+                }
+            }
+        }
+        dist
+    }
 
     #[test]
     fn boundary_halo_pagerank_matches_serial_exactly() {
@@ -429,6 +509,18 @@ mod tests {
         let shards = partition_cc_boundary(n, &edges, 8);
         let dist = distributed_cc_boundary(n, &shards);
         assert_eq!(serial, dist, "boundary-halo CC diverged from serial");
+    }
+
+    #[test]
+    fn boundary_halo_bfs_matches_serial_exactly() {
+        // One connected RMAT blob so most vertices are reachable → a real multi-hop BFS across shards.
+        let n = Kronecker::vertices(9); // 512
+        let edges: Vec<(usize, usize)> = Kronecker::new(9, 8, 0xB5).collect();
+        let source = 0;
+        let serial = serial_bfs(n, &edges, source);
+        let shards = partition_cc_boundary(n, &edges, 8);
+        let dist = distributed_bfs_boundary(n, &shards, source);
+        assert_eq!(serial, dist, "boundary-halo BFS diverged from serial");
     }
 
     #[test]
