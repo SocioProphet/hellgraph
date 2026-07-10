@@ -10,9 +10,13 @@ use hg_core::AtomId;
 use rayon::prelude::*;
 use std::collections::HashMap;
 
+mod boundary;
 mod cc;
 mod graph500;
 mod ooc;
+pub use boundary::{
+    distributed_pagerank_boundary, partition_edges_boundary, total_halo_bytes, BoundaryShard,
+};
 pub use cc::{
     connected_components, distributed_connected_components, partition_undirected, CcShard,
 };
