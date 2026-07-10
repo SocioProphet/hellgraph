@@ -33,9 +33,19 @@ teardown() {
 }
 trap teardown EXIT
 
-echo "▸ build + push"
-docker build -f "$HERE/Dockerfile" -t "$IMAGE" "$ROOT"
-docker push "$IMAGE"
+echo "▸ build + push (BUILDER=${BUILDER:-docker})"
+case "${BUILDER:-docker}" in
+  cloudbuild)
+    # Server-side build — no local docker daemon needed (this is the Saturday path). Uses cloudbuild.yaml
+    # so the non-root Dockerfile (deploy/bench/Dockerfile) is honoured.
+    gcloud builds submit "$ROOT" --config="$HERE/cloudbuild.yaml" --substitutions=_IMAGE="$IMAGE"
+    ;;
+  docker)
+    docker build -f "$HERE/Dockerfile" -t "$IMAGE" "$ROOT"
+    docker push "$IMAGE"
+    ;;
+  *) echo "unknown BUILDER=$BUILDER (want docker|cloudbuild)"; exit 2 ;;
+esac
 
 echo "▸ apply configmap + coordinator + workers"
 kubectl apply -f "$K8S/configmap.yaml"

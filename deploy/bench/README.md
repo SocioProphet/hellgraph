@@ -22,32 +22,46 @@ From the local dress rehearsal: **~126 bytes/edge resident**.
 Set `HG_SCALE` / `HG_SHARDS` in `k8s/configmap.yaml`. The **MVP proof is scale 26 / 8 shards (~1B edges)**
 — that's the default.
 
-## Run it
+## Run it — one command (`saturday.sh`)
 
-Prereqs: `kubectl` pointed at the target cluster, push access to `$REGISTRY`. The cluster itself is spun
-up and torn down **separately and explicitly** (see below) — `run.sh` only manages the workload, and it
-tears the workload down on exit (`spin up → work → TEAR DOWN`).
+The whole money run: create GKE cluster → build image with **Cloud Build (no local docker)** → deploy →
+stream the verified result → **tear down the cluster** (on exit, always). Ephemeral by construction.
 
 ```bash
-# 0. bring up a cluster (explicit, ephemeral — example; tear it down when done)
-gcloud container clusters create hg-bench --num-nodes=8 --machine-type=e2-standard-4 --spot
+# prereq once: gcloud auth login   (the scripts fail fast if the token is stale)
 
-# 1. run the benchmark (build → push → deploy → stream verified result → delete workload)
-REGISTRY=us-docker.pkg.dev/PROJECT/hellgraph deploy/bench/run.sh
+# dry-run — checks auth/APIs/AR-repo/manifests and prints the plan; spends NOTHING:
+PROJECT=my-proj deploy/bench/saturday.sh --preflight
 
-# 2. TEAR DOWN the cluster (do not leave it running)
-gcloud container clusters delete hg-bench --quiet
+# for real (creates cluster, builds, runs, tears down):
+PROJECT=my-proj REGION=us-central1 deploy/bench/saturday.sh
 ```
 
-`KEEP=1 ... run.sh` leaves the pods up for inspection (you then clean up by label `app=hg-bench`).
+Sizing knobs: `NODES` (default `HG_SHARDS + 1`), `MACHINE` (default `e2-standard-4` = 4 vCPU / 16 GB, the
+row in the table above), graph size via `k8s/configmap.yaml`. `KEEP=1` leaves the cluster up (you then
+delete it yourself).
+
+### Workload-only (`run.sh`) — cluster already exists
+
+If you manage the cluster yourself, `run.sh` just builds + deploys + streams + deletes the *workload*
+(`spin up → work → TEAR DOWN`). Pick the builder:
+
+```bash
+# server-side build, no local docker (what saturday.sh uses):
+REGISTRY=us-central1-docker.pkg.dev/PROJECT/hellgraph BUILDER=cloudbuild deploy/bench/run.sh
+# or local docker if you have it:
+REGISTRY=... BUILDER=docker deploy/bench/run.sh
+```
 
 ## Files
 
+- `saturday.sh` — full lifecycle: cluster create → Cloud Build → run → cluster teardown; `--preflight`.
 - `Dockerfile` — multi-stage Rust 1.96 build → slim runtime; one image, both roles.
+- `cloudbuild.yaml` — server-side build (honours the non-root Dockerfile); no local docker needed.
 - `k8s/configmap.yaml` — `HG_SHARDS` / `HG_SCALE` / `HG_EDGEFACTOR` / `HG_ITERS` (single source of truth).
 - `k8s/coordinator.yaml` — headless Service (`hg-coordinator:9000`) + coordinator Job.
 - `k8s/workers.yaml` — Indexed Job; each pod's `JOB_COMPLETION_INDEX` is its shard ordinal.
-- `run.sh` — build/push/apply/stream/teardown; keeps worker fan-out == `HG_SHARDS`.
+- `run.sh` — build (`BUILDER=docker|cloudbuild`)/apply/stream/teardown; keeps worker fan-out == `HG_SHARDS`.
 
 ## Honest scope
 
