@@ -11,10 +11,12 @@ use rayon::prelude::*;
 use std::collections::HashMap;
 
 mod cc;
+mod graph500;
 mod ooc;
 pub use cc::{
     connected_components, distributed_connected_components, partition_undirected, CcShard,
 };
+pub use graph500::Kronecker;
 pub use ooc::{pagerank_mmap, write_csr, write_csr_bucketed, write_csr_streaming, MmapCsr};
 
 /// Cold PageRank over a 0..n indexed graph. Dangling nodes (no out-edges) redistribute their mass uniformly.
@@ -721,6 +723,29 @@ mod tests {
         assert_eq!(single[3], single[4]);
         assert_ne!(single[0], single[3], "distinct components differ");
         assert_ne!(single[5], single[0], "isolated node is its own component");
+    }
+
+    #[test]
+    fn graph500_kronecker_is_well_formed_and_deterministic() {
+        let (scale, ef) = (10u32, 16usize);
+        let n = Kronecker::vertices(scale);
+        let m = Kronecker::edges(scale, ef);
+        assert_eq!(n, 1024);
+        assert_eq!(m, 16 * 1024);
+        let edges: Vec<(usize, usize)> = Kronecker::new(scale, ef, 42).collect();
+        assert_eq!(edges.len(), m, "yields exactly edgefactor·2^scale edges");
+        assert!(
+            edges.iter().all(|&(u, v)| u < n && v < n),
+            "all vertices in [0, 2^scale)"
+        );
+        // deterministic: same seed → identical stream
+        assert_eq!(edges, Kronecker::new(scale, ef, 42).collect::<Vec<_>>());
+        // RMAT skew: degree is concentrated (a few hot vertices) — not uniform. Check node 0 is hot.
+        let deg0 = edges.iter().filter(|&&(u, v)| u == 0 || v == 0).count();
+        assert!(
+            deg0 > m / n,
+            "RMAT produces a skewed (scale-free-ish) degree distribution"
+        );
     }
 
     #[test]
