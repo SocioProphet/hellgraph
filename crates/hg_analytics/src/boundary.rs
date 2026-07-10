@@ -634,6 +634,125 @@ fn most_frequent_label(labels: impl Iterator<Item = u32>) -> u32 {
         .unwrap_or(0)
 }
 
+// ── Boundary-halo local clustering coefficient (LCC) — the 2-hop kernel ────────────────────────────────────────
+/// An LCC partition. Unlike the 1-hop kernels above, LCC needs each owned vertex to know the ADJACENCY of
+/// its neighbours (to count edges among them), so a boundary vertex needs its ghost neighbours' neighbour
+/// lists — 2-hop information. `adj` therefore holds the sorted global neighbour list of every owned vertex
+/// AND every ghost. LCC is single-pass, so this heavier halo is exchanged ONCE at setup, not per superstep.
+pub struct BoundaryLccShard {
+    pub lo: usize,
+    pub hi: usize,
+    /// global id → sorted, deduped global neighbour ids, for every owned vertex and every ghost.
+    pub adj: HashMap<usize, Vec<u32>>,
+}
+
+impl BoundaryLccShard {
+    pub fn owned(&self) -> usize {
+        self.hi - self.lo
+    }
+}
+
+/// Range-partition into `k` LCC shards. Each shard carries its owned vertices' adjacency plus the adjacency
+/// of every ghost (the 2-hop halo) — enough to count each owned vertex's triangles locally.
+pub fn partition_lcc_boundary(
+    n: usize,
+    edges: &[(usize, usize)],
+    k: usize,
+) -> Vec<BoundaryLccShard> {
+    if n == 0 {
+        return Vec::new();
+    }
+    let k = k.clamp(1, n);
+    let size = n.div_ceil(k);
+    // Global undirected adjacency (sorted, deduped) — the ground truth we slice per shard.
+    let mut gadj: Vec<Vec<u32>> = vec![Vec::new(); n];
+    for &(u, v) in edges {
+        if u < n && v < n && u != v {
+            gadj[u].push(v as u32);
+            gadj[v].push(u as u32);
+        }
+    }
+    for a in gadj.iter_mut() {
+        a.sort_unstable();
+        a.dedup();
+    }
+    (0..k)
+        .map(|c| {
+            let lo = c * size;
+            let hi = ((c + 1) * size).min(n);
+            let mut adj: HashMap<usize, Vec<u32>> = HashMap::new();
+            let mut ghosts: BTreeSet<usize> = BTreeSet::new();
+            #[allow(clippy::needless_range_loop)]
+            for v in lo..hi {
+                adj.insert(v, gadj[v].clone());
+                for &w in &gadj[v] {
+                    let w = w as usize;
+                    if w < lo || w >= hi {
+                        ghosts.insert(w); // remote neighbour → its adjacency must come along (2-hop)
+                    }
+                }
+            }
+            for g in ghosts {
+                adj.insert(g, gadj[g].clone());
+            }
+            BoundaryLccShard { lo, hi, adj }
+        })
+        .collect()
+}
+
+/// Count of common elements between two sorted, deduped slices (a linear merge).
+fn sorted_intersection_count(a: &[u32], b: &[u32]) -> usize {
+    let (mut i, mut j, mut c) = (0usize, 0usize, 0usize);
+    while i < a.len() && j < b.len() {
+        match a[i].cmp(&b[j]) {
+            std::cmp::Ordering::Less => i += 1,
+            std::cmp::Ordering::Greater => j += 1,
+            std::cmp::Ordering::Equal => {
+                c += 1;
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    c
+}
+
+/// Distributed local clustering coefficient with a boundary (2-hop) halo. Single pass: for each owned
+/// vertex `v`, LCC(v) = edges-among-N(v) / C(deg,2), computed as `Σ_{a∈N(v)} |N(a) ∩ N(v)| / (deg·(deg−1))`
+/// (each triangle edge counted twice → the deg·(deg−1) denominator). Vertices with degree < 2 get 0.
+/// Deterministic and exact vs a single-graph LCC. The adjacency-carrying halo is why this is the "2-hop"
+/// kernel — but being single-pass, it is exchanged once, not every superstep.
+pub fn distributed_lcc_boundary(n: usize, shards: &[BoundaryLccShard]) -> Vec<f64> {
+    if n == 0 {
+        return Vec::new();
+    }
+    let partials: Vec<(usize, Vec<f64>)> = shards
+        .par_iter()
+        .map(|sh| {
+            let mut out = vec![0.0f64; sh.owned()];
+            for v in sh.lo..sh.hi {
+                let nv = &sh.adj[&v];
+                let d = nv.len();
+                if d < 2 {
+                    continue;
+                }
+                // Σ over neighbours a of |N(a) ∩ N(v)| — each edge among N(v) counted twice.
+                let mut sum = 0usize;
+                for &a in nv {
+                    sum += sorted_intersection_count(&sh.adj[&(a as usize)], nv);
+                }
+                out[v - sh.lo] = sum as f64 / (d as f64 * (d as f64 - 1.0));
+            }
+            (sh.lo, out)
+        })
+        .collect();
+    let mut lcc = vec![0.0f64; n];
+    for (lo, local) in &partials {
+        lcc[*lo..*lo + local.len()].copy_from_slice(local);
+    }
+    lcc
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -790,6 +909,50 @@ mod tests {
         assert!(
             maxd < 1e-9,
             "boundary SSSP diverged from Dijkstra: max|Δ| {maxd:e}"
+        );
+    }
+
+    #[test]
+    fn boundary_halo_lcc_matches_serial_exactly() {
+        let n = Kronecker::vertices(9); // 512
+        let edges: Vec<(usize, usize)> = Kronecker::new(9, 8, 0x1CCC).collect();
+
+        // Serial LCC reference: edges among each vertex's neighbours / C(deg,2).
+        let mut g: Vec<std::collections::BTreeSet<usize>> = vec![Default::default(); n];
+        for &(u, v) in &edges {
+            if u != v {
+                g[u].insert(v);
+                g[v].insert(u);
+            }
+        }
+        let mut ref_lcc = vec![0.0f64; n];
+        for v in 0..n {
+            let nv: Vec<usize> = g[v].iter().copied().collect();
+            let d = nv.len();
+            if d < 2 {
+                continue;
+            }
+            let mut edges_among = 0usize;
+            for i in 0..d {
+                for j in (i + 1)..d {
+                    if g[nv[i]].contains(&nv[j]) {
+                        edges_among += 1;
+                    }
+                }
+            }
+            ref_lcc[v] = 2.0 * edges_among as f64 / (d as f64 * (d as f64 - 1.0));
+        }
+
+        let shards = partition_lcc_boundary(n, &edges, 8);
+        let lcc = distributed_lcc_boundary(n, &shards);
+        let maxd = ref_lcc
+            .iter()
+            .zip(&lcc)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f64, f64::max);
+        assert!(
+            maxd < 1e-12,
+            "boundary LCC diverged from serial: max|Δ| {maxd:e}"
         );
     }
 

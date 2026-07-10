@@ -62,26 +62,30 @@ N worker **processes**, Fennel-partitioned, boundary halo over real sockets. Edg
 The P2P mesh removes the coordinator from the hot path: its traffic is O(k), independent of graph size —
 the difference between an 8-node demo and a 64-node run.
 
-## 4. The distributed suite — five LDBC kernels, all exact
+## 4. The full LDBC Graphalytics suite — all six kernels, all exact
 
 ```
-HG_SCALE=20 HG_SHARDS=16 cargo run -p hg_analytics --release --example ldbc_suite
+HG_SCALE=18 HG_SHARDS=16 cargo run -p hg_analytics --release --example ldbc_suite
 ```
 
-One Fennel partition, five computational shapes, self-verifying scorecard. Scale-20 (1M nodes / 16.8M
+One Fennel partition, every computational shape, self-verifying scorecard. Scale-18 (262K nodes / 4.2M
 edges, 16 shards):
 
-| kernel | shape | time | halo/step | vs single-graph |
-|--------|-------|-----:|----------:|:---------------:|
-| PageRank | fixpoint | 1.03 s | 7.6 MB | max\|Δ\| 6e-17 ✓ |
-| WCC | min-label prop | 0.19 s | 5.4 MB | exact ✓ |
-| CDLP | label voting | 3.90 s | 5.4 MB | exact ✓ |
-| BFS | unit traversal | 0.20 s | 5.4 MB | exact ✓ |
-| SSSP | weighted traversal | 0.42 s | 10.8 MB | max\|Δ\| 0 ✓ |
+| kernel | shape | time | vs single-graph |
+|--------|-------|-----:|:---------------:|
+| PageRank | fixpoint | 0.18 s | max\|Δ\| 1e-16 ✓ |
+| WCC | min-label prop | 0.04 s | exact ✓ |
+| CDLP | label voting | 0.98 s | exact ✓ |
+| BFS | unit traversal | 0.04 s | exact ✓ |
+| SSSP | weighted traversal | 0.07 s | max\|Δ\| 0 ✓ |
+| LCC | 2-hop triangle count | 21.3 s | max\|Δ\| 0 ✓ |
 
-Five of the six LDBC Graphalytics kernels (BFS, PR, WCC, CDLP, SSSP), boundary-halo distributed, all
-bit-exact against their single-graph reference. CDLP is heavier (per-node label histogram × fixed rounds),
-the rest are sub-second at 16.8M edges.
+**The complete six-kernel LDBC Graphalytics suite (BFS, PR, WCC, CDLP, LCC, SSSP), boundary-halo
+distributed, all bit-exact** against their single-graph references. LCC is the outlier on time — triangle
+counting on RMAT is adversarial (a few power-law super-hubs own most triangles, and RMAT does not cap
+degree the way real LDBC datasets do); it is single-pass and exact, just heavy on this synthetic graph.
+The other five are sub-second-to-~1s at 4.2M edges. LCC is also the only kernel needing a 2-hop halo
+(ghosts carry adjacency, not a scalar) — exchanged once, since it is single-pass.
 
 ## 5. Out-of-core (single machine, > RAM)
 
@@ -112,6 +116,5 @@ Run it on GKE: `deploy/bench/` (`saturday.sh` = create → Cloud Build → run �
 - `dist_p2p` uses a full mesh (only among peers with real boundary overlap); >100 nodes wants a sparser
   mesh and pod-IP wiring.
 - Laptop out-of-core ceiling ~500M edges; beyond that is the cluster.
-- LDBC coverage is 5/6 kernels (BFS, PR, WCC, CDLP, SSSP); only LCC (local clustering coefficient) is not
-  yet distributed — it needs 2-hop neighbourhoods across shard boundaries, a genuine extension of the
-  current 1-hop ghost halo (Louvain also exists single-graph).
+- LDBC coverage is complete: all 6 Graphalytics kernels (BFS, PR, WCC, CDLP, LCC, SSSP) are distributed
+  and verified. LCC is slow on RMAT hubs (inherent to triangle counting on uncapped power-law degree).

@@ -1,8 +1,8 @@
 //! ldbc_suite — the whole distributed boundary-halo suite on ONE graph, as an LDBC-Graphalytics-style
-//! scorecard. Runs PageRank (PR), WCC, CDLP, BFS, and weighted SSSP — the main computational shapes
-//! (fixpoint smoothing / min-label prop / label voting / unit-hop + weighted traversal), which are five of
-//! the six LDBC Graphalytics kernels. Each is Fennel-partitioned + boundary-halo distributed and VERIFIED
-//! bit-exact against its single-graph reference, with per-kernel time + recurring halo reported.
+//! scorecard. Runs the FULL six-kernel LDBC Graphalytics suite — PageRank, WCC, CDLP, BFS, weighted SSSP,
+//! and LCC — covering every computational shape (fixpoint smoothing / min-label prop / label voting /
+//! unit-hop + weighted traversal / 2-hop triangle counting). Each is Fennel-partitioned + boundary-halo
+//! distributed and VERIFIED bit-exact against its single-graph reference, with per-kernel time reported.
 //!
 //! This is the Saturday deliverable in one command: a credible, self-verifying benchmark result, not just
 //! "it ran". Graph size via HG_SCALE / HG_EDGEFACTOR; shards via HG_SHARDS.
@@ -11,15 +11,59 @@
 
 use hg_analytics::{
     connected_components, distributed_bfs_boundary, distributed_cc_boundary,
-    distributed_cdlp_boundary, distributed_pagerank_boundary, distributed_sssp_boundary,
-    fennel_partition, pagerank, partition_cc_boundary_at, partition_edges_boundary_at,
-    partition_wsssp_boundary_at, relabel_contiguous, total_cc_halo_bytes, total_halo_bytes,
-    total_w_halo_bytes, BoundaryCcShard, Kronecker,
+    distributed_cdlp_boundary, distributed_lcc_boundary, distributed_pagerank_boundary,
+    distributed_sssp_boundary, fennel_partition, pagerank, partition_cc_boundary_at,
+    partition_edges_boundary_at, partition_lcc_boundary, partition_wsssp_boundary_at,
+    relabel_contiguous, total_cc_halo_bytes, total_halo_bytes, total_w_halo_bytes, BoundaryCcShard,
+    Kronecker,
 };
 use std::collections::HashMap;
 use std::time::Instant;
 
 const CDLP_ITERS: usize = 10;
+
+/// Serial LCC reference (Σ|N(a)∩N(v)| / (deg·(deg−1))) for the correctness check.
+fn serial_lcc(n: usize, edges: &[(usize, usize)]) -> Vec<f64> {
+    let mut g: Vec<Vec<u32>> = vec![Vec::new(); n];
+    for &(u, v) in edges {
+        if u < n && v < n && u != v {
+            g[u].push(v as u32);
+            g[v].push(u as u32);
+        }
+    }
+    for a in g.iter_mut() {
+        a.sort_unstable();
+        a.dedup();
+    }
+    let isect = |a: &[u32], b: &[u32]| -> usize {
+        let (mut i, mut j, mut c) = (0, 0, 0);
+        while i < a.len() && j < b.len() {
+            match a[i].cmp(&b[j]) {
+                std::cmp::Ordering::Less => i += 1,
+                std::cmp::Ordering::Greater => j += 1,
+                std::cmp::Ordering::Equal => {
+                    c += 1;
+                    i += 1;
+                    j += 1;
+                }
+            }
+        }
+        c
+    };
+    let mut lcc = vec![0.0f64; n];
+    for v in 0..n {
+        let d = g[v].len();
+        if d < 2 {
+            continue;
+        }
+        let mut sum = 0usize;
+        for &a in &g[v] {
+            sum += isect(&g[a as usize], &g[v]);
+        }
+        lcc[v] = sum as f64 / (d as f64 * (d as f64 - 1.0));
+    }
+    lcc
+}
 
 /// Serial synchronous CDLP reference (most-frequent neighbour label, ties → smallest id).
 fn serial_cdlp(n: usize, edges: &[(usize, usize)], iters: usize) -> Vec<u32> {
@@ -250,6 +294,27 @@ fn main() {
         if sssp_ok { "EXACT ✓" } else { "MISMATCH ✗" }
     );
 
+    // ── LCC (local clustering coefficient) — the 2-hop kernel (adjacency-carrying halo) ──────────────
+    let lcc_shards = partition_lcc_boundary(n, &remapped, k);
+    let t = Instant::now();
+    let lcc = distributed_lcc_boundary(n, &lcc_shards);
+    let lcc_s = t.elapsed().as_secs_f64();
+    let lcc_ref = serial_lcc(n, &remapped);
+    let lcc_delta = lcc_ref
+        .iter()
+        .zip(&lcc)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f64, f64::max);
+    let lcc_ok = lcc_delta < 1e-9;
+    println!(
+        "  {:<6} {:>9} {:>11} {:>14}  {}",
+        "LCC",
+        format!("{lcc_s:.2}s"),
+        "(2-hop)",
+        format!("max|Δ| {lcc_delta:.0e}"),
+        if lcc_ok { "EXACT ✓" } else { "MISMATCH ✗" }
+    );
+
     println!(
         "\n  BFS from {source}: {reached}/{n} vertices reached (max hop {})",
         bfs.iter()
@@ -258,9 +323,9 @@ fn main() {
             .copied()
             .unwrap_or(0)
     );
-    let all_ok = pr_delta < 1e-9 && wcc_ok && cdlp_ok && bfs_ok && sssp_ok;
+    let all_ok = pr_delta < 1e-9 && wcc_ok && cdlp_ok && bfs_ok && sssp_ok && lcc_ok;
     println!(
-        "\n  {}  — 5 LDBC kernels, boundary-halo distributed, all verified against single-graph.",
+        "\n  {}  — the full 6-kernel LDBC Graphalytics suite, boundary-halo distributed, all verified.",
         if all_ok {
             "ALL EXACT ✓"
         } else {
