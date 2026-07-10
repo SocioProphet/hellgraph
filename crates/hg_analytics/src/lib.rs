@@ -16,8 +16,9 @@ mod graph500;
 mod ooc;
 mod partitioner;
 pub use boundary::{
-    distributed_pagerank_boundary, partition_edges_boundary, partition_edges_boundary_at,
-    total_halo_bytes, BoundaryShard,
+    distributed_cc_boundary, distributed_pagerank_boundary, partition_cc_boundary,
+    partition_cc_boundary_at, partition_edges_boundary, partition_edges_boundary_at,
+    total_cc_halo_bytes, total_halo_bytes, BoundaryCcShard, BoundaryShard,
 };
 pub use cc::{
     connected_components, distributed_connected_components, partition_undirected, CcShard,

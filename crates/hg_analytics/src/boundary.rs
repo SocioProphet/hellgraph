@@ -199,10 +199,165 @@ pub fn distributed_pagerank_boundary(
     rank
 }
 
+// ── Boundary-halo connected components ────────────────────────────────────────────────────────────────────────
+/// A CC partition with a boundary-only halo. Owns `[lo, hi)`; `ghosts` are the sorted distinct global ids
+/// of the remote NEIGHBOURS this shard's owned nodes touch (undirected). `adj` stores, per owned node, the
+/// LOCAL index of each neighbour (owned `< owned`, else ghost). The halo exchanged each superstep is just
+/// the ghost LABELS (u32) — proving the boundary-halo model is not PageRank-specific but covers the whole
+/// vertex-centric class.
+pub struct BoundaryCcShard {
+    pub lo: usize,
+    pub hi: usize,
+    pub ghosts: Vec<usize>,
+    pub adj: Vec<Vec<usize>>,
+}
+
+impl BoundaryCcShard {
+    pub fn owned(&self) -> usize {
+        self.hi - self.lo
+    }
+    /// Bytes received per superstep for the label halo (one u32 per ghost).
+    pub fn halo_bytes(&self) -> usize {
+        self.ghosts.len() * 4
+    }
+}
+
+/// Total recurring CC label-halo traffic per superstep, in bytes.
+pub fn total_cc_halo_bytes(shards: &[BoundaryCcShard]) -> usize {
+    shards.iter().map(BoundaryCcShard::halo_bytes).sum()
+}
+
+/// Range-partition the undirected graph into `k` boundary CC shards.
+pub fn partition_cc_boundary(n: usize, edges: &[(usize, usize)], k: usize) -> Vec<BoundaryCcShard> {
+    if n == 0 {
+        return Vec::new();
+    }
+    let k = k.clamp(1, n);
+    let size = n.div_ceil(k);
+    let bounds: Vec<usize> = (0..=k).map(|c| (c * size).min(n)).collect();
+    partition_cc_boundary_at(n, edges, &bounds)
+}
+
+/// Build boundary CC shards from explicit contiguous boundaries (the general form a smart partition drives).
+pub fn partition_cc_boundary_at(
+    n: usize,
+    edges: &[(usize, usize)],
+    bounds: &[usize],
+) -> Vec<BoundaryCcShard> {
+    if n == 0 || bounds.len() < 2 {
+        return Vec::new();
+    }
+    let k = bounds.len() - 1;
+    let owner = |v: usize| -> usize {
+        match bounds.binary_search(&v) {
+            Ok(c) => c.min(k - 1),
+            Err(c) => c - 1,
+        }
+    };
+    // Undirected: each edge contributes a neighbour to BOTH endpoints' owning shards.
+    let mut raw: Vec<Vec<Vec<usize>>> = (0..k)
+        .map(|c| vec![Vec::new(); bounds[c + 1] - bounds[c]])
+        .collect();
+    let mut ghost_sets: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); k];
+    let mut note = |shard: usize, node: usize, nbr: usize| {
+        let (lo, hi) = (bounds[shard], bounds[shard + 1]);
+        raw[shard][node - lo].push(nbr);
+        if nbr < lo || nbr >= hi {
+            ghost_sets[shard].insert(nbr);
+        }
+    };
+    for &(u, v) in edges {
+        if u < n && v < n && u != v {
+            note(owner(u), u, v);
+            note(owner(v), v, u);
+        }
+    }
+    let mut shards = Vec::with_capacity(k);
+    for c in 0..k {
+        let (lo, hi) = (bounds[c], bounds[c + 1]);
+        let owned = hi - lo;
+        let ghosts: Vec<usize> = ghost_sets[c].iter().copied().collect();
+        let ghost_idx: HashMap<usize, usize> =
+            ghosts.iter().enumerate().map(|(i, &g)| (g, i)).collect();
+        let adj: Vec<Vec<usize>> = raw[c]
+            .iter()
+            .map(|nbrs| {
+                nbrs.iter()
+                    .map(|&w| {
+                        if w >= lo && w < hi {
+                            w - lo
+                        } else {
+                            owned + ghost_idx[&w]
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+        shards.push(BoundaryCcShard {
+            lo,
+            hi,
+            ghosts,
+            adj,
+        });
+    }
+    shards
+}
+
+/// Distributed connected components with a boundary-only label halo. Each superstep every shard assembles
+/// its local label view (owned labels + ghost label halo) and min-propagates over its owned nodes; disjoint
+/// owned ranges are gathered; iterate to a global fixpoint. Only ghost labels cross boundaries — edges stay
+/// sovereign. Deterministic and identical to single-graph `connected_components`.
+pub fn distributed_cc_boundary(n: usize, shards: &[BoundaryCcShard]) -> Vec<u32> {
+    if n == 0 {
+        return Vec::new();
+    }
+    let mut label: Vec<u32> = (0..n as u32).collect();
+    loop {
+        let partials: Vec<(usize, Vec<u32>)> = shards
+            .par_iter()
+            .map(|sh| {
+                let owned = sh.owned();
+                // Received message: owned labels + the boundary halo (ghost labels).
+                let mut local_label = vec![0u32; owned + sh.ghosts.len()];
+                local_label[..owned].copy_from_slice(&label[sh.lo..sh.hi]);
+                for (i, &g) in sh.ghosts.iter().enumerate() {
+                    local_label[owned + i] = label[g];
+                }
+                let mut out = vec![0u32; owned];
+                for (i, nbrs) in sh.adj.iter().enumerate() {
+                    let mut m = local_label[i];
+                    for &li in nbrs {
+                        if local_label[li] < m {
+                            m = local_label[li];
+                        }
+                    }
+                    out[i] = m;
+                }
+                (sh.lo, out)
+            })
+            .collect();
+        let mut changed = false;
+        let mut next = label.clone();
+        for (lo, local) in &partials {
+            for (i, &l) in local.iter().enumerate() {
+                if l != next[lo + i] {
+                    next[lo + i] = l;
+                    changed = true;
+                }
+            }
+        }
+        label = next;
+        if !changed {
+            break;
+        }
+    }
+    label
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{pagerank, Kronecker};
+    use crate::{connected_components, pagerank, Kronecker};
 
     #[test]
     fn boundary_halo_pagerank_matches_serial_exactly() {
@@ -258,6 +413,35 @@ mod tests {
         assert!(
             halo * 100 < full_broadcast,
             "boundary halo {halo}B not <1% of full broadcast {full_broadcast}B"
+        );
+    }
+
+    #[test]
+    fn boundary_halo_cc_matches_serial_exactly() {
+        // Two disjoint RMAT blobs offset into disjoint id ranges → a real multi-component graph the
+        // boundary label halo must reconcile across shards.
+        let half = Kronecker::vertices(8); // 256
+        let n = 2 * half;
+        let mut edges: Vec<(usize, usize)> = Kronecker::new(8, 6, 1).collect();
+        edges.extend(Kronecker::new(8, 6, 2).map(|(u, v)| (u + half, v + half)));
+
+        let serial = connected_components(n, &edges);
+        let shards = partition_cc_boundary(n, &edges, 8);
+        let dist = distributed_cc_boundary(n, &shards);
+        assert_eq!(serial, dist, "boundary-halo CC diverged from serial");
+    }
+
+    #[test]
+    fn boundary_cc_halo_beats_full_broadcast_on_ring() {
+        let n = 4096usize;
+        let edges: Vec<(usize, usize)> = (0..n).map(|i| (i, (i + 1) % n)).collect();
+        let k = 16usize;
+        let shards = partition_cc_boundary(n, &edges, k);
+        let halo = total_cc_halo_bytes(&shards);
+        let full_broadcast = k * n * 4; // u32 labels
+        assert!(
+            halo * 50 < full_broadcast,
+            "CC boundary halo {halo}B not «  full broadcast {full_broadcast}B"
         );
     }
 }
