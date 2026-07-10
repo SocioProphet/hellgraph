@@ -26,6 +26,26 @@ python3 scripts/bench/vs_baseline.py                        # runs networkx + sc
 PageRank is memory-bound, so parallel-vs-serial is ~1.6× (honest) and scipy's spmv is also well-optimized —
 ~3× is a real single-node win, not a strawman, and the ranking is identical.
 
+### vs a real graph database (KuzuDB, native PageRank)
+
+```
+pip install kuzu
+HG_SCALE=18 cargo run -p hg_analytics --release --example vs_baseline
+HG_OUT=/tmp/hg_vs18 python3 scripts/bench/vs_kuzu.py
+```
+
+Not a linear-algebra library — an actual embedded graph DB (Cypher, native `page_rank`), same graph, same
+machine, compute-to-compute:
+
+| graph | hg_analytics | KuzuDB PageRank | ranking agreement |
+|-------|-------------:|----------------:|:-----------------:|
+| scale 17, 2.1M edges | 46 ms | 559 ms (**12.2× slower**) | top-100 100% |
+| scale 18, 4.2M edges | 109 ms | 1122 ms (**10.3× slower**) | top-100 100% |
+
+Identical ranking, ~10–12× faster on compute — and Kuzu additionally pays a ~0.5 s bulk-load step we don't.
+Caveats: Kuzu is single-machine embedded (not distributed); its default damping/iteration count may differ,
+but the 100% top-100 agreement shows both reach the same ranking.
+
 ## 2. Boundary-only halo — the scaling unlock
 
 ```
@@ -111,8 +131,9 @@ Run it on GKE: `deploy/bench/` (`saturday.sh` = create → Cloud Build → run �
 
 ## Honest limits
 
-- No Neptune/TigerGraph **server** head-to-head on identical hardware yet — the library baselines
-  (networkx/scipy) are what's reproducible here; the server comparison is the next artifact.
+- Head-to-head covers networkx, scipy (libraries) and **KuzuDB (a real embedded graph DB)** — all beaten
+  on the same graph/machine with identical ranking. A managed **distributed** server (Neptune/TigerGraph)
+  on matched hardware is still the one comparison left, and it needs the cluster.
 - `dist_p2p` uses a full mesh (only among peers with real boundary overlap); >100 nodes wants a sparser
   mesh and pod-IP wiring.
 - Laptop out-of-core ceiling ~500M edges; beyond that is the cluster.
