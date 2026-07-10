@@ -1,0 +1,41 @@
+# Coordinator: a Service (stable DNS the workers dial) + a Job (partitions, ships shards, runs BSP,
+# prints the verified result, exits). The Service selects the coordinator pod by label.
+apiVersion: v1
+kind: Service
+metadata:
+  name: hg-coordinator
+  labels: { app: hg-bench, role: coordinator }
+spec:
+  clusterIP: None            # headless: workers resolve the pod directly, no proxy hop
+  selector: { app: hg-bench, role: coordinator }
+  ports:
+    - name: bsp
+      port: 9000
+      targetPort: 9000
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: hg-coordinator
+  labels: { app: hg-bench, role: coordinator }
+spec:
+  backoffLimit: 0            # a benchmark run is not idempotent; do not silently retry
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels: { app: hg-bench, role: coordinator }
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: coordinator
+          image: IMAGE_PLACEHOLDER          # set by run.sh (registry/hellgraph-bench:tag)
+          env:
+            - { name: HG_ROLE, value: coordinator }
+            - { name: HG_LISTEN, value: "0.0.0.0:9000" }
+          envFrom:
+            - configMapRef: { name: hg-bench-params }
+          ports:
+            - containerPort: 9000
+          resources:
+            requests: { cpu: "2", memory: "8Gi" }
+            limits:   { cpu: "4", memory: "16Gi" }

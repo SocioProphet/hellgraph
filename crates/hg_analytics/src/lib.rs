@@ -7,7 +7,28 @@
 //! two engines reconcile while both exist; once the edge binds to this kernel, only this determinism matters.
 
 use hg_core::AtomId;
+use rayon::prelude::*;
 use std::collections::HashMap;
+
+mod boundary;
+mod cc;
+mod graph500;
+mod ooc;
+mod partitioner;
+pub use boundary::{
+    distributed_bfs_boundary, distributed_cc_boundary, distributed_cdlp_boundary,
+    distributed_lcc_boundary, distributed_pagerank_boundary, distributed_sssp_boundary,
+    partition_cc_boundary, partition_cc_boundary_at, partition_edges_boundary,
+    partition_edges_boundary_at, partition_lcc_boundary, partition_wsssp_boundary,
+    partition_wsssp_boundary_at, total_cc_halo_bytes, total_halo_bytes, total_w_halo_bytes,
+    BoundaryCcShard, BoundaryLccShard, BoundaryShard, BoundaryWShard,
+};
+pub use cc::{
+    connected_components, distributed_connected_components, partition_undirected, CcShard,
+};
+pub use graph500::Kronecker;
+pub use ooc::{pagerank_mmap, write_csr, write_csr_bucketed, write_csr_streaming, MmapCsr};
+pub use partitioner::{balance, edge_cut, fennel_partition, ldg_partition, relabel_contiguous};
 
 /// Cold PageRank over a 0..n indexed graph. Dangling nodes (no out-edges) redistribute their mass uniformly.
 pub fn pagerank(
@@ -95,6 +116,60 @@ fn pagerank_from(
     rank
 }
 
+/// Parallel (rayon) PageRank — the multi-core scale-out of `pagerank`. Pull-based: each node's next
+/// rank is computed independently from its IN-neighbours, so the O(E) work parallelises with no write
+/// contention. The O(n) dangling + convergence reductions stay serial, which keeps the result
+/// deterministic (same output every run) AND identical to the serial `pagerank` fixed point. This is
+/// the leg that turns "Rust is faster" from a claim into a number: linear-ish speedup in cores.
+pub fn pagerank_parallel(
+    n: usize,
+    edges: &[(usize, usize)],
+    damping: f64,
+    max_iters: usize,
+    tol: f64,
+) -> Vec<f64> {
+    if n == 0 {
+        return Vec::new();
+    }
+    let mut out_deg = vec![0usize; n];
+    let mut in_adj: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for &(u, v) in edges {
+        if u < n && v < n {
+            out_deg[u] += 1;
+            in_adj[v].push(u);
+        }
+    }
+    let base = (1.0 - damping) / n as f64;
+    let mut rank = vec![1.0 / n as f64; n];
+    for _ in 0..max_iters {
+        // Dangling mass + share: serial O(n), deterministic.
+        let mut dangling = 0.0;
+        for u in 0..n {
+            if out_deg[u] == 0 {
+                dangling += rank[u];
+            }
+        }
+        let add = base + damping * dangling / n as f64;
+        // Parallel pull over the O(E) work: next[v] = add + damping·Σ_{u→v} rank[u]/out_deg[u].
+        let next: Vec<f64> = (0..n)
+            .into_par_iter()
+            .map(|v| {
+                let mut acc = 0.0;
+                for &u in &in_adj[v] {
+                    acc += rank[u] / out_deg[u] as f64; // out_deg[u] ≥ 1 (u has edge u→v)
+                }
+                add + damping * acc
+            })
+            .collect();
+        let diff: f64 = (0..n).map(|i| (next[i] - rank[i]).abs()).sum();
+        rank = next;
+        if diff < tol {
+            break;
+        }
+    }
+    rank
+}
+
 /// AtomId-facing wrapper: map ids → dense indices (sorted for determinism), run PageRank, return id → score.
 pub fn pagerank_by_id(
     node_ids: &[AtomId],
@@ -113,6 +188,47 @@ pub fn pagerank_by_id(
         .collect();
     let pr = pagerank(ids.len(), &e, damping, max_iters, tol);
     ids.iter().enumerate().map(|(i, &id)| (id, pr[i])).collect()
+}
+
+// ── Connected components (union-find — the fast single-machine path) ──────────────────────────────────────────
+/// Single-machine connected components via union-find (path halving + union by size) — near-linear
+/// O(m·α(n)), far faster than iterative label propagation for a one-shot in-memory answer. Returns each
+/// node's component representative (the root id). Induces the SAME partition as `connected_components`
+/// (label ids differ: roots here vs smallest-member there). This is the algorithm to race a graph DB with;
+/// the label-propagation `connected_components` stays the canonical min-label reference for the distributed
+/// BSP path (which must reconcile across shards).
+pub fn connected_components_uf(n: usize, edges: &[(usize, usize)]) -> Vec<u32> {
+    if n == 0 {
+        return Vec::new();
+    }
+    let mut parent: Vec<u32> = (0..n as u32).collect();
+    let mut size = vec![1u32; n];
+    // find with path halving.
+    fn find(parent: &mut [u32], mut x: u32) -> u32 {
+        while parent[x as usize] != x {
+            parent[x as usize] = parent[parent[x as usize] as usize];
+            x = parent[x as usize];
+        }
+        x
+    }
+    for &(u, v) in edges {
+        if u < n && v < n && u != v {
+            let (mut ru, mut rv) = (find(&mut parent, u as u32), find(&mut parent, v as u32));
+            if ru != rv {
+                // union by size (attach smaller under larger) → shallow trees.
+                if size[ru as usize] < size[rv as usize] {
+                    std::mem::swap(&mut ru, &mut rv);
+                }
+                parent[rv as usize] = ru;
+                size[ru as usize] += size[rv as usize];
+            }
+        }
+    }
+    // Flatten: every node points to its root.
+    for i in 0..n {
+        parent[i] = find(&mut parent, i as u32);
+    }
+    parent
 }
 
 // ── Betweenness centrality (Brandes, unweighted, undirected) ─────────────────────────────────────────────────
@@ -166,6 +282,186 @@ pub fn betweenness(n: usize, edges: &[(usize, usize)]) -> Vec<f64> {
         *x /= 2.0; // undirected: each pair counted from both endpoints
     }
     bc
+}
+
+/// Single-source Brandes accumulation into `bc` (shared helper for serial + parallel betweenness).
+fn brandes_source(s: usize, adj: &[Vec<usize>], n: usize, bc: &mut [f64]) {
+    let mut stack: Vec<usize> = Vec::new();
+    let mut preds: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut sigma = vec![0.0f64; n];
+    let mut dist = vec![-1i64; n];
+    sigma[s] = 1.0;
+    dist[s] = 0;
+    let mut queue: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
+    queue.push_back(s);
+    while let Some(v) = queue.pop_front() {
+        stack.push(v);
+        for &w in &adj[v] {
+            if dist[w] < 0 {
+                dist[w] = dist[v] + 1;
+                queue.push_back(w);
+            }
+            if dist[w] == dist[v] + 1 {
+                sigma[w] += sigma[v];
+                preds[w].push(v);
+            }
+        }
+    }
+    let mut delta = vec![0.0f64; n];
+    while let Some(w) = stack.pop() {
+        for &v in &preds[w] {
+            delta[v] += (sigma[v] / sigma[w]) * (1.0 + delta[w]);
+        }
+        if w != s {
+            bc[w] += delta[w];
+        }
+    }
+}
+
+/// Parallel (rayon) Brandes betweenness — the source loop is embarrassingly parallel and
+/// COMPUTE-bound (each BFS is real work, not a memory gather), so this scales near-linearly in
+/// cores. Determinism is preserved: sources are split into fixed contiguous chunks, each chunk
+/// accumulates a partial vector, and the partials are summed back IN CHUNK ORDER (independent of
+/// thread scheduling) → same output every run. This is the leg that actually buries them on
+/// "we scale with cores".
+pub fn betweenness_parallel(n: usize, edges: &[(usize, usize)]) -> Vec<f64> {
+    if n == 0 {
+        return Vec::new();
+    }
+    let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for &(u, v) in edges {
+        if u < n && v < n && u != v {
+            adj[u].push(v);
+            adj[v].push(u);
+        }
+    }
+    // FIXED chunk count (independent of thread count) so the deterministic in-order sum of partials
+    // yields the SAME result on any core count — determinism must not depend on the machine. rayon
+    // load-balances the fixed chunks across whatever threads are available.
+    let chunks = 64usize.min(n).max(1);
+    let chunk_size = n.div_ceil(chunks);
+    // Each chunk → a partial bc vector; collect() preserves chunk order for a deterministic sum.
+    let partials: Vec<Vec<f64>> = (0..chunks)
+        .into_par_iter()
+        .map(|c| {
+            let mut local = vec![0.0f64; n];
+            let start = c * chunk_size;
+            let end = ((c + 1) * chunk_size).min(n);
+            for s in start..end {
+                brandes_source(s, &adj, n, &mut local);
+            }
+            local
+        })
+        .collect();
+    let mut bc = vec![0.0f64; n];
+    for p in &partials {
+        for i in 0..n {
+            bc[i] += p[i];
+        }
+    }
+    for x in bc.iter_mut() {
+        *x /= 2.0;
+    }
+    bc
+}
+
+// ── Distributed (partition-parallel, BSP) PageRank ────────────────────────────────────────────────────────────
+/// A graph partition owned by ONE federation participant: the node range `[lo, hi)` it owns, plus the
+/// in-edges TO those owned nodes (edge sources may be remote — read from the exchanged halo). This is
+/// the unit of sharding — a sovereign Autobase log IS one of these. Edges never leave their shard.
+pub struct Shard {
+    pub lo: usize,
+    pub hi: usize,
+    /// Per owned node (local index `v - lo`) → global source ids of its in-edges.
+    pub in_adj: Vec<Vec<usize>>,
+}
+
+/// Range-partition a global edge list into `k` shards (each owns a contiguous node range). Returns the
+/// shards + the global out-degree vector (small O(n) metadata replicated to every participant).
+pub fn partition_edges(n: usize, edges: &[(usize, usize)], k: usize) -> (Vec<Shard>, Vec<u32>) {
+    if n == 0 {
+        return (Vec::new(), Vec::new());
+    }
+    let k = k.clamp(1, n);
+    let size = n.div_ceil(k);
+    let mut out_deg = vec![0u32; n];
+    let mut shards: Vec<Shard> = (0..k)
+        .map(|c| {
+            let lo = c * size;
+            let hi = ((c + 1) * size).min(n);
+            Shard {
+                lo,
+                hi,
+                in_adj: vec![Vec::new(); hi - lo],
+            }
+        })
+        .collect();
+    for &(u, v) in edges {
+        if u < n && v < n {
+            out_deg[u] += 1;
+            let sh = &mut shards[v / size]; // shard owning v
+            let li = v - sh.lo;
+            sh.in_adj[li].push(u);
+        }
+    }
+    (shards, out_deg)
+}
+
+/// Distributed PageRank over sharded partitions (Pregel/BSP model). Each superstep: every shard
+/// computes its OWNED nodes' ranks locally IN PARALLEL from a globally-exchanged rank halo (the only
+/// thing that crosses shard boundaries — O(n) per superstep, not the O(E) edges), then the owned
+/// ranges are gathered into the next global vector. Matches single-graph `pagerank` exactly.
+///
+/// This is the move the centralized incumbents can't make: the data (edges) stays sovereign per
+/// participant; only ranks are exchanged. Deterministic (disjoint owned ranges, fixed source order).
+pub fn distributed_pagerank(
+    n: usize,
+    shards: &[Shard],
+    out_deg: &[u32],
+    damping: f64,
+    max_iters: usize,
+    tol: f64,
+) -> Vec<f64> {
+    if n == 0 {
+        return Vec::new();
+    }
+    let base = (1.0 - damping) / n as f64;
+    let mut rank = vec![1.0 / n as f64; n]; // the exchanged halo (post-gather global state)
+    for _ in 0..max_iters {
+        let mut dangling = 0.0;
+        for u in 0..n {
+            if out_deg[u] == 0 {
+                dangling += rank[u];
+            }
+        }
+        let add = base + damping * dangling / n as f64;
+        // SCATTER: each shard computes its owned partial locally, in parallel (rayon = participants).
+        let partials: Vec<(usize, Vec<f64>)> = shards
+            .par_iter()
+            .map(|sh| {
+                let mut local = vec![0.0f64; sh.hi - sh.lo];
+                for (i, srcs) in sh.in_adj.iter().enumerate() {
+                    let mut acc = 0.0;
+                    for &u in srcs {
+                        acc += rank[u] / out_deg[u] as f64; // remote source rank ← the halo
+                    }
+                    local[i] = add + damping * acc;
+                }
+                (sh.lo, local)
+            })
+            .collect();
+        // GATHER: stitch disjoint owned ranges into the next global vector.
+        let mut next = vec![0.0f64; n];
+        for (lo, local) in &partials {
+            next[*lo..*lo + local.len()].copy_from_slice(local);
+        }
+        let diff: f64 = (0..n).map(|i| (next[i] - rank[i]).abs()).sum();
+        rank = next;
+        if diff < tol {
+            break;
+        }
+    }
+    rank
 }
 
 // ── Louvain community detection (full: local-moving + aggregation, deterministic) ─────────────────────────────
@@ -289,6 +585,249 @@ mod tests {
     const D: f64 = 0.85;
     const IT: usize = 200;
     const TOL: f64 = 1e-12;
+
+    #[test]
+    fn union_find_cc_induces_same_partition_as_label_prop() {
+        use crate::Kronecker;
+        // Two disjoint RMAT blobs → a real multi-component graph. Union-find and label-prop must agree
+        // on the PARTITION (which nodes share a component), even though the label ids differ.
+        let half = Kronecker::vertices(8);
+        let n = 2 * half;
+        let mut edges: Vec<(usize, usize)> = Kronecker::new(8, 6, 1).collect();
+        edges.extend(Kronecker::new(8, 6, 2).map(|(u, v)| (u + half, v + half)));
+
+        let lp = connected_components(n, &edges); // min-label
+        let uf = connected_components_uf(n, &edges); // roots
+        assert_eq!(
+            lp.iter().collect::<std::collections::HashSet<_>>().len(),
+            uf.iter().collect::<std::collections::HashSet<_>>().len(),
+            "same number of components"
+        );
+        // Same partition: for every edge-connected pair the labels agree within each scheme.
+        for v in 0..n {
+            for &w in &[(v + 1) % n, (v + 7) % n] {
+                assert_eq!(
+                    lp[v] == lp[w],
+                    uf[v] == uf[w],
+                    "union-find and label-prop disagree on whether {v},{w} share a component"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn parallel_pagerank_matches_serial_and_is_deterministic() {
+        let edges = vec![(0, 1), (1, 2), (2, 0), (2, 3), (3, 1), (0, 3)];
+        let a = pagerank(4, &edges, D, IT, TOL);
+        let b = pagerank_parallel(4, &edges, D, IT, TOL);
+        for i in 0..4 {
+            assert!(
+                (a[i] - b[i]).abs() < 1e-9,
+                "parallel PR must match serial fixed point"
+            );
+        }
+        assert_eq!(
+            b,
+            pagerank_parallel(4, &edges, D, IT, TOL),
+            "deterministic run-to-run"
+        );
+    }
+
+    #[test]
+    fn parallel_betweenness_matches_serial_and_is_deterministic() {
+        let edges = vec![(0, 1), (1, 2), (2, 3), (3, 4), (1, 3), (0, 4)];
+        let a = betweenness(5, &edges);
+        let b = betweenness_parallel(5, &edges);
+        for i in 0..5 {
+            assert!(
+                (a[i] - b[i]).abs() < 1e-9,
+                "parallel betweenness must match serial"
+            );
+        }
+        assert_eq!(
+            b,
+            betweenness_parallel(5, &edges),
+            "deterministic run-to-run"
+        );
+    }
+
+    #[test]
+    fn distributed_pagerank_matches_single_graph_at_any_shard_count() {
+        let edges = vec![
+            (0, 1),
+            (1, 2),
+            (2, 0),
+            (2, 3),
+            (3, 1),
+            (0, 3),
+            (3, 4),
+            (4, 2),
+        ];
+        let n = 5;
+        let single = pagerank(n, &edges, D, IT, TOL);
+        for k in [1usize, 2, 3, 5] {
+            let (shards, out_deg) = partition_edges(n, &edges, k);
+            let dist = distributed_pagerank(n, &shards, &out_deg, D, IT, TOL);
+            for i in 0..n {
+                assert!(
+                    (single[i] - dist[i]).abs() < 1e-9,
+                    "sharded (k={k}) must equal single-graph at node {i}"
+                );
+            }
+        }
+        let (s, o) = partition_edges(n, &edges, 3);
+        assert_eq!(
+            distributed_pagerank(n, &s, &o, D, IT, TOL),
+            distributed_pagerank(n, &s, &o, D, IT, TOL),
+            "deterministic run-to-run"
+        );
+    }
+
+    #[test]
+    fn out_of_core_mmap_pagerank_matches_in_memory() {
+        let edges = vec![
+            (0, 1),
+            (1, 2),
+            (2, 0),
+            (2, 3),
+            (3, 1),
+            (0, 3),
+            (3, 4),
+            (4, 2),
+        ];
+        let n = 5;
+        let tmp = std::env::temp_dir().join(format!("hg_ooc_{}.csr", std::process::id()));
+        write_csr(&tmp, n, &edges).unwrap();
+        let csr = MmapCsr::open(&tmp).unwrap();
+        assert_eq!(csr.n(), n);
+        assert_eq!(csr.edge_count(), edges.len());
+        let a = pagerank(n, &edges, D, IT, TOL);
+        let b = pagerank_mmap(&csr, D, IT, TOL); // edges read from the mmap, not heap
+        for i in 0..n {
+            assert!(
+                (a[i] - b[i]).abs() < 1e-9,
+                "out-of-core PR must match in-memory at {i}"
+            );
+        }
+        drop(csr);
+        std::fs::remove_file(&tmp).ok();
+    }
+
+    #[test]
+    fn streaming_csr_builder_is_byte_identical_to_batch_and_bounded_heap() {
+        let edges = vec![
+            (0, 1),
+            (1, 2),
+            (2, 0),
+            (2, 3),
+            (3, 1),
+            (0, 3),
+            (3, 4),
+            (4, 2),
+        ];
+        let n = 5;
+        let batch = std::env::temp_dir().join(format!("hg_batch_{}.csr", std::process::id()));
+        let stream = std::env::temp_dir().join(format!("hg_stream_{}.csr", std::process::id()));
+        write_csr(&batch, n, &edges).unwrap();
+        // O(n)-heap streaming build: the closure yields the edge stream, never held whole.
+        write_csr_streaming(&stream, n, || edges.iter().copied()).unwrap();
+        assert_eq!(
+            std::fs::read(&batch).unwrap(),
+            std::fs::read(&stream).unwrap(),
+            "streaming builder must produce a byte-identical CSR to the batch builder"
+        );
+        let csr = MmapCsr::open(&stream).unwrap();
+        let a = pagerank(n, &edges, D, IT, TOL);
+        let b = pagerank_mmap(&csr, D, IT, TOL);
+        for i in 0..n {
+            assert!(
+                (a[i] - b[i]).abs() < 1e-9,
+                "streamed-CSR PR must match in-memory at {i}"
+            );
+        }
+        drop(csr);
+        std::fs::remove_file(&batch).ok();
+        std::fs::remove_file(&stream).ok();
+    }
+
+    #[test]
+    fn bucketed_builder_is_byte_identical_across_bucket_counts() {
+        let edges = vec![
+            (0, 1),
+            (1, 2),
+            (2, 0),
+            (2, 3),
+            (3, 1),
+            (0, 3),
+            (3, 4),
+            (4, 2),
+            (1, 4),
+        ];
+        let n = 5;
+        let reference = std::env::temp_dir().join(format!("hg_ref_{}.csr", std::process::id()));
+        write_csr(&reference, n, &edges).unwrap();
+        let want = std::fs::read(&reference).unwrap();
+        // Sequential-I/O external build must match the batch build at ANY bucket count.
+        for buckets in [1usize, 2, 3, 5, 8] {
+            let out = std::env::temp_dir().join(format!(
+                "hg_buck_{}_{}.csr",
+                buckets,
+                std::process::id()
+            ));
+            write_csr_bucketed(&out, n, || edges.iter().copied(), buckets).unwrap();
+            assert_eq!(
+                std::fs::read(&out).unwrap(),
+                want,
+                "bucketed (b={buckets}) must be byte-identical"
+            );
+            std::fs::remove_file(&out).ok();
+        }
+        std::fs::remove_file(&reference).ok();
+    }
+
+    #[test]
+    fn distributed_connected_components_matches_single_graph() {
+        // component {0,1,2} triangle · component {3,4} edge · node 5 isolated
+        let edges = vec![(0, 1), (1, 2), (2, 0), (3, 4)];
+        let n = 6;
+        let single = connected_components(n, &edges);
+        for k in [1usize, 2, 3, 6] {
+            let shards = partition_undirected(n, &edges, k);
+            assert_eq!(
+                distributed_connected_components(n, &shards),
+                single,
+                "sharded CC (k={k}) must equal single-graph"
+            );
+        }
+        assert_eq!(single[0], single[1]);
+        assert_eq!(single[1], single[2]);
+        assert_eq!(single[3], single[4]);
+        assert_ne!(single[0], single[3], "distinct components differ");
+        assert_ne!(single[5], single[0], "isolated node is its own component");
+    }
+
+    #[test]
+    fn graph500_kronecker_is_well_formed_and_deterministic() {
+        let (scale, ef) = (10u32, 16usize);
+        let n = Kronecker::vertices(scale);
+        let m = Kronecker::edges(scale, ef);
+        assert_eq!(n, 1024);
+        assert_eq!(m, 16 * 1024);
+        let edges: Vec<(usize, usize)> = Kronecker::new(scale, ef, 42).collect();
+        assert_eq!(edges.len(), m, "yields exactly edgefactor·2^scale edges");
+        assert!(
+            edges.iter().all(|&(u, v)| u < n && v < n),
+            "all vertices in [0, 2^scale)"
+        );
+        // deterministic: same seed → identical stream
+        assert_eq!(edges, Kronecker::new(scale, ef, 42).collect::<Vec<_>>());
+        // RMAT skew: degree is concentrated (a few hot vertices) — not uniform. Check node 0 is hot.
+        let deg0 = edges.iter().filter(|&&(u, v)| u == 0 || v == 0).count();
+        assert!(
+            deg0 > m / n,
+            "RMAT produces a skewed (scale-free-ish) degree distribution"
+        );
+    }
 
     #[test]
     fn symmetric_cycle_is_uniform() {

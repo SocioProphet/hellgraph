@@ -1,0 +1,13 @@
+# Cloud Build config — builds the benchmark image server-side (no local docker needed).
+#   gcloud builds submit . --config=deploy/bench/cloudbuild.yaml --substitutions=_IMAGE=REG/hellgraph-bench:TAG
+# Honours the non-root Dockerfile at deploy/bench/Dockerfile; build context is the repo root.
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args: ['build', '-f', 'deploy/bench/Dockerfile', '-t', '${_IMAGE}', '.']
+  - name: gcr.io/cloud-builders/docker
+    args: ['push', '${_IMAGE}']
+images:
+  - '${_IMAGE}'
+options:
+  machineType: E2_HIGHCPU_8   # the Rust build is CPU-bound; a bigger builder shaves wall time
+timeout: 1800s

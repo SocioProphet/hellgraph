@@ -1,0 +1,34 @@
+# Workers: an Indexed Job. completions == parallelism == HG_SHARDS, so every shard runs at once and each
+# pod receives a unique JOB_COMPLETION_INDEX (0..N-1) — the worker reads that as its shard ordinal.
+# The worker retries the coordinator connect (~60s), so pod start order does not matter.
+#
+# IMPORTANT: completions/parallelism below MUST equal HG_SHARDS in the ConfigMap. run.sh patches both
+# from the ConfigMap so they never drift.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: hg-workers
+  labels: { app: hg-bench, role: worker }
+spec:
+  completionMode: Indexed
+  completions: 8            # == HG_SHARDS (run.sh keeps these in sync)
+  parallelism: 8            # == HG_SHARDS
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels: { app: hg-bench, role: worker }
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: worker
+          image: IMAGE_PLACEHOLDER          # set by run.sh
+          env:
+            - { name: HG_ROLE, value: worker }
+            - { name: HG_COORD, value: "hg-coordinator:9000" }
+            # JOB_COMPLETION_INDEX is injected by k8s for Indexed jobs; the worker reads it as ordinal.
+          envFrom:
+            - configMapRef: { name: hg-bench-params }
+          resources:
+            requests: { cpu: "2", memory: "12Gi" }
+            limits:   { cpu: "4", memory: "20Gi" }

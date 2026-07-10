@@ -5,3 +5,6 @@ edition = "2021"
 
 [dependencies]
 hg_core = { path = "../hg_core" }
+rayon = "1.10"
+memmap2 = "0.9"
+bytemuck = "1"
