@@ -21,6 +21,8 @@ OUT = os.environ.get("HG_OUT", "/tmp/hg_vs17")
 meta = open(f"{OUT}/meta.txt").read().split()
 n, m = int(meta[0]), int(meta[1])
 rust_parallel_s = float(meta[5])
+rust_wcc_s = float(meta[6]) if len(meta) > 6 else None
+rust_ncomp = int(meta[7]) if len(meta) > 7 else None
 edges = np.fromfile(f"{OUT}/edges.bin", dtype=np.uint32).reshape(-1, 2)
 rust_top = [int(x) for x in open(f"{OUT}/rust_top.txt").read().split()]
 
@@ -58,12 +60,26 @@ while res.has_next():
 
 agree = len(set(kuzu_order[:100]) & set(rust_top)) / 100.0
 
-print(f"\nKuzu (embedded graph DB, native PageRank):")
+# ── Kuzu native weakly-connected components ──────────────────────────────────────────────────────────
+t = time.perf_counter()
+wres = con.execute("CALL weakly_connected_components('G') RETURN group_id")
+kuzu_wcc_s = time.perf_counter() - t
+groups = set()
+while wres.has_next():
+    groups.add(wres.get_next()[0])
+kuzu_ncomp = len(groups)
+
+print(f"\nKuzu (embedded graph DB):")
 print(f"  bulk load (COPY)   : {load_s*1000:8.1f} ms   (+ {csv_s*1000:.0f} ms to write CSV)")
 print(f"  PageRank compute   : {kuzu_s*1000:8.1f} ms")
+print(f"  WCC compute        : {kuzu_wcc_s*1000:8.1f} ms")
+
 print(f"\nhead-to-head (compute-to-compute, same graph, same machine):")
-print(f"  hg_analytics : {rust_parallel_s*1000:7.1f} ms")
-print(f"  Kuzu         : {kuzu_s*1000:7.1f} ms   → hg_analytics is {kuzu_s/rust_parallel_s:.1f}x faster")
-print(f"  top-100 ranking agreement: {agree*100:.0f}%")
-print("\nNote: exact PageRank values differ (Kuzu's default damping/iterations vs ours); the ranking is "
-      "what agrees. Kuzu also pays a load step we don't (in-memory). Compute-to-compute is the fair line.")
+print(f"  PageRank  hg {rust_parallel_s*1000:7.1f} ms  vs  Kuzu {kuzu_s*1000:7.1f} ms   "
+      f"→ hg is {kuzu_s/rust_parallel_s:.1f}x faster   (top-100 ranking {agree*100:.0f}% agree)")
+if rust_wcc_s:
+    comp_ok = "same" if kuzu_ncomp == rust_ncomp else f"differ ({rust_ncomp} vs {kuzu_ncomp})"
+    print(f"  WCC       hg {rust_wcc_s*1000:7.1f} ms  vs  Kuzu {kuzu_wcc_s*1000:7.1f} ms   "
+          f"→ hg is {kuzu_wcc_s/rust_wcc_s:.1f}x faster   (component count {comp_ok})")
+print("\nNote: exact PageRank values differ (Kuzu's default damping/iterations vs ours); the ranking "
+      "agrees. Kuzu also pays a load step we don't (in-memory). Compute-to-compute is the fair line.")

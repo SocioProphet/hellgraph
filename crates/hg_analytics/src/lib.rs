@@ -190,6 +190,47 @@ pub fn pagerank_by_id(
     ids.iter().enumerate().map(|(i, &id)| (id, pr[i])).collect()
 }
 
+// ── Connected components (union-find — the fast single-machine path) ──────────────────────────────────────────
+/// Single-machine connected components via union-find (path halving + union by size) — near-linear
+/// O(m·α(n)), far faster than iterative label propagation for a one-shot in-memory answer. Returns each
+/// node's component representative (the root id). Induces the SAME partition as `connected_components`
+/// (label ids differ: roots here vs smallest-member there). This is the algorithm to race a graph DB with;
+/// the label-propagation `connected_components` stays the canonical min-label reference for the distributed
+/// BSP path (which must reconcile across shards).
+pub fn connected_components_uf(n: usize, edges: &[(usize, usize)]) -> Vec<u32> {
+    if n == 0 {
+        return Vec::new();
+    }
+    let mut parent: Vec<u32> = (0..n as u32).collect();
+    let mut size = vec![1u32; n];
+    // find with path halving.
+    fn find(parent: &mut [u32], mut x: u32) -> u32 {
+        while parent[x as usize] != x {
+            parent[x as usize] = parent[parent[x as usize] as usize];
+            x = parent[x as usize];
+        }
+        x
+    }
+    for &(u, v) in edges {
+        if u < n && v < n && u != v {
+            let (mut ru, mut rv) = (find(&mut parent, u as u32), find(&mut parent, v as u32));
+            if ru != rv {
+                // union by size (attach smaller under larger) → shallow trees.
+                if size[ru as usize] < size[rv as usize] {
+                    std::mem::swap(&mut ru, &mut rv);
+                }
+                parent[rv as usize] = ru;
+                size[ru as usize] += size[rv as usize];
+            }
+        }
+    }
+    // Flatten: every node points to its root.
+    for i in 0..n {
+        parent[i] = find(&mut parent, i as u32);
+    }
+    parent
+}
+
 // ── Betweenness centrality (Brandes, unweighted, undirected) ─────────────────────────────────────────────────
 /// Exact Brandes betweenness over an undirected graph. Deterministic (BFS in index order). Each shortest-path pair
 /// is counted once (undirected → halved). Identifies "bridge" nodes — the structural connectors.
@@ -544,6 +585,35 @@ mod tests {
     const D: f64 = 0.85;
     const IT: usize = 200;
     const TOL: f64 = 1e-12;
+
+    #[test]
+    fn union_find_cc_induces_same_partition_as_label_prop() {
+        use crate::Kronecker;
+        // Two disjoint RMAT blobs → a real multi-component graph. Union-find and label-prop must agree
+        // on the PARTITION (which nodes share a component), even though the label ids differ.
+        let half = Kronecker::vertices(8);
+        let n = 2 * half;
+        let mut edges: Vec<(usize, usize)> = Kronecker::new(8, 6, 1).collect();
+        edges.extend(Kronecker::new(8, 6, 2).map(|(u, v)| (u + half, v + half)));
+
+        let lp = connected_components(n, &edges); // min-label
+        let uf = connected_components_uf(n, &edges); // roots
+        assert_eq!(
+            lp.iter().collect::<std::collections::HashSet<_>>().len(),
+            uf.iter().collect::<std::collections::HashSet<_>>().len(),
+            "same number of components"
+        );
+        // Same partition: for every edge-connected pair the labels agree within each scheme.
+        for v in 0..n {
+            for &w in &[(v + 1) % n, (v + 7) % n] {
+                assert_eq!(
+                    lp[v] == lp[w],
+                    uf[v] == uf[w],
+                    "union-find and label-prop disagree on whether {v},{w} share a component"
+                );
+            }
+        }
+    }
 
     #[test]
     fn parallel_pagerank_matches_serial_and_is_deterministic() {

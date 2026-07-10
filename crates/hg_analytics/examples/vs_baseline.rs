@@ -10,7 +10,8 @@
 //!
 //! Run: `HG_SCALE=15 cargo run -p hg_analytics --release --example vs_baseline`
 
-use hg_analytics::{pagerank, pagerank_parallel, Kronecker};
+use hg_analytics::{connected_components_uf, pagerank, pagerank_parallel, Kronecker};
+use std::collections::HashSet;
 use std::io::Write;
 use std::time::Instant;
 
@@ -45,6 +46,12 @@ fn main() {
     let parallel = pagerank_parallel(n, &edges, damping, iters, tol);
     let rust_parallel_s = t.elapsed().as_secs_f64();
 
+    // Connected components (union-find — the fast single-machine path) for the graph-DB WCC head-to-head.
+    let t = Instant::now();
+    let cc = connected_components_uf(n, &edges);
+    let rust_wcc_s = t.elapsed().as_secs_f64();
+    let n_components = cc.iter().copied().collect::<HashSet<u32>>().len();
+
     // Sanity: parallel == serial fixed point.
     let maxd = serial
         .iter()
@@ -71,9 +78,10 @@ fn main() {
     std::fs::write(format!("{out}/rust_top.txt"), top).unwrap();
 
     let mut meta = std::fs::File::create(format!("{out}/meta.txt")).unwrap();
+    // fields: n m iters damping serial_s parallel_s wcc_s n_components
     writeln!(
         meta,
-        "{n} {m} {iters} {damping} {rust_serial_s} {rust_parallel_s}"
+        "{n} {m} {iters} {damping} {rust_serial_s} {rust_parallel_s} {rust_wcc_s} {n_components}"
     )
     .unwrap();
 
@@ -83,6 +91,7 @@ fn main() {
         "  rust parallel : {rust_parallel_s:.4}s  ({:.2}x vs serial)",
         rust_serial_s / rust_parallel_s.max(1e-9)
     );
+    println!("  rust WCC      : {rust_wcc_s:.4}s  ({n_components} components)");
     println!("  parallel == serial: max|Δ| {maxd:.2e}");
     println!("  wrote graph + result to {out}/  — now run scripts/bench/vs_baseline.py");
 }
