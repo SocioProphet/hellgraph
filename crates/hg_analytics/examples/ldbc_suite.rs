@@ -1,8 +1,8 @@
 //! ldbc_suite — the whole distributed boundary-halo suite on ONE graph, as an LDBC-Graphalytics-style
-//! scorecard. Runs PageRank (PR), weakly-connected-components (WCC), and BFS — the three main computational
-//! shapes (fixpoint smoothing / label propagation / frontier traversal), which are also three of the six
-//! LDBC Graphalytics kernels. Each is Fennel-partitioned + boundary-halo distributed and VERIFIED bit-exact
-//! against its single-graph reference, with per-kernel time + recurring halo traffic reported.
+//! scorecard. Runs PageRank (PR), weakly-connected-components (WCC), BFS, and weighted SSSP — the main
+//! computational shapes (fixpoint smoothing / label propagation / unit-hop + weighted traversal), which are
+//! four of the six LDBC Graphalytics kernels. Each is Fennel-partitioned + boundary-halo distributed and
+//! VERIFIED bit-exact against its single-graph reference, with per-kernel time + recurring halo reported.
 //!
 //! This is the Saturday deliverable in one command: a credible, self-verifying benchmark result, not just
 //! "it ran". Graph size via HG_SCALE / HG_EDGEFACTOR; shards via HG_SHARDS.
@@ -11,11 +11,41 @@
 
 use hg_analytics::{
     connected_components, distributed_bfs_boundary, distributed_cc_boundary,
-    distributed_pagerank_boundary, fennel_partition, pagerank, partition_cc_boundary_at,
-    partition_edges_boundary_at, relabel_contiguous, total_cc_halo_bytes, total_halo_bytes,
-    BoundaryCcShard, Kronecker,
+    distributed_pagerank_boundary, distributed_sssp_boundary, fennel_partition, pagerank,
+    partition_cc_boundary_at, partition_edges_boundary_at, partition_wsssp_boundary_at,
+    relabel_contiguous, total_cc_halo_bytes, total_halo_bytes, total_w_halo_bytes, BoundaryCcShard,
+    Kronecker,
 };
 use std::time::Instant;
+
+/// Serial Dijkstra reference (undirected, non-negative weights) for the SSSP correctness check.
+fn serial_dijkstra(n: usize, edges: &[(usize, usize)], weights: &[f64], source: usize) -> Vec<f64> {
+    let mut adj: Vec<Vec<(usize, f64)>> = vec![Vec::new(); n];
+    for (i, &(u, v)) in edges.iter().enumerate() {
+        if u < n && v < n && u != v {
+            adj[u].push((v, weights[i]));
+            adj[v].push((u, weights[i]));
+        }
+    }
+    let mut dist = vec![f64::INFINITY; n];
+    dist[source] = 0.0;
+    let mut heap = std::collections::BinaryHeap::new();
+    heap.push((std::cmp::Reverse(0.0f64.to_bits()), source));
+    while let Some((std::cmp::Reverse(bits), u)) = heap.pop() {
+        let du = f64::from_bits(bits);
+        if du > dist[u] {
+            continue;
+        }
+        for &(w, wt) in &adj[u] {
+            let nd = du + wt;
+            if nd < dist[w] {
+                dist[w] = nd;
+                heap.push((std::cmp::Reverse(nd.to_bits()), w));
+            }
+        }
+    }
+    dist
+}
 
 fn env(key: &str, d: usize) -> usize {
     std::env::var(key)
@@ -137,6 +167,37 @@ fn main() {
         if bfs_ok { "EXACT ✓" } else { "MISMATCH ✗" }
     );
 
+    // ── SSSP (weighted shortest path) — deterministic positive weights from a hash of the edge ───────
+    let weights: Vec<f64> = remapped
+        .iter()
+        .map(|&(u, v)| 1.0 + ((u.wrapping_mul(2654435761) ^ v) % 16) as f64)
+        .collect();
+    let w_shards = partition_wsssp_boundary_at(n, &remapped, &weights, &bounds);
+    let t = Instant::now();
+    let sssp = distributed_sssp_boundary(n, &w_shards, source);
+    let sssp_s = t.elapsed().as_secs_f64();
+    let sssp_ref = serial_dijkstra(n, &remapped, &weights, source);
+    let sssp_delta = sssp_ref
+        .iter()
+        .zip(&sssp)
+        .map(|(a, b)| {
+            if a.is_infinite() && b.is_infinite() {
+                0.0
+            } else {
+                (a - b).abs()
+            }
+        })
+        .fold(0.0f64, f64::max);
+    let sssp_ok = sssp_delta < 1e-9;
+    println!(
+        "  {:<6} {:>9} {:>11} {:>14}  {}",
+        "SSSP",
+        format!("{sssp_s:.2}s"),
+        human(total_w_halo_bytes(&w_shards) as f64),
+        format!("max|Δ| {sssp_delta:.0e}"),
+        if sssp_ok { "EXACT ✓" } else { "MISMATCH ✗" }
+    );
+
     println!(
         "\n  BFS from {source}: {reached}/{n} vertices reached (max hop {})",
         bfs.iter()
@@ -145,9 +206,9 @@ fn main() {
             .copied()
             .unwrap_or(0)
     );
-    let all_ok = pr_delta < 1e-9 && wcc_ok && bfs_ok;
+    let all_ok = pr_delta < 1e-9 && wcc_ok && bfs_ok && sssp_ok;
     println!(
-        "\n  {}  — 3 LDBC kernels, boundary-halo distributed, all verified against single-graph.",
+        "\n  {}  — 4 LDBC kernels, boundary-halo distributed, all verified against single-graph.",
         if all_ok {
             "ALL EXACT ✓"
         } else {

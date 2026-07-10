@@ -410,6 +410,170 @@ pub fn distributed_bfs_boundary(n: usize, shards: &[BoundaryCcShard], source: us
     dist
 }
 
+// ── Boundary-halo weighted single-source shortest path (SSSP) ──────────────────────────────────────────────────
+/// A weighted-SSSP partition with a boundary-only halo. Like `BoundaryCcShard` but each neighbour carries
+/// an edge weight, so `adj[i]` is `(local index, weight)` pairs. The halo is f64 distances.
+pub struct BoundaryWShard {
+    pub lo: usize,
+    pub hi: usize,
+    pub ghosts: Vec<usize>,
+    pub adj: Vec<Vec<(usize, f64)>>,
+}
+
+impl BoundaryWShard {
+    pub fn owned(&self) -> usize {
+        self.hi - self.lo
+    }
+    /// Bytes received per superstep for the distance halo (one f64 per ghost).
+    pub fn halo_bytes(&self) -> usize {
+        self.ghosts.len() * 8
+    }
+}
+
+/// Total recurring SSSP distance-halo traffic per superstep, in bytes.
+pub fn total_w_halo_bytes(shards: &[BoundaryWShard]) -> usize {
+    shards.iter().map(BoundaryWShard::halo_bytes).sum()
+}
+
+/// Range-partition a weighted undirected graph (`weights` parallel to `edges`) into `k` boundary SSSP shards.
+pub fn partition_wsssp_boundary(
+    n: usize,
+    edges: &[(usize, usize)],
+    weights: &[f64],
+    k: usize,
+) -> Vec<BoundaryWShard> {
+    if n == 0 {
+        return Vec::new();
+    }
+    let k = k.clamp(1, n);
+    let size = n.div_ceil(k);
+    let bounds: Vec<usize> = (0..=k).map(|c| (c * size).min(n)).collect();
+    partition_wsssp_boundary_at(n, edges, weights, &bounds)
+}
+
+/// Build weighted-SSSP boundary shards from explicit contiguous boundaries. `weights[i]` is the weight of
+/// `edges[i]` (undirected → applied to both directions). Non-positive/missing weights default to 1.0.
+pub fn partition_wsssp_boundary_at(
+    n: usize,
+    edges: &[(usize, usize)],
+    weights: &[f64],
+    bounds: &[usize],
+) -> Vec<BoundaryWShard> {
+    if n == 0 || bounds.len() < 2 {
+        return Vec::new();
+    }
+    let k = bounds.len() - 1;
+    let owner = |v: usize| -> usize {
+        match bounds.binary_search(&v) {
+            Ok(c) => c.min(k - 1),
+            Err(c) => c - 1,
+        }
+    };
+    // raw[shard][owned local] = Vec<(global neighbour, weight)>
+    let mut raw: Vec<Vec<Vec<(usize, f64)>>> = (0..k)
+        .map(|c| vec![Vec::new(); bounds[c + 1] - bounds[c]])
+        .collect();
+    let mut ghost_sets: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); k];
+    let mut note = |shard: usize, node: usize, nbr: usize, w: f64| {
+        let (lo, hi) = (bounds[shard], bounds[shard + 1]);
+        raw[shard][node - lo].push((nbr, w));
+        if nbr < lo || nbr >= hi {
+            ghost_sets[shard].insert(nbr);
+        }
+    };
+    for (i, &(u, v)) in edges.iter().enumerate() {
+        if u < n && v < n && u != v {
+            let w = weights.get(i).copied().filter(|&w| w > 0.0).unwrap_or(1.0);
+            note(owner(u), u, v, w);
+            note(owner(v), v, u, w);
+        }
+    }
+    let mut shards = Vec::with_capacity(k);
+    for c in 0..k {
+        let (lo, hi) = (bounds[c], bounds[c + 1]);
+        let owned = hi - lo;
+        let ghosts: Vec<usize> = ghost_sets[c].iter().copied().collect();
+        let ghost_idx: HashMap<usize, usize> =
+            ghosts.iter().enumerate().map(|(i, &g)| (g, i)).collect();
+        let adj: Vec<Vec<(usize, f64)>> = raw[c]
+            .iter()
+            .map(|nbrs| {
+                nbrs.iter()
+                    .map(|&(w, wt)| {
+                        let li = if w >= lo && w < hi {
+                            w - lo
+                        } else {
+                            owned + ghost_idx[&w]
+                        };
+                        (li, wt)
+                    })
+                    .collect()
+            })
+            .collect();
+        shards.push(BoundaryWShard {
+            lo,
+            hi,
+            ghosts,
+            adj,
+        });
+    }
+    shards
+}
+
+/// Distributed weighted single-source shortest path with a boundary-only halo (BSP Bellman-Ford relaxation:
+/// `dist[v] = min(dist[v], min_{u~v} dist[u] + w(u,v))`). Only ghost DISTANCES (f64) cross shard boundaries.
+/// Deterministic — shortest-path distances are unique, so the min-fixpoint is order-independent and exact vs
+/// serial Dijkstra. Unreachable vertices stay `f64::INFINITY`. BFS is the special case `w ≡ 1`.
+pub fn distributed_sssp_boundary(n: usize, shards: &[BoundaryWShard], source: usize) -> Vec<f64> {
+    if n == 0 {
+        return Vec::new();
+    }
+    let mut dist = vec![f64::INFINITY; n];
+    if source < n {
+        dist[source] = 0.0;
+    }
+    loop {
+        let partials: Vec<(usize, Vec<f64>)> = shards
+            .par_iter()
+            .map(|sh| {
+                let owned = sh.owned();
+                let mut local_dist = vec![f64::INFINITY; owned + sh.ghosts.len()];
+                local_dist[..owned].copy_from_slice(&dist[sh.lo..sh.hi]);
+                for (i, &g) in sh.ghosts.iter().enumerate() {
+                    local_dist[owned + i] = dist[g];
+                }
+                let mut out = vec![f64::INFINITY; owned];
+                for (i, nbrs) in sh.adj.iter().enumerate() {
+                    let mut m = local_dist[i];
+                    for &(li, w) in nbrs {
+                        let du = local_dist[li];
+                        if du.is_finite() && du + w < m {
+                            m = du + w;
+                        }
+                    }
+                    out[i] = m;
+                }
+                (sh.lo, out)
+            })
+            .collect();
+        let mut changed = false;
+        let mut next = dist.clone();
+        for (lo, local) in &partials {
+            for (i, &dv) in local.iter().enumerate() {
+                if dv < next[lo + i] {
+                    next[lo + i] = dv;
+                    changed = true;
+                }
+            }
+        }
+        dist = next;
+        if !changed {
+            break;
+        }
+    }
+    dist
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -509,6 +673,64 @@ mod tests {
         let shards = partition_cc_boundary(n, &edges, 8);
         let dist = distributed_cc_boundary(n, &shards);
         assert_eq!(serial, dist, "boundary-halo CC diverged from serial");
+    }
+
+    #[test]
+    fn boundary_halo_sssp_matches_serial_dijkstra() {
+        // Weighted RMAT: deterministic positive weights from a hash of (u,v). Verify distributed SSSP
+        // against serial Dijkstra (the ground truth for weighted shortest paths).
+        let n = Kronecker::vertices(9); // 512
+        let edges: Vec<(usize, usize)> = Kronecker::new(9, 8, 0x5DEE).collect();
+        let weights: Vec<f64> = edges
+            .iter()
+            .map(|&(u, v)| 1.0 + ((u.wrapping_mul(2654435761) ^ v) % 16) as f64)
+            .collect();
+        let source = 0;
+
+        // Serial Dijkstra reference (undirected).
+        let mut adj: Vec<Vec<(usize, f64)>> = vec![Vec::new(); n];
+        for (i, &(u, v)) in edges.iter().enumerate() {
+            if u != v {
+                adj[u].push((v, weights[i]));
+                adj[v].push((u, weights[i]));
+            }
+        }
+        // Dijkstra with a min-heap keyed on the f64 bit pattern (monotonic for non-negative distances).
+        let mut ref_dist = vec![f64::INFINITY; n];
+        ref_dist[source] = 0.0;
+        let mut heap = std::collections::BinaryHeap::new();
+        heap.push((std::cmp::Reverse(0.0f64.to_bits()), source));
+        while let Some((std::cmp::Reverse(bits), u)) = heap.pop() {
+            let du = f64::from_bits(bits);
+            if du > ref_dist[u] {
+                continue;
+            }
+            for &(w, wt) in &adj[u] {
+                let nd = du + wt;
+                if nd < ref_dist[w] {
+                    ref_dist[w] = nd;
+                    heap.push((std::cmp::Reverse(nd.to_bits()), w));
+                }
+            }
+        }
+
+        let shards = partition_wsssp_boundary(n, &edges, &weights, 8);
+        let dist = distributed_sssp_boundary(n, &shards, source);
+        let maxd = ref_dist
+            .iter()
+            .zip(&dist)
+            .map(|(a, b)| {
+                if a.is_infinite() && b.is_infinite() {
+                    0.0
+                } else {
+                    (a - b).abs()
+                }
+            })
+            .fold(0.0f64, f64::max);
+        assert!(
+            maxd < 1e-9,
+            "boundary SSSP diverged from Dijkstra: max|Δ| {maxd:e}"
+        );
     }
 
     #[test]

@@ -62,20 +62,24 @@ N worker **processes**, Fennel-partitioned, boundary halo over real sockets. Edg
 The P2P mesh removes the coordinator from the hot path: its traffic is O(k), independent of graph size —
 the difference between an 8-node demo and a 64-node run.
 
-## 4. The distributed suite — three LDBC kernels, all exact
+## 4. The distributed suite — four LDBC kernels, all exact
 
 ```
 HG_SCALE=20 HG_SHARDS=16 cargo run -p hg_analytics --release --example ldbc_suite
 ```
 
-One Fennel partition, three computational shapes, self-verifying scorecard. Scale-20 (1M nodes / 16.8M
+One Fennel partition, four computational shapes, self-verifying scorecard. Scale-20 (1M nodes / 16.8M
 edges, 16 shards):
 
 | kernel | shape | time | halo/step | vs single-graph |
 |--------|-------|-----:|----------:|:---------------:|
-| PageRank | fixpoint | 1.04 s | 7.6 MB | max\|Δ\| 6e-17 ✓ |
-| WCC | label-prop | 0.24 s | 5.4 MB | exact ✓ |
-| BFS | traversal | 0.20 s | 5.4 MB | exact ✓ |
+| PageRank | fixpoint | 1.01 s | 7.6 MB | max\|Δ\| 6e-17 ✓ |
+| WCC | label-prop | 0.22 s | 5.4 MB | exact ✓ |
+| BFS | unit traversal | 0.20 s | 5.4 MB | exact ✓ |
+| SSSP | weighted traversal | 0.49 s | 10.8 MB | max\|Δ\| 0 ✓ |
+
+Four of the six LDBC Graphalytics kernels (BFS, PR, WCC, SSSP), boundary-halo distributed, all bit-exact
+against their single-graph reference (SSSP vs serial Dijkstra).
 
 ## 5. Out-of-core (single machine, > RAM)
 
@@ -106,5 +110,5 @@ Run it on GKE: `deploy/bench/` (`saturday.sh` = create → Cloud Build → run �
 - `dist_p2p` uses a full mesh (only among peers with real boundary overlap); >100 nodes wants a sparser
   mesh and pod-IP wiring.
 - Laptop out-of-core ceiling ~500M edges; beyond that is the cluster.
-- Weighted SSSP is a one-line change to the BFS relaxation (`+w` instead of `+1`) but needs a weighted
-  shard; not yet built.
+- LDBC coverage is 4/6 kernels (BFS, PR, WCC, SSSP); CDLP (community detection) and LCC (local clustering
+  coefficient) are not yet distributed (Louvain exists single-graph).
