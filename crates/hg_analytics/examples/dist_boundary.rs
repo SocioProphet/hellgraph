@@ -7,12 +7,19 @@
 //!                                  scalar dangling-mass partial.
 //!   • down (coordinator → worker): exactly the ghost ranks this worker needs, + the scalar `add`.
 //! There is NO O(n) message per superstep — total per-step traffic is O(boundary). The O(E) edges never
-//! leave their worker's file. One final O(n) gather at the end collects the answer (one-time, not per-step).
+//! leave the worker (each shard's CSR is streamed to it once at setup — no shared filesystem needed, so it
+//! runs unchanged on a GKE cluster). One final O(n) gather collects the answer (one-time, not per-step).
 //!
-//! The graph is Fennel-partitioned (edge-cut minimised) then relabelled to contiguous blocks, so the
-//! boundary is small. The distributed answer is checked against single-graph PageRank.
+//! Roles (env-driven so the SAME binary is the container for every pod):
+//!   • default (no env)          — LOCAL: coordinator generates the graph, spawns SHARDS worker processes,
+//!                                 ships each its shard over a loopback socket, runs, verifies. `cargo run`.
+//!   • HG_ROLE=coordinator       — CLUSTER coordinator: bind HG_LISTEN (default 0.0.0.0:9000), wait for
+//!                                 HG_SHARDS external workers to connect, ship shards, run, verify.
+//!   • HG_ROLE=worker            — CLUSTER worker: connect HG_COORD (host:port), identify by HG_ORDINAL
+//!                                 (or JOB_COMPLETION_INDEX), receive its shard, compute.
+//! Graph size overridable via HG_SCALE / HG_EDGEFACTOR / HG_ITERS.
 //!
-//! Run: `cargo run -p hg_analytics --release --example dist_boundary`
+//! Run locally: `cargo run -p hg_analytics --release --example dist_boundary`
 
 use hg_analytics::{
     fennel_partition, pagerank, partition_edges_boundary_at, relabel_contiguous, Kronecker,
@@ -20,17 +27,15 @@ use hg_analytics::{
 use std::collections::BTreeSet;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::PathBuf;
 use std::time::Instant;
 
-const SCALE: u32 = 18; // 262_144 vertices
-const EDGEFACTOR: usize = 16; // ~4.2M edges
-const SHARDS: usize = 8;
-const ITERS: usize = 25;
 const D: f64 = 0.85;
 
-fn shard_path(idx: usize) -> PathBuf {
-    std::env::temp_dir().join(format!("hg_bshard_{idx}.bin"))
+fn env_usize(key: &str, default: usize) -> usize {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
 }
 
 fn read_vec(s: &mut impl Read, bytes: usize) -> std::io::Result<Vec<u8>> {
@@ -40,19 +45,65 @@ fn read_vec(s: &mut impl Read, bytes: usize) -> std::io::Result<Vec<u8>> {
 }
 
 fn main() {
+    // Local-spawn children use argv (worker <addr> <ordinal>); cluster pods use env.
     if std::env::args().nth(1).as_deref() == Some("worker") {
         let addr = std::env::args().nth(2).unwrap();
         let idx: usize = std::env::args().nth(3).unwrap().parse().unwrap();
         run_worker(&addr, idx);
-    } else {
-        run_coordinator();
+        return;
+    }
+    match std::env::var("HG_ROLE").as_deref() {
+        Ok("worker") => {
+            let addr = std::env::var("HG_COORD").expect("HG_COORD=host:port required for worker");
+            let ordinal = std::env::var("HG_ORDINAL")
+                .or_else(|_| std::env::var("JOB_COMPLETION_INDEX"))
+                .expect("HG_ORDINAL or JOB_COMPLETION_INDEX required")
+                .parse()
+                .unwrap();
+            run_worker(&addr, ordinal);
+        }
+        Ok("coordinator") => {
+            let listen = std::env::var("HG_LISTEN").unwrap_or_else(|_| "0.0.0.0:9000".into());
+            run_coordinator(&listen, env_usize("HG_SHARDS", 8), false);
+        }
+        _ => {
+            // Local all-in-one: bind an ephemeral loopback port and spawn the workers ourselves.
+            run_coordinator("127.0.0.1:0", env_usize("HG_SHARDS", 8), true);
+        }
     }
 }
 
-// ── Worker: owns one shard file (local CSR + local out-degrees + which owned nodes to report up). Keeps
-//    its owned ranks across supersteps; each step receives only its ghost halo, computes, reports boundary.
-fn run_worker(addr: &str, idx: usize) {
-    let raw = std::fs::read(shard_path(idx)).unwrap();
+// ── Worker: receives its shard over the socket (local CSR + local out-degrees + which owned nodes to
+//    report up), keeps its owned ranks across supersteps, exchanges only the boundary each step.
+fn run_worker(addr: &str, ordinal: usize) {
+    // Retry the connect: on a cluster the coordinator pod may not be listening yet (k8s does not order
+    // pod startup). Back off up to ~60s before giving up.
+    let mut sock = {
+        let mut attempt = 0;
+        loop {
+            match TcpStream::connect(addr) {
+                Ok(s) => break s,
+                Err(e) if attempt < 60 => {
+                    attempt += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(1000));
+                    if attempt % 10 == 0 {
+                        eprintln!("worker {ordinal}: waiting for coordinator {addr} ({e})");
+                    }
+                }
+                Err(e) => panic!("worker {ordinal}: coordinator {addr} unreachable: {e}"),
+            }
+        }
+    };
+    sock.set_nodelay(true).ok();
+    sock.write_all(&(ordinal as u64).to_le_bytes()).unwrap(); // hello: which shard I am
+
+    // Receive setup: [1/n : f64][shard_len : u64][shard bytes].
+    let n_recip = f64::from_le_bytes(read_vec(&mut sock, 8).unwrap().try_into().unwrap());
+    let shard_len =
+        u64::from_le_bytes(read_vec(&mut sock, 8).unwrap().try_into().unwrap()) as usize;
+    let raw = read_vec(&mut sock, shard_len).unwrap();
+
+    // Parse the shard layout (see coordinator's build_shard_buffer).
     let mut p = 0usize;
     let rd_u64 = |raw: &[u8], p: &mut usize| {
         let v = u64::from_le_bytes(raw[*p..*p + 8].try_into().unwrap());
@@ -71,18 +122,11 @@ fn run_worker(addr: &str, idx: usize) {
     p += (owned + g) * 4;
     let up_locals: &[u32] = bytemuck::cast_slice(&raw[p..p + up_len * 4]);
 
-    let mut sock = TcpStream::connect(addr).unwrap();
-    sock.set_nodelay(true).ok();
-    sock.write_all(&(idx as u64).to_le_bytes()).unwrap(); // hello
-    let n_recip = f64::from_le_bytes(read_vec(&mut sock, 8).unwrap().try_into().unwrap()); // 1/n init
-
-    // Local persistent state: owned ranks (kept across supersteps — the whole point).
+    // Persistent local state: owned ranks kept across supersteps (the whole point).
     let mut owned_rank = vec![n_recip; owned];
-    // Reusable local view: [owned ranks | ghost halo].
     let mut local_rank = vec![n_recip; owned + g];
 
     loop {
-        // Receive this step's control + ghost halo (the boundary-only download).
         let mut ctrl = [0u8; 8];
         if sock.read_exact(&mut ctrl).is_err() {
             break;
@@ -92,16 +136,13 @@ fn run_worker(addr: &str, idx: usize) {
             break; // terminate
         }
         if add.is_infinite() {
-            // Final gather: send full owned ranks once, then finish.
-            sock.write_all(bytemuck::cast_slice(&owned_rank)).unwrap();
+            sock.write_all(bytemuck::cast_slice(&owned_rank)).unwrap(); // final gather
             break;
         }
         let ghost_halo: Vec<f64> =
             bytemuck::cast_slice(&read_vec(&mut sock, g * 8).unwrap()).to_vec();
-        // Assemble local view: owned (persistent) followed by the received ghost halo.
         local_rank[..owned].copy_from_slice(&owned_rank);
         local_rank[owned..].copy_from_slice(&ghost_halo);
-        // Compute new owned ranks (pull from local in-neighbours).
         let mut dangling_partial = 0.0f64;
         for v in 0..owned {
             let mut acc = 0.0;
@@ -113,7 +154,6 @@ fn run_worker(addr: &str, idx: usize) {
                 dangling_partial += owned_rank[v];
             }
         }
-        // Report up: dangling scalar + the boundary-owned values other shards need (boundary-only upload).
         let mut up = Vec::with_capacity(8 + up_len * 8);
         up.extend_from_slice(&dangling_partial.to_le_bytes());
         for &li in up_locals {
@@ -123,22 +163,33 @@ fn run_worker(addr: &str, idx: usize) {
     }
 }
 
-// ── Coordinator: Fennel-partition, relabel, write shard files, spawn workers, drive the boundary BSP loop.
-fn run_coordinator() {
-    let n = Kronecker::vertices(SCALE);
-    let edges: Vec<(usize, usize)> = Kronecker::new(SCALE, EDGEFACTOR, 0xB0A7).collect();
+struct Book {
+    lo: usize,
+    owned: usize,
+    ghost_bpos: Vec<usize>,
+    up_bpos: Vec<usize>,
+    shard: Vec<u8>,
+}
+
+/// Coordinator: Fennel-partition, relabel, build per-shard buffers, (optionally) spawn workers, ship each
+/// its shard over the socket, drive the boundary BSP loop, verify against single-graph PageRank.
+fn run_coordinator(listen: &str, shards_n: usize, spawn: bool) {
+    let scale = env_usize("HG_SCALE", 18) as u32;
+    let edgefactor = env_usize("HG_EDGEFACTOR", 16);
+    let iters = env_usize("HG_ITERS", 25);
+    let n = Kronecker::vertices(scale);
+    let edges: Vec<(usize, usize)> = Kronecker::new(scale, edgefactor, 0xB0A7).collect();
     let m = edges.len();
     println!(
-        "Boundary-halo distributed PageRank over SOCKETS: {n} nodes / {m} edges / {SHARDS} worker processes"
+        "Boundary-halo distributed PageRank over TCP: {n} nodes / {m} edges / {shards_n} workers \
+(scale {scale}, ef {edgefactor}, {iters} iters)"
     );
 
-    // Fennel edge-cut partition → relabel to contiguous blocks → boundary shards on the relabelled graph.
-    let part = fennel_partition(n, &edges, SHARDS);
-    let (remapped, bounds, _perm) = relabel_contiguous(n, &part, SHARDS, &edges);
+    let part = fennel_partition(n, &edges, shards_n);
+    let (remapped, bounds, _perm) = relabel_contiguous(n, &part, shards_n, &edges);
     let (shards, out_deg) = partition_edges_boundary_at(n, &remapped, &bounds);
 
-    // Boundary set B = union of all ghosts; its dense index space is the only per-step state the
-    // coordinator holds (O(boundary), not O(n)).
+    // Boundary set B = union of all ghosts; the coordinator's only per-step state (O(boundary)).
     let mut bset: BTreeSet<usize> = BTreeSet::new();
     for sh in &shards {
         bset.extend(sh.ghosts.iter().copied());
@@ -147,94 +198,51 @@ fn run_coordinator() {
         bset.iter().enumerate().map(|(i, &g)| (g, i)).collect();
     let b_len = bset.len();
 
-    // Per-worker bookkeeping + shard files.
-    struct Book {
-        lo: usize,
-        owned: usize,
-        ghost_bpos: Vec<usize>, // gather halo for this worker from boundary_val
-        up_bpos: Vec<usize>,    // scatter this worker's reported up-values into boundary_val
-    }
-    let mut books: Vec<Book> = Vec::new();
-    for sh in &shards {
-        let owned = sh.owned();
-        let g = sh.ghosts.len();
-        // out_deg over [owned ++ ghosts].
-        let mut odl: Vec<u32> = Vec::with_capacity(owned + g);
-        odl.extend_from_slice(&out_deg[sh.lo..sh.hi]);
-        for &gg in &sh.ghosts {
-            odl.push(out_deg[gg]);
-        }
-        // owned nodes that are in B → the values to report up (sorted by local index).
-        let up_locals: Vec<u32> = (0..owned)
-            .filter(|&li| bpos.contains_key(&(sh.lo + li)))
-            .map(|li| li as u32)
-            .collect();
-        let up_bpos: Vec<usize> = up_locals
-            .iter()
-            .map(|&li| bpos[&(sh.lo + li as usize)])
-            .collect();
-        let ghost_bpos: Vec<usize> = sh.ghosts.iter().map(|&gg| bpos[&gg]).collect();
-
-        // CSR (local indices) for the worker file.
-        let mut off = vec![0u64; owned + 1];
-        for (i, srcs) in sh.in_adj.iter().enumerate() {
-            off[i + 1] = off[i] + srcs.len() as u64;
-        }
-        let flat: Vec<u32> = sh.in_adj.iter().flatten().map(|&li| li as u32).collect();
-
-        let mut buf = Vec::new();
-        buf.extend_from_slice(&(owned as u64).to_le_bytes());
-        buf.extend_from_slice(&(g as u64).to_le_bytes());
-        buf.extend_from_slice(&(up_locals.len() as u64).to_le_bytes());
-        buf.extend_from_slice(bytemuck::cast_slice(&off));
-        buf.extend_from_slice(bytemuck::cast_slice(&flat));
-        buf.extend_from_slice(bytemuck::cast_slice(&odl));
-        buf.extend_from_slice(bytemuck::cast_slice(&up_locals));
-        std::fs::write(shard_path(books.len()), &buf).unwrap();
-
-        books.push(Book {
-            lo: sh.lo,
-            owned,
-            ghost_bpos,
-            up_bpos,
-        });
-    }
-
-    // Spawn workers; accept + identify by hello; send 1/n init.
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap().to_string();
-    let exe = std::env::current_exe().unwrap();
-    let mut kids: Vec<std::process::Child> = (0..SHARDS)
-        .map(|idx| {
-            std::process::Command::new(&exe)
-                .args(["worker", &addr, &idx.to_string()])
-                .spawn()
-                .unwrap()
-        })
+    let books: Vec<Book> = shards
+        .iter()
+        .map(|sh| build_book(sh, &out_deg, &bpos))
         .collect();
-    // conns[idx] in worker-id order.
-    let mut conns: Vec<Option<TcpStream>> = (0..SHARDS).map(|_| None).collect();
-    for _ in 0..SHARDS {
+
+    let listener = TcpListener::bind(listen).unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let mut kids: Vec<std::process::Child> = Vec::new();
+    if spawn {
+        let exe = std::env::current_exe().unwrap();
+        kids = (0..shards_n)
+            .map(|idx| {
+                std::process::Command::new(&exe)
+                    .args(["worker", &addr, &idx.to_string()])
+                    .spawn()
+                    .unwrap()
+            })
+            .collect();
+    } else {
+        println!("  waiting for {shards_n} workers to connect on {listen} ...");
+    }
+
+    // Accept, identify by hello ordinal, ship [1/n][shard_len][shard bytes] to each.
+    let mut conns: Vec<Option<TcpStream>> = (0..shards_n).map(|_| None).collect();
+    for _ in 0..shards_n {
         let (mut s, _) = listener.accept().unwrap();
         s.set_nodelay(true).ok();
         let id = u64::from_le_bytes(read_vec(&mut s, 8).unwrap().try_into().unwrap()) as usize;
         s.write_all(&(1.0 / n as f64).to_le_bytes()).unwrap();
+        s.write_all(&(books[id].shard.len() as u64).to_le_bytes())
+            .unwrap();
+        s.write_all(&books[id].shard).unwrap();
         conns[id] = Some(s);
     }
     let mut conns: Vec<TcpStream> = conns.into_iter().map(|c| c.unwrap()).collect();
 
     let base = (1.0 - D) / n as f64;
-    // boundary_val holds rank_t restricted to B. Init uniform 1/n.
     let mut boundary_val = vec![1.0 / n as f64; b_len];
-    // Seed add_0 from the uniform-rank dangling mass (coordinator knows out_deg = setup metadata).
     let n_dangle = out_deg.iter().filter(|&&d| d == 0).count();
     let mut add = base + D * (n_dangle as f64 / n as f64) / n as f64;
 
     let mut down_bytes = 0usize;
     let mut up_bytes = 0usize;
     let t = Instant::now();
-    for _ in 0..ITERS {
-        // DOWN: send each worker add + only its ghost halo (gathered from boundary_val).
+    for _ in 0..iters {
         for (c, s) in conns.iter_mut().enumerate() {
             let halo: Vec<f64> = books[c]
                 .ghost_bpos
@@ -245,7 +253,6 @@ fn run_coordinator() {
             s.write_all(bytemuck::cast_slice(&halo)).unwrap();
             down_bytes += 8 + halo.len() * 8;
         }
-        // UP: gather dangling partials + boundary-owned values; rebuild boundary_val = rank_{t+1}|B.
         let mut dangling = 0.0f64;
         for (c, s) in conns.iter_mut().enumerate() {
             let up_len = books[c].up_bpos.len();
@@ -273,25 +280,23 @@ fn run_coordinator() {
         k.wait().ok();
     }
 
-    // Verify against single-graph PageRank on the same (relabelled) graph.
-    let single = pagerank(n, &remapped, D, ITERS, -1.0);
+    let single = pagerank(n, &remapped, D, iters, -1.0);
     let maxdiff = single
         .iter()
         .zip(&rank)
         .map(|(a, b)| (a - b).abs())
         .fold(0.0, f64::max);
-
-    let full_broadcast = SHARDS * n * 8 * ITERS;
+    let full_broadcast = shards_n * n * 8 * iters;
     let boundary_total = down_bytes + up_bytes;
-    println!("  {ITERS} boundary supersteps over TCP: {dt:>7.3?}");
+    println!("  {iters} boundary supersteps over TCP: {dt:>7.3?}");
     println!(
         "  boundary set |B| = {b_len} ({:.1}% of n)",
         100.0 * b_len as f64 / n as f64
     );
     println!(
         "  wire/step: down {} KB (ghost halos) + up {} KB (boundary + dangling) — NO O(n) per step",
-        down_bytes / ITERS / 1000,
-        up_bytes / ITERS / 1000
+        down_bytes / iters / 1000,
+        up_bytes / iters / 1000
     );
     println!(
         "  total over wire: {:.1} MB   vs a full-broadcast BSP {:.1} MB  → {:.1}x less",
@@ -300,8 +305,51 @@ fn run_coordinator() {
         full_broadcast as f64 / boundary_total.max(1) as f64
     );
     println!("  == single-graph PageRank: max|Δ| {maxdiff:.2e}   (distributed answer is EXACT)");
+}
 
-    for idx in 0..SHARDS {
-        std::fs::remove_file(shard_path(idx)).ok();
+/// Build one worker's shard buffer + the coordinator's gather/scatter bookkeeping for it.
+fn build_book(
+    sh: &hg_analytics::BoundaryShard,
+    out_deg: &[u32],
+    bpos: &std::collections::HashMap<usize, usize>,
+) -> Book {
+    let owned = sh.owned();
+    let g = sh.ghosts.len();
+    let mut odl: Vec<u32> = Vec::with_capacity(owned + g);
+    odl.extend_from_slice(&out_deg[sh.lo..sh.hi]);
+    for &gg in &sh.ghosts {
+        odl.push(out_deg[gg]);
+    }
+    let up_locals: Vec<u32> = (0..owned)
+        .filter(|&li| bpos.contains_key(&(sh.lo + li)))
+        .map(|li| li as u32)
+        .collect();
+    let up_bpos: Vec<usize> = up_locals
+        .iter()
+        .map(|&li| bpos[&(sh.lo + li as usize)])
+        .collect();
+    let ghost_bpos: Vec<usize> = sh.ghosts.iter().map(|&gg| bpos[&gg]).collect();
+
+    let mut off = vec![0u64; owned + 1];
+    for (i, srcs) in sh.in_adj.iter().enumerate() {
+        off[i + 1] = off[i] + srcs.len() as u64;
+    }
+    let flat: Vec<u32> = sh.in_adj.iter().flatten().map(|&li| li as u32).collect();
+
+    let mut shard = Vec::new();
+    shard.extend_from_slice(&(owned as u64).to_le_bytes());
+    shard.extend_from_slice(&(g as u64).to_le_bytes());
+    shard.extend_from_slice(&(up_locals.len() as u64).to_le_bytes());
+    shard.extend_from_slice(bytemuck::cast_slice(&off));
+    shard.extend_from_slice(bytemuck::cast_slice(&flat));
+    shard.extend_from_slice(bytemuck::cast_slice(&odl));
+    shard.extend_from_slice(bytemuck::cast_slice(&up_locals));
+
+    Book {
+        lo: sh.lo,
+        owned,
+        ghost_bpos,
+        up_bpos,
+        shard,
     }
 }

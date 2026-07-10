@@ -1,0 +1,13 @@
+# Shared benchmark parameters — the coordinator and the workers MUST agree on HG_SHARDS.
+# HG_SCALE 30 = 2^30 ≈ 1.07B vertices; edgefactor 16 ⇒ ~17B edges. Dial down for a smaller first run
+# (scale 26 ≈ 67M vertices / ~1B edges is the MVP proof). Change here, re-apply, re-run.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: hg-bench-params
+  labels: { app: hg-bench }
+data:
+  HG_SHARDS: "8"
+  HG_SCALE: "26"        # 2^26 ≈ 67M vertices → ~1B edges at ef=16 (the MVP proof)
+  HG_EDGEFACTOR: "16"
+  HG_ITERS: "25"
