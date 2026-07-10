@@ -1,8 +1,8 @@
 //! ldbc_suite — the whole distributed boundary-halo suite on ONE graph, as an LDBC-Graphalytics-style
-//! scorecard. Runs PageRank (PR), weakly-connected-components (WCC), BFS, and weighted SSSP — the main
-//! computational shapes (fixpoint smoothing / label propagation / unit-hop + weighted traversal), which are
-//! four of the six LDBC Graphalytics kernels. Each is Fennel-partitioned + boundary-halo distributed and
-//! VERIFIED bit-exact against its single-graph reference, with per-kernel time + recurring halo reported.
+//! scorecard. Runs PageRank (PR), WCC, CDLP, BFS, and weighted SSSP — the main computational shapes
+//! (fixpoint smoothing / min-label prop / label voting / unit-hop + weighted traversal), which are five of
+//! the six LDBC Graphalytics kernels. Each is Fennel-partitioned + boundary-halo distributed and VERIFIED
+//! bit-exact against its single-graph reference, with per-kernel time + recurring halo reported.
 //!
 //! This is the Saturday deliverable in one command: a credible, self-verifying benchmark result, not just
 //! "it ran". Graph size via HG_SCALE / HG_EDGEFACTOR; shards via HG_SHARDS.
@@ -11,12 +11,49 @@
 
 use hg_analytics::{
     connected_components, distributed_bfs_boundary, distributed_cc_boundary,
-    distributed_pagerank_boundary, distributed_sssp_boundary, fennel_partition, pagerank,
-    partition_cc_boundary_at, partition_edges_boundary_at, partition_wsssp_boundary_at,
-    relabel_contiguous, total_cc_halo_bytes, total_halo_bytes, total_w_halo_bytes, BoundaryCcShard,
-    Kronecker,
+    distributed_cdlp_boundary, distributed_pagerank_boundary, distributed_sssp_boundary,
+    fennel_partition, pagerank, partition_cc_boundary_at, partition_edges_boundary_at,
+    partition_wsssp_boundary_at, relabel_contiguous, total_cc_halo_bytes, total_halo_bytes,
+    total_w_halo_bytes, BoundaryCcShard, Kronecker,
 };
+use std::collections::HashMap;
 use std::time::Instant;
+
+const CDLP_ITERS: usize = 10;
+
+/// Serial synchronous CDLP reference (most-frequent neighbour label, ties → smallest id).
+fn serial_cdlp(n: usize, edges: &[(usize, usize)], iters: usize) -> Vec<u32> {
+    let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for &(u, v) in edges {
+        if u < n && v < n && u != v {
+            adj[u].push(v);
+            adj[v].push(u);
+        }
+    }
+    let mut label: Vec<u32> = (0..n as u32).collect();
+    for _ in 0..iters {
+        let mut next = label.clone();
+        for v in 0..n {
+            if adj[v].is_empty() {
+                continue;
+            }
+            let mut counts: HashMap<u32, usize> = HashMap::new();
+            for &w in &adj[v] {
+                *counts.entry(label[w]).or_insert(0) += 1;
+            }
+            next[v] = counts
+                .into_iter()
+                .fold(None, |b: Option<(u32, usize)>, (lab, cnt)| match b {
+                    Some((bl, bc)) if bc > cnt || (bc == cnt && bl <= lab) => Some((bl, bc)),
+                    _ => Some((lab, cnt)),
+                })
+                .map(|(l, _)| l)
+                .unwrap_or(0);
+        }
+        label = next;
+    }
+    label
+}
 
 /// Serial Dijkstra reference (undirected, non-negative weights) for the SSSP correctness check.
 fn serial_dijkstra(n: usize, edges: &[(usize, usize)], weights: &[f64], source: usize) -> Vec<f64> {
@@ -151,6 +188,21 @@ fn main() {
         if wcc_ok { "EXACT ✓" } else { "MISMATCH ✗" }
     );
 
+    // CDLP (community detection, label voting — fixed iterations) shares the same undirected CC shards.
+    let t = Instant::now();
+    let cdlp = distributed_cdlp_boundary(n, &cc_shards, CDLP_ITERS);
+    let cdlp_s = t.elapsed().as_secs_f64();
+    let cdlp_ref = serial_cdlp(n, &remapped, CDLP_ITERS);
+    let cdlp_ok = cdlp == cdlp_ref;
+    println!(
+        "  {:<6} {:>9} {:>11} {:>14}  {}",
+        "CDLP",
+        format!("{cdlp_s:.2}s"),
+        human(total_cc_halo_bytes(&cc_shards) as f64),
+        if cdlp_ok { "exact match" } else { "DIVERGED" },
+        if cdlp_ok { "EXACT ✓" } else { "MISMATCH ✗" }
+    );
+
     let source = 0usize;
     let t = Instant::now();
     let bfs = distributed_bfs_boundary(n, &cc_shards, source);
@@ -206,9 +258,9 @@ fn main() {
             .copied()
             .unwrap_or(0)
     );
-    let all_ok = pr_delta < 1e-9 && wcc_ok && bfs_ok && sssp_ok;
+    let all_ok = pr_delta < 1e-9 && wcc_ok && cdlp_ok && bfs_ok && sssp_ok;
     println!(
-        "\n  {}  — 4 LDBC kernels, boundary-halo distributed, all verified against single-graph.",
+        "\n  {}  — 5 LDBC kernels, boundary-halo distributed, all verified against single-graph.",
         if all_ok {
             "ALL EXACT ✓"
         } else {

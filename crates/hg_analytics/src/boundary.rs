@@ -574,6 +574,66 @@ pub fn distributed_sssp_boundary(n: usize, shards: &[BoundaryWShard], source: us
     dist
 }
 
+// ── Boundary-halo community detection by label propagation (CDLP) ──────────────────────────────────────────────
+/// Distributed CDLP (LDBC Graphalytics community detection) with a boundary-only halo, over the undirected
+/// CC shards. SYNCHRONOUS label propagation for a FIXED number of iterations (LDBC semantics — not run to a
+/// fixpoint): each round every vertex adopts the label most frequent among its neighbours, ties broken by
+/// the SMALLEST label id. Only ghost labels (u32) cross shard boundaries. Deterministic (synchronous update
+/// from the previous round + deterministic tie-break) → identical to a single-graph CDLP. This is the LABEL-
+/// VOTING shape (distinct from WCC's min-propagation): it proves the boundary-halo model covers it too.
+pub fn distributed_cdlp_boundary(n: usize, shards: &[BoundaryCcShard], iters: usize) -> Vec<u32> {
+    if n == 0 {
+        return Vec::new();
+    }
+    let mut label: Vec<u32> = (0..n as u32).collect();
+    for _ in 0..iters {
+        let partials: Vec<(usize, Vec<u32>)> = shards
+            .par_iter()
+            .map(|sh| {
+                let owned = sh.owned();
+                let mut local_label = vec![0u32; owned + sh.ghosts.len()];
+                local_label[..owned].copy_from_slice(&label[sh.lo..sh.hi]);
+                for (i, &g) in sh.ghosts.iter().enumerate() {
+                    local_label[owned + i] = label[g];
+                }
+                let mut out = vec![0u32; owned];
+                for (i, nbrs) in sh.adj.iter().enumerate() {
+                    if nbrs.is_empty() {
+                        out[i] = local_label[i]; // isolated → keep own label
+                        continue;
+                    }
+                    out[i] = most_frequent_label(nbrs.iter().map(|&li| local_label[li]));
+                }
+                (sh.lo, out)
+            })
+            .collect();
+        // Synchronous: build the next global label vector wholesale from this round's partials.
+        let mut next = label.clone();
+        for (lo, local) in &partials {
+            next[*lo..*lo + local.len()].copy_from_slice(local);
+        }
+        label = next;
+    }
+    label
+}
+
+/// The label appearing most often among `labels`, ties broken by the smallest label id (LDBC CDLP rule).
+fn most_frequent_label(labels: impl Iterator<Item = u32>) -> u32 {
+    let mut counts: HashMap<u32, usize> = HashMap::new();
+    for l in labels {
+        *counts.entry(l).or_insert(0) += 1;
+    }
+    // Max by count, then min by label id → deterministic.
+    counts
+        .into_iter()
+        .fold(None, |best: Option<(u32, usize)>, (lab, cnt)| match best {
+            Some((bl, bc)) if bc > cnt || (bc == cnt && bl <= lab) => Some((bl, bc)),
+            _ => Some((lab, cnt)),
+        })
+        .map(|(lab, _)| lab)
+        .unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -731,6 +791,37 @@ mod tests {
             maxd < 1e-9,
             "boundary SSSP diverged from Dijkstra: max|Δ| {maxd:e}"
         );
+    }
+
+    #[test]
+    fn boundary_halo_cdlp_matches_serial_exactly() {
+        let n = Kronecker::vertices(9); // 512
+        let edges: Vec<(usize, usize)> = Kronecker::new(9, 8, 0xC0DE).collect();
+        let iters = 10;
+
+        // Serial synchronous CDLP reference (same tie-break: most frequent, then smallest label).
+        let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for &(u, v) in &edges {
+            if u != v {
+                adj[u].push(v);
+                adj[v].push(u);
+            }
+        }
+        let mut label: Vec<u32> = (0..n as u32).collect();
+        for _ in 0..iters {
+            let mut next = label.clone();
+            for v in 0..n {
+                if adj[v].is_empty() {
+                    continue;
+                }
+                next[v] = super::most_frequent_label(adj[v].iter().map(|&w| label[w]));
+            }
+            label = next;
+        }
+
+        let shards = partition_cc_boundary(n, &edges, 8);
+        let dist = distributed_cdlp_boundary(n, &shards, iters);
+        assert_eq!(label, dist, "boundary-halo CDLP diverged from serial");
     }
 
     #[test]

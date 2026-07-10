@@ -16,11 +16,11 @@ mod graph500;
 mod ooc;
 mod partitioner;
 pub use boundary::{
-    distributed_bfs_boundary, distributed_cc_boundary, distributed_pagerank_boundary,
-    distributed_sssp_boundary, partition_cc_boundary, partition_cc_boundary_at,
-    partition_edges_boundary, partition_edges_boundary_at, partition_wsssp_boundary,
-    partition_wsssp_boundary_at, total_cc_halo_bytes, total_halo_bytes, total_w_halo_bytes,
-    BoundaryCcShard, BoundaryShard, BoundaryWShard,
+    distributed_bfs_boundary, distributed_cc_boundary, distributed_cdlp_boundary,
+    distributed_pagerank_boundary, distributed_sssp_boundary, partition_cc_boundary,
+    partition_cc_boundary_at, partition_edges_boundary, partition_edges_boundary_at,
+    partition_wsssp_boundary, partition_wsssp_boundary_at, total_cc_halo_bytes, total_halo_bytes,
+    total_w_halo_bytes, BoundaryCcShard, BoundaryShard, BoundaryWShard,
 };
 pub use cc::{
     connected_components, distributed_connected_components, partition_undirected, CcShard,
