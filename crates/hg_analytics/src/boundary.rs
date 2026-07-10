@@ -59,33 +59,50 @@ pub fn partition_edges_boundary(
     }
     let k = k.clamp(1, n);
     let size = n.div_ceil(k);
+    let bounds: Vec<usize> = (0..=k).map(|c| (c * size).min(n)).collect();
+    partition_edges_boundary_at(n, edges, &bounds)
+}
+
+/// Build boundary shards from EXPLICIT contiguous boundaries: shard `c` owns `[bounds[c], bounds[c+1])`.
+/// `bounds` must be non-decreasing with `bounds[0] == 0` and `bounds[last] == n`. This is the general form
+/// a smart partitioner drives — relabel vertices so each partition is a contiguous block (unequal sizes),
+/// pass the block boundaries here, and the same boundary-halo PageRank runs on the edge-cut-minimised
+/// layout. The equal-`size` range partition is just the special case `partition_edges_boundary` produces.
+pub fn partition_edges_boundary_at(
+    n: usize,
+    edges: &[(usize, usize)],
+    bounds: &[usize],
+) -> (Vec<BoundaryShard>, Vec<u32>) {
+    if n == 0 || bounds.len() < 2 {
+        return (Vec::new(), Vec::new());
+    }
+    let k = bounds.len() - 1;
+    // Owner of a global id via binary search over the boundaries: largest c with bounds[c] <= v.
+    let owner = |v: usize| -> usize {
+        match bounds.binary_search(&v) {
+            Ok(c) => c.min(k - 1), // v is exactly a boundary start → that block
+            Err(c) => c - 1,       // between bounds[c-1] and bounds[c]
+        }
+    };
     let mut out_deg = vec![0u32; n];
-    // Pass 1: bucket each in-edge's global source under the owned target, and collect the ghost set.
     let mut raw: Vec<Vec<Vec<usize>>> = (0..k)
-        .map(|c| {
-            let lo = c * size;
-            let hi = ((c + 1) * size).min(n);
-            vec![Vec::new(); hi - lo]
-        })
+        .map(|c| vec![Vec::new(); bounds[c + 1] - bounds[c]])
         .collect();
     let mut ghost_sets: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); k];
     for &(u, v) in edges {
         if u < n && v < n {
             out_deg[u] += 1;
-            let c = v / size;
-            let lo = c * size;
-            let hi = ((c + 1) * size).min(n);
+            let c = owner(v);
+            let (lo, hi) = (bounds[c], bounds[c + 1]);
             raw[c][v - lo].push(u);
             if u < lo || u >= hi {
                 ghost_sets[c].insert(u); // remote source → ghost
             }
         }
     }
-    // Pass 2: freeze ghost order (BTreeSet = sorted, deterministic) and remap global sources → local idx.
     let mut shards = Vec::with_capacity(k);
     for c in 0..k {
-        let lo = c * size;
-        let hi = ((c + 1) * size).min(n);
+        let (lo, hi) = (bounds[c], bounds[c + 1]);
         let owned = hi - lo;
         let ghosts: Vec<usize> = ghost_sets[c].iter().copied().collect();
         let ghost_idx: HashMap<usize, usize> =

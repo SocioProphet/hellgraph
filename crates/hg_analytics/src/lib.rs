@@ -14,14 +14,17 @@ mod boundary;
 mod cc;
 mod graph500;
 mod ooc;
+mod partitioner;
 pub use boundary::{
-    distributed_pagerank_boundary, partition_edges_boundary, total_halo_bytes, BoundaryShard,
+    distributed_pagerank_boundary, partition_edges_boundary, partition_edges_boundary_at,
+    total_halo_bytes, BoundaryShard,
 };
 pub use cc::{
     connected_components, distributed_connected_components, partition_undirected, CcShard,
 };
 pub use graph500::Kronecker;
 pub use ooc::{pagerank_mmap, write_csr, write_csr_bucketed, write_csr_streaming, MmapCsr};
+pub use partitioner::{balance, edge_cut, fennel_partition, ldg_partition, relabel_contiguous};
 
 /// Cold PageRank over a 0..n indexed graph. Dangling nodes (no out-edges) redistribute their mass uniformly.
 pub fn pagerank(

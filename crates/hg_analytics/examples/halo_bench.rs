@@ -6,7 +6,9 @@
 //! cargo run -p hg_analytics --example halo_bench --release
 
 use hg_analytics::{
-    distributed_pagerank_boundary, pagerank, partition_edges_boundary, total_halo_bytes, Kronecker,
+    balance, distributed_pagerank_boundary, edge_cut, fennel_partition, ldg_partition, pagerank,
+    partition_edges_boundary, partition_edges_boundary_at, relabel_contiguous, total_halo_bytes,
+    Kronecker,
 };
 
 fn human(bytes: usize) -> String {
@@ -52,6 +54,40 @@ fn run(name: &str, n: usize, edges: &[(usize, usize)], k: usize) {
     );
 }
 
+/// Compare range vs Fennel vs LDG on the SAME graph: edge cut, balance, halo bytes/superstep, and
+/// (for the smart partitions) confirm the boundary-halo PageRank is still bit-identical to serial.
+fn compare(name: &str, n: usize, edges: &[(usize, usize)], k: usize) {
+    println!("{name}: n={n} m={} k={k}", edges.len());
+    let full = k * n * 8;
+    let serial = pagerank(n, edges, 0.85, 40, 1e-10);
+    let size = n.div_ceil(k);
+    let range: Vec<usize> = (0..n).map(|v| (v / size).min(k - 1)).collect();
+
+    for (label, part) in [
+        ("range ", range),
+        ("fennel", fennel_partition(n, edges, k)),
+        ("ldg   ", ldg_partition(n, edges, k)),
+    ] {
+        let cut = edge_cut(&part, edges);
+        let (mn, mx) = balance(&part, k);
+        let (remapped, bounds, perm) = relabel_contiguous(n, &part, k, edges);
+        let (shards, out_deg) = partition_edges_boundary_at(n, &remapped, &bounds);
+        let halo = total_halo_bytes(&shards);
+        let dist = distributed_pagerank_boundary(n, &shards, &out_deg, 0.85, 40, 1e-10);
+        let max_delta = (0..n)
+            .map(|v| (serial[v] - dist[perm[v]]).abs())
+            .fold(0.0f64, f64::max);
+        println!(
+            "  {label}  cut {:>6.2}%  balance {mn}/{mx} ({:.1}x)  halo {:>9}  ({:>5.1}x < full)  max|Δ| {:.0e}",
+            100.0 * cut as f64 / edges.len() as f64,
+            mx as f64 / mn.max(1) as f64,
+            human(halo),
+            full as f64 / halo.max(1) as f64,
+            max_delta,
+        );
+    }
+}
+
 fn main() {
     // RMAT / Graph500: the honest worst case for a naive range partition.
     let scale = 16u32; // 65_536 vertices
@@ -65,4 +101,7 @@ fn main() {
     let rn = 1_000_000usize;
     let ring: Vec<(usize, usize)> = (0..rn).map(|i| (i, (i + 1) % rn)).collect();
     run("Ring 1M (perfect locality, ceiling)", rn, &ring, 16);
+
+    println!("\n── partitioner comparison (range vs edge-cut) ──");
+    compare("RMAT scale-16", n, &rmat, 16);
 }
