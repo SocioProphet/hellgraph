@@ -158,7 +158,9 @@ fn run_worker(coord_addr: &str, id: usize) {
     // (a receiver caches the last value → unchanged ghosts need no message) and still shrinks the wire as
     // ranks freeze; eps>0 trades a bounded perturbation for a bigger cut. This is the residual/delta halo
     // (#13) on the peer-to-peer mesh — the recurring-traffic optimization for the fast-path billion.
-    let delta_eps: Option<f64> = std::env::var("HG_DELTA_EPS").ok().and_then(|v| v.parse().ok());
+    let delta_eps: Option<f64> = std::env::var("HG_DELTA_EPS")
+        .ok()
+        .and_then(|v| v.parse().ok());
     let delta = delta_eps.is_some();
 
     // Spawn a reader thread per peer we RECEIVE from; each drains `iters` messages into a channel of RAW
@@ -214,7 +216,7 @@ fn run_worker(coord_addr: &str, id: usize) {
     let mut sent_bytes = 0usize;
 
     let accel = env_usize("HG_ACCEL", 0); // Anderson window; 0 = plain power iteration (the proven default)
-    // BSP loop. `owned_rank` = current iterate x (owned slice); persistent ghost halo in local_rank[owned..].
+                                          // BSP loop. `owned_rank` = current iterate x (owned slice); persistent ghost halo in local_rank[owned..].
     let mut owned_rank = vec![n_recip; s.owned];
     let mut local_rank = vec![n_recip; s.owned + s.g];
     let mut add = s.seed_add;
@@ -229,7 +231,11 @@ fn run_worker(coord_addr: &str, id: usize) {
         local_rank[..s.owned].copy_from_slice(&owned_rank);
         for li in 0..s.owned + s.g {
             let d = s.out_deg_local[li];
-            contrib[li] = if d == 0 { 0.0 } else { local_rank[li] / d as f64 };
+            contrib[li] = if d == 0 {
+                0.0
+            } else {
+                local_rank[li] / d as f64
+            };
         }
         // g = one PageRank pull from [x | ghost halo] — one gather per edge over the fused contribs.
         let mut g = vec![0.0f64; s.owned];
@@ -476,7 +482,9 @@ fn run_coordinator(listen: &str, k: usize, spawn: bool) {
     // cuts the biggest single-thread chunk. HG_PARTITION=range skips Fennel's serial pass (higher edge-cut,
     // but the halo is p2p so the setup saving wins) — Fennel stays the default for cut quality.
     let t_setup = Instant::now();
-    let cores = std::thread::available_parallelism().map(|c| c.get()).unwrap_or(8);
+    let cores = std::thread::available_parallelism()
+        .map(|c| c.get())
+        .unwrap_or(8);
     let edges: Vec<(usize, usize)> = Kronecker::generate_parallel(scale, ef, 0xB0A7, cores * 4);
     let m = edges.len();
     println!(
@@ -490,7 +498,10 @@ fn run_coordinator(listen: &str, k: usize, spawn: bool) {
     };
     let (remapped, bounds, _perm) = relabel_contiguous(n, &part, k, &edges);
     let (shards, out_deg) = partition_edges_boundary_at(n, &remapped, &bounds);
-    eprintln!("  setup (parallel gen + partition + shard) in {:.2?}", t_setup.elapsed());
+    eprintln!(
+        "  setup (parallel gen + partition + shard) in {:.2?}",
+        t_setup.elapsed()
+    );
 
     // Routing tables: for each c and peer d, send_local[c][d] (c-owned indices that are d-ghosts, sorted)
     // and recv_ghost[c][d] (c-ghost indices owned by d). By construction these mirror across the pair.
@@ -661,9 +672,17 @@ fn run_coordinator(listen: &str, k: usize, spawn: bool) {
     // point and show it beats power@iters — that's the proof of fewer effective iterations.
     let maxdiff = if accel > 0 {
         let converged = pagerank(n, &remapped, D, 2000, 1e-13);
-        let acc_err = converged.iter().zip(&rank).map(|(a, b)| (a - b).abs()).fold(0.0, f64::max);
+        let acc_err = converged
+            .iter()
+            .zip(&rank)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0, f64::max);
         let power = pagerank(n, &remapped, D, iters, -1.0);
-        let power_err = converged.iter().zip(&power).map(|(a, b)| (a - b).abs()).fold(0.0, f64::max);
+        let power_err = converged
+            .iter()
+            .zip(&power)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0, f64::max);
         println!(
             "  ANDERSON(window {accel}) @ {iters} steps: max|Δ| vs CONVERGED {acc_err:.2e}  —  power iteration @ {iters}: {power_err:.2e}  ⇒ {:.0}× closer in the same steps",
             power_err / acc_err.max(1e-300)
@@ -671,7 +690,11 @@ fn run_coordinator(listen: &str, k: usize, spawn: bool) {
         acc_err
     } else {
         let single = pagerank(n, &remapped, D, iters, -1.0);
-        single.iter().zip(&rank).map(|(a, b)| (a - b).abs()).fold(0.0, f64::max)
+        single
+            .iter()
+            .zip(&rank)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0, f64::max)
     };
     // Total P2P bytes = Σ_steps Σ_{c,d} |send c→d| × 8.
     let mut p2p_per_step = 0usize;
@@ -718,7 +741,9 @@ fn run_coordinator(listen: &str, k: usize, spawn: bool) {
     );
     // Verdict tag: bit-EXACT for the dense/eps=0 power path; Anderson lands on the same converged fixed
     // point (verified above); delta eps>0 is a bounded approximation traded for wire.
-    let delta_exact = std::env::var("HG_DELTA_EPS").map(|e| e == "0").unwrap_or(true);
+    let delta_exact = std::env::var("HG_DELTA_EPS")
+        .map(|e| e == "0")
+        .unwrap_or(true);
     let tag = if accel > 0 {
         "Anderson → same converged fixed point (verified vs power-iteration limit)"
     } else if delta_exact {

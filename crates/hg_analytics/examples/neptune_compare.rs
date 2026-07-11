@@ -10,7 +10,9 @@
 //!
 //!   cargo run -p hg_analytics --release --example neptune_compare
 
-use hg_analytics::{plan_pagerank, ClusterSpec, PlannerConfig, Topology, Workload, RESIDENT_BYTES_PER_EDGE};
+use hg_analytics::{
+    plan_pagerank, ClusterSpec, PlannerConfig, Topology, Workload, RESIDENT_BYTES_PER_EDGE,
+};
 
 // ── Sourced competitor facts (July 2026) ────────────────────────────────────────────────────────────────
 // Neptune Analytics: in-memory, billed in m-NCU (1 m-NCU = 1 GB memory + compute + net, per hour), min 128
@@ -20,8 +22,8 @@ use hg_analytics::{plan_pagerank, ClusterSpec, PlannerConfig, Topology, Workload
 const NEPTUNE_USD_PER_MNCU_HR: f64 = 0.03; // from the AWS pricing example ($7.68 / 256 m-NCU)
 const NEPTUNE_MIN_MNCU: f64 = 128.0; // historical floor; 1 m-NCU = 1 GB in-memory
 const NEPTUNE_MAX_MNCU: f64 = 4096.0; // published ceiling = 4 TB resident in ONE Neptune Analytics graph
-// Neptune stores a property graph — heavier than a flat CSR. Charitably assume it needs only the raw graph
-// footprint (our measured 126 B/edge); real Neptune overhead is higher, so this UNDER-states its cost.
+                                      // Neptune stores a property graph — heavier than a flat CSR. Charitably assume it needs only the raw graph
+                                      // footprint (our measured 126 B/edge); real Neptune overhead is higher, so this UNDER-states its cost.
 const NEPTUNE_BYTES_PER_EDGE_FLOOR: f64 = RESIDENT_BYTES_PER_EDGE;
 
 fn human(m: usize) -> String {
@@ -36,7 +38,7 @@ fn main() {
     // hellgraph cost model: cheap arm spot nodes, per-second billing, torn down after the run.
     // (These match the measured billion run: 8× t2a-standard-4 spot, ~$0.01/hr each.)
     let cfg = PlannerConfig {
-        node_usd_per_hour: 0.011, // t2a-standard-4 spot, approx
+        node_usd_per_hour: 0.011,              // t2a-standard-4 spot, approx
         billing_increment_hours: 1.0 / 3600.0, // per-second (GKE)
         throughput_edges_per_s: 2.8e9, // MEASURED single-node CPU this session (conservative; no GPU)
         ..Default::default()
@@ -52,8 +54,17 @@ fn main() {
         "edges", "hg topology", "hg $/run", "Neptune Analytics"
     );
     // Big graphs need bigger nodes to keep the shard count sane — a 512GB node is a normal cloud VM.
-    let big_spec = ClusterSpec { nodes: 4096, mem_gb_per_node: 512.0 };
-    for &m in &[1_000_000_000usize, 10_000_000_000, 32_000_000_000, 100_000_000_000, 1_000_000_000_000] {
+    let big_spec = ClusterSpec {
+        nodes: 4096,
+        mem_gb_per_node: 512.0,
+    };
+    for &m in &[
+        1_000_000_000usize,
+        10_000_000_000,
+        32_000_000_000,
+        100_000_000_000,
+        1_000_000_000_000,
+    ] {
         let n = m / 16; // ~edgefactor 16
         let plan = plan_pagerank(n, m, 25, big_spec, Workload::SingleQuery, cfg);
         let nodes = match plan.topology {
@@ -71,7 +82,11 @@ fn main() {
             format!("CANNOT FIT (needs {:.0} > 4096 m-NCU cap)", mncu)
         } else {
             let hourly = mncu * NEPTUNE_USD_PER_MNCU_HR;
-            format!("${hourly:.0}/hr ({:.0} m-NCU) ⇒ {:.0}×", mncu, hourly / hg_cost.max(1e-9))
+            format!(
+                "${hourly:.0}/hr ({:.0} m-NCU) ⇒ {:.0}×",
+                mncu,
+                hourly / hg_cost.max(1e-9)
+            )
         };
         let topo = match plan.topology {
             Topology::SingleInMemory => "SINGLE".to_string(),
@@ -79,7 +94,13 @@ fn main() {
             Topology::Replicated { nodes } => format!("REPL×{nodes}"),
             Topology::Distributed { shards } => format!("DIST k={shards}"),
         };
-        println!("{:>8} {:>18} {:>9.2}  {:>25}", human(m), topo, hg_cost, neptune_str);
+        println!(
+            "{:>8} {:>18} {:>9.2}  {:>25}",
+            human(m),
+            topo,
+            hg_cost,
+            neptune_str
+        );
     }
     println!("\n  hg = ephemeral spot (512GB nodes), 120s spin-up + setup + compute, torn down; needs distributed");
     println!("       generation (#12) so no node ever holds the whole graph. hg $/run is PROJECTED at 10B+.");
@@ -90,7 +111,9 @@ fn main() {
     println!("       cluster prices, vs our cheap spot. At 100B the race is hg-cheap vs cuGraph-expensive; Neptune is OUT.");
 
     println!("\nThe receipt (MEASURED, not marketing):");
-    println!("  hellgraph ran 1,073,741,824 edges / 67M nodes, distributed boundary-halo PageRank,");
+    println!(
+        "  hellgraph ran 1,073,741,824 edges / 67M nodes, distributed boundary-halo PageRank,"
+    );
     println!("  BIT-EXACT (max|Δ| 1.86e-14 vs single-graph) on 8× t2a-standard-4 spot nodes, then TORE DOWN.");
     println!("  Neptune Analytics: 'tens of billions of connections in seconds' — no published GTEPS, no receipt.\n");
     println!("Honest scoreboard:");
