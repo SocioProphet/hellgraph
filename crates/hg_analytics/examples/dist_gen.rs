@@ -221,11 +221,13 @@ fn run_worker(coord_addr: &str, id: usize) {
     //    property; routing (source→its owner) lets each worker count only its OWNED out-degree — O(n/k),
     //    NOT a dense O(n) vector on every worker (which would be 25 GB/worker at 100B). No node holds O(n).
     let _ = n; // n only used for the (verify-scale) sanity; no dense O(n) allocation here anymore
-    let mut buckets: Vec<Vec<(u32, u32)>> = vec![Vec::new(); k];
-    let mut src_buckets: Vec<Vec<u32>> = vec![Vec::new(); k];
+    // GLOBAL vertex ids are u64: at 100B edges n≈6.25B > u32's 4.29B, so u32 would silently TRUNCATE ids.
+    // (Local per-shard indices stay u32 — a shard holds < 2³² vertices — see the in-CSR build below.)
+    let mut buckets: Vec<Vec<(u64, u64)>> = vec![Vec::new(); k];
+    let mut src_buckets: Vec<Vec<u64>> = vec![Vec::new(); k];
     for (u, v) in Kronecker::slice(scale, seed, start, count) {
-        buckets[owner_of(v, &bounds)].push((u as u32, v as u32));
-        src_buckets[owner_of(u, &bounds)].push(u as u32);
+        buckets[owner_of(v, &bounds)].push((u as u64, v as u64));
+        src_buckets[owner_of(u, &bounds)].push(u as u64);
     }
 
     // 3. ALL-TO-ALL shuffle. Mesh: connect to higher ids, accept from lower ids (id announced first).
@@ -265,14 +267,14 @@ fn run_worker(coord_addr: &str, id: usize) {
         writers.push(std::thread::spawn(move || {
             // Section 1: edges targeting d. Section 2: source-occurrences owned by d (for d's out-degree).
             write_robust(&mut wr, &(b.len() as u64).to_le_bytes());
-            let mut payload = Vec::with_capacity(b.len() * 8);
+            let mut payload = Vec::with_capacity(b.len() * 16);
             for &(u, v) in &b {
-                payload.extend_from_slice(&u.to_le_bytes());
-                payload.extend_from_slice(&v.to_le_bytes());
+                payload.extend_from_slice(&u.to_le_bytes()); // u64 = 8 B
+                payload.extend_from_slice(&v.to_le_bytes()); // u64 = 8 B → 16 B/edge
             }
             write_robust(&mut wr, &payload);
             write_robust(&mut wr, &(sb.len() as u64).to_le_bytes());
-            write_robust(&mut wr, bytemuck::cast_slice(&sb));
+            write_robust(&mut wr, bytemuck::cast_slice(&sb)); // Vec<u64> = 8 B each
         }));
     }
     let mut rx = Vec::new();
@@ -284,9 +286,9 @@ fn run_worker(coord_addr: &str, id: usize) {
         let (tx, r) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let ecnt = rd_u64(&read_vec(&mut rd, 8).unwrap(), &mut 0) as usize;
-            let ebody = read_vec(&mut rd, ecnt * 8).unwrap();
+            let ebody = read_vec(&mut rd, ecnt * 16).unwrap(); // 16 B/edge (two u64)
             let scnt = rd_u64(&read_vec(&mut rd, 8).unwrap(), &mut 0) as usize;
-            let sbody = read_vec(&mut rd, scnt * 4).unwrap();
+            let sbody = read_vec(&mut rd, scnt * 8).unwrap(); // 8 B/source (u64)
             tx.send((ebody, sbody)).ok();
         });
         rx.push(r);
@@ -297,20 +299,20 @@ fn run_worker(coord_addr: &str, id: usize) {
     let owned = hi - lo;
     // My in-edges = my self-bucket + received edges. My owned out-degree = my owned source-occurrences
     // (self + received), counted into an O(owned) vector.
-    let mut in_edges: Vec<(u32, u32)> = std::mem::take(&mut buckets[id]);
+    let mut in_edges: Vec<(u64, u64)> = std::mem::take(&mut buckets[id]);
     let mut owned_outdeg = vec![0u32; owned];
     for &s in &src_buckets[id] {
         owned_outdeg[s as usize - lo] += 1;
     }
     for r in rx {
         let (ebody, sbody) = r.recv().unwrap();
-        for ch in ebody.chunks_exact(8) {
-            let u = u32::from_le_bytes(ch[0..4].try_into().unwrap());
-            let v = u32::from_le_bytes(ch[4..8].try_into().unwrap());
+        for ch in ebody.chunks_exact(16) {
+            let u = u64::from_le_bytes(ch[0..8].try_into().unwrap());
+            let v = u64::from_le_bytes(ch[8..16].try_into().unwrap());
             in_edges.push((u, v));
         }
-        for ch in sbody.chunks_exact(4) {
-            owned_outdeg[u32::from_le_bytes(ch.try_into().unwrap()) as usize - lo] += 1;
+        for ch in sbody.chunks_exact(8) {
+            owned_outdeg[u64::from_le_bytes(ch.try_into().unwrap()) as usize - lo] += 1;
         }
     }
     for w in writers {
@@ -358,9 +360,10 @@ fn run_worker(coord_addr: &str, id: usize) {
     //    O(boundary) on it). Phase 1: request each owner d the ghosts I need. Phase 2: reply each requester
     //    with the out-degrees of what it asked → I learn my send_local AND my ghosts' out-degrees.
     let g = ghosts.len();
-    let mut req: Vec<Vec<u32>> = vec![Vec::new(); k];
+    // Global ghost ids are u64 (100B-safe); the local send indices they map to stay u32 (< owned).
+    let mut req: Vec<Vec<u64>> = vec![Vec::new(); k];
     for &gg in &ghosts {
-        req[owner_of(gg, &bounds)].push(gg as u32); // ghosts sorted ⇒ req[d] sorted
+        req[owner_of(gg, &bounds)].push(gg as u64); // ghosts sorted ⇒ req[d] sorted
     }
     let req_from = all_to_all(
         &peers,
@@ -371,8 +374,8 @@ fn run_worker(coord_addr: &str, id: usize) {
     // send_local[e] = my owned local indices of what e requested (in the order e sent it).
     let mut send_local: Vec<Vec<u32>> = vec![Vec::new(); k];
     for e in 0..k {
-        for ch in req_from[e].chunks_exact(4) {
-            send_local[e].push(u32::from_le_bytes(ch.try_into().unwrap()) - lo as u32);
+        for ch in req_from[e].chunks_exact(8) {
+            send_local[e].push((u64::from_le_bytes(ch.try_into().unwrap()) - lo as u64) as u32);
         }
     }
     let reply: Vec<Vec<u8>> = (0..k)
@@ -559,7 +562,7 @@ fn run_worker(coord_addr: &str, id: usize) {
     }
 }
 
-fn fnv1a(edges: &[(u32, u32)]) -> u64 {
+fn fnv1a(edges: &[(u64, u64)]) -> u64 {
     let mut h = 0xcbf29ce484222325u64;
     for &(u, v) in edges {
         for b in u.to_le_bytes().iter().chain(v.to_le_bytes().iter()) {
@@ -659,10 +662,10 @@ fn run_coordinator(listen: &str, k: usize, spawn: bool) {
     println!("  distributed gen+shuffle+route: {dt:.2?}");
     if verify {
         assert_eq!(total_edges, m as u64, "distributed shuffle lost/duplicated edges");
-        let mut central: Vec<Vec<(u32, u32)>> = vec![Vec::new(); k];
+        let mut central: Vec<Vec<(u64, u64)>> = vec![Vec::new(); k];
         let mut central_outdeg = vec![0u32; n];
         for (u, v) in Kronecker::new(scale, ef, seed) {
-            central[owner_of(v, &bounds)].push((u as u32, v as u32));
+            central[owner_of(v, &bounds)].push((u as u64, v as u64));
             central_outdeg[u] += 1;
         }
         let mut ok = true;
