@@ -130,28 +130,39 @@ pub struct PreparedGraph {
     in_nbr: Vec<u32>,   // m in-neighbour sources, in edge order
     out_deg: Vec<u32>,  // n out-degrees (static topology)
     dangling: Vec<u32>, // indices with out_deg==0, precomputed (static set)
+    out_off: Vec<u32>,  // n+1 out-CSR row pointers (for forward-push personalized PR)
+    out_nbr: Vec<u32>,  // m out-neighbour targets, in edge order
 }
 
 impl PreparedGraph {
-    /// Build the flat in-CSR + out-degrees + dangling list ONCE. O(m), serial (memory-bandwidth-bound).
+    /// Build the flat in-CSR + out-CSR + out-degrees + dangling list ONCE. O(m), serial (mem-BW-bound).
+    /// The in-CSR drives global PageRank (pull); the out-CSR drives forward-push personalized PR.
     pub fn build(n: usize, edges: &[(usize, usize)]) -> Self {
         let mut out_deg = vec![0u32; n];
         let mut off = vec![0u32; n + 1];
+        let mut out_off = vec![0u32; n + 1];
         for &(u, v) in edges {
             if u < n && v < n {
                 off[v + 1] += 1;
+                out_off[u + 1] += 1;
             }
         }
         for v in 0..n {
             off[v + 1] += off[v];
+            out_off[v + 1] += out_off[v];
         }
         let mut cursor = off.clone();
-        let mut in_nbr = vec![0u32; off.get(n).copied().unwrap_or(0) as usize];
+        let mut out_cursor = out_off.clone();
+        let m = off.get(n).copied().unwrap_or(0) as usize;
+        let mut in_nbr = vec![0u32; m];
+        let mut out_nbr = vec![0u32; m];
         for &(u, v) in edges {
             if u < n && v < n {
                 out_deg[u] += 1;
                 in_nbr[cursor[v] as usize] = u as u32;
                 cursor[v] += 1;
+                out_nbr[out_cursor[u] as usize] = v as u32;
+                out_cursor[u] += 1;
             }
         }
         let dangling = (0..n as u32)
@@ -163,6 +174,8 @@ impl PreparedGraph {
             in_nbr,
             out_deg,
             dangling,
+            out_off,
+            out_nbr,
         }
     }
 
@@ -194,6 +207,121 @@ impl PreparedGraph {
         self.run(&seed, damping, max_iters, tol)
     }
 
+    /// Personalized (rooted) PageRank via Andersen–Chung–Lang FORWARD PUSH — the local-query lever. Instead
+    /// of iterating the whole graph, it pushes probability mass out from `seeds` and stops touching a node
+    /// once its residual falls below `eps·outdeg`. For a LOCAL query the active set stays small, so the work
+    /// (`pushes`) is ~independent of graph size — sublinear, not O(m·iters). This is the 5–10× (often ≫) that
+    /// global power iteration can't reach, and it's the "why is THIS node ranked here" product query. Returns
+    /// `(ppr, pushes)`; `ppr` sums to ≈1, deterministic (FIFO work queue, fixed order).
+    pub fn pagerank_personalized(
+        &self,
+        seeds: &[usize],
+        damping: f64,
+        eps: f64,
+    ) -> (Vec<f64>, usize) {
+        let n = self.n;
+        if n == 0 || seeds.is_empty() {
+            return (vec![0.0; n], 0);
+        }
+        let alpha = 1.0 - damping; // teleport (restart) probability
+        let mut p = vec![0.0f64; n]; // PPR estimate
+        let mut r = vec![0.0f64; n]; // residual (unpushed mass)
+        let mut queued = vec![false; n];
+        let mut queue: std::collections::VecDeque<u32> = std::collections::VecDeque::new();
+        let seed_mass = 1.0 / seeds.len() as f64;
+        for &s in seeds {
+            if s < n {
+                r[s] += seed_mass;
+                if !queued[s] {
+                    queued[s] = true;
+                    queue.push_back(s as u32);
+                }
+            }
+        }
+        let mut pushes = 0usize;
+        // Push while any active node has residual above the eps·outdeg threshold (FIFO → deterministic).
+        while let Some(u) = queue.pop_front() {
+            let u = u as usize;
+            queued[u] = false;
+            let ru = r[u];
+            let du = self.out_deg[u];
+            if du == 0 {
+                // Dangling: mass can't flow forward. Absorb the teleport share into the estimate and return
+                // the rest to the seeds (standard restart), keeping total mass conserved.
+                p[u] += alpha * ru;
+                r[u] = 0.0;
+                let back = (1.0 - alpha) * ru * seed_mass;
+                for &s in seeds {
+                    if s < n {
+                        r[s] += back;
+                        if !queued[s] && r[s] > eps * self.out_deg[s].max(1) as f64 {
+                            queued[s] = true;
+                            queue.push_back(s as u32);
+                        }
+                    }
+                }
+                continue;
+            }
+            if ru <= eps * du as f64 {
+                continue; // below threshold — leave the residual, stop pushing (the sublinearity)
+            }
+            p[u] += alpha * ru;
+            let mass = (1.0 - alpha) * ru / du as f64;
+            r[u] = 0.0;
+            for &v in &self.out_nbr[self.out_off[u] as usize..self.out_off[u + 1] as usize] {
+                let v = v as usize;
+                r[v] += mass;
+                pushes += 1;
+                if !queued[v] && r[v] > eps * self.out_deg[v].max(1) as f64 {
+                    queued[v] = true;
+                    queue.push_back(v as u32);
+                }
+            }
+        }
+        (p, pushes)
+    }
+
+    /// PageRank with an f32 CONTRIB gather — the memory-bandwidth lever. The pull is bound by the RANDOM
+    /// gather of `contrib[u]`; storing contrib as f32 (4 B) instead of f64 (8 B) halves that random traffic
+    /// (the same trade the GPU makes). `rank` and the accumulator stay f64, so only the per-vertex contrib
+    /// is rounded → the result matches the f64 fixed point to ~f32 tolerance (not bit-exact). Use when you
+    /// want throughput over the last bits (ranking is unaffected); use `pagerank` for the bit-exact answer.
+    pub fn pagerank_f32(&self, damping: f64, max_iters: usize, tol: f64) -> Vec<f64> {
+        let n = self.n;
+        if n == 0 {
+            return Vec::new();
+        }
+        let base = (1.0 - damping) / n as f64;
+        let mut rank = vec![1.0 / n as f64; n];
+        let mut contrib = vec![0.0f32; n]; // f32 storage → 4 B random gather instead of 8 B
+        for _ in 0..max_iters {
+            let dangling = det_par_sum(self.dangling.len(), |i| rank[self.dangling[i] as usize]);
+            let add = base + damping * dangling / n as f64;
+            contrib
+                .par_iter_mut()
+                .zip(&rank)
+                .zip(&self.out_deg)
+                .for_each(|((c, &r), &d)| *c = if d == 0 { 0.0 } else { (r / d as f64) as f32 });
+            let next: Vec<f64> = (0..n)
+                .into_par_iter()
+                .map(|v| {
+                    // Gather f32 contribs, accumulate in f64 (accuracy where it's cheap — in registers).
+                    let mut acc = 0.0f64;
+                    for &u in &self.in_nbr[self.off[v] as usize..self.off[v + 1] as usize] {
+                        acc += contrib[u as usize] as f64;
+                    }
+                    add + damping * acc
+                })
+                .collect();
+            let diff = det_par_sum(n, |i| (next[i] - rank[i]).abs());
+            rank = next;
+            if diff < tol {
+                break;
+            }
+        }
+        rank
+    }
+
     /// The iteration loop shared by every entry point: fused-contrib parallel pull + deterministic parallel
     /// reductions. Identical fixed point (to tolerance) as serial `pagerank`; deterministic run-to-run.
     fn run(&self, seed: &[f64], damping: f64, max_iters: usize, tol: f64) -> Vec<f64> {
@@ -202,37 +330,39 @@ impl PreparedGraph {
             return Vec::new();
         }
         let base = (1.0 - damping) / n as f64;
-        let mut rank = seed.to_vec();
+        // PING-PONG two PREALLOCATED buffers instead of `.collect()`-ing a fresh `next` Vec every iteration
+        // (that was an n·8 B alloc+free per sweep — pure waste at low iteration counts). `cur` reads, `nxt`
+        // is written in place via par_iter_mut, then swap.
+        let mut cur = seed.to_vec();
+        let mut nxt = vec![0.0f64; n];
         let mut contrib = vec![0.0f64; n];
         for _ in 0..max_iters {
             // Dangling mass: deterministic fixed-chunk parallel sum over the precomputed list.
-            let dangling = det_par_sum(self.dangling.len(), |i| rank[self.dangling[i] as usize]);
+            let dangling = det_par_sum(self.dangling.len(), |i| cur[self.dangling[i] as usize]);
             let add = base + damping * dangling / n as f64;
-            // FUSED per-vertex contribution contrib[u]=rank[u]/out_deg[u]: n divides not m≈16n, and the
-            // pull's inner loop becomes a SINGLE gather. A dangling u never appears as a source (contrib 0).
+            // FUSED per-vertex contribution contrib[u]=cur[u]/out_deg[u]: n divides not m≈16n, and the pull's
+            // inner loop becomes a SINGLE gather. A dangling u never appears as a source (contrib 0).
             contrib
                 .par_iter_mut()
-                .zip(&rank)
+                .zip(&cur)
                 .zip(&self.out_deg)
                 .for_each(|((c, &r), &d)| *c = if d == 0 { 0.0 } else { r / d as f64 });
-            let next: Vec<f64> = (0..n)
-                .into_par_iter()
-                .map(|v| {
-                    let mut acc = 0.0;
-                    for &u in &self.in_nbr[self.off[v] as usize..self.off[v + 1] as usize] {
-                        acc += contrib[u as usize];
-                    }
-                    add + damping * acc
-                })
-                .collect();
+            // Write the pull result straight into the reused `nxt` buffer (no allocation).
+            nxt.par_iter_mut().enumerate().for_each(|(v, slot)| {
+                let mut acc = 0.0;
+                for &u in &self.in_nbr[self.off[v] as usize..self.off[v + 1] as usize] {
+                    acc += contrib[u as usize];
+                }
+                *slot = add + damping * acc;
+            });
             // Convergence residual: deterministic fixed-chunk parallel sum (gates the stop test only).
-            let diff = det_par_sum(n, |i| (next[i] - rank[i]).abs());
-            rank = next;
+            let diff = det_par_sum(n, |i| (nxt[i] - cur[i]).abs());
+            std::mem::swap(&mut cur, &mut nxt);
             if diff < tol {
                 break;
             }
         }
-        rank
+        cur
     }
 }
 
@@ -969,6 +1099,71 @@ mod tests {
             pushes < power_work,
             "residual ({pushes}) not < power iteration ({power_work})"
         );
+    }
+
+    #[test]
+    fn personalized_push_matches_power_iteration_and_conserves_mass() {
+        use crate::{Kronecker, PreparedGraph};
+        // Build an RMAT graph, then add a self-out for any dangling node so every vertex has out-degree ≥1
+        // (keeps the power-iteration reference clean — no dangling redistribution to reconcile).
+        let n = Kronecker::vertices(11);
+        let mut edges: Vec<(usize, usize)> = Kronecker::new(11, 8, 0x9A).collect();
+        let mut outdeg = vec![0u32; n];
+        for &(u, _v) in &edges {
+            outdeg[u] += 1;
+        }
+        for u in 0..n {
+            if outdeg[u] == 0 {
+                edges.push((u, u));
+            }
+        }
+        let g = PreparedGraph::build(n, &edges);
+        let damping = 0.85;
+        let alpha = 1.0 - damping;
+        let seeds = [7usize];
+
+        let (p, pushes) = g.pagerank_personalized(&seeds, damping, 1e-9);
+
+        // (1) Mass conservation is exact: α accumulates into p, (1−α) recirculates in r → Σp + Σr ≡ 1,
+        //     so Σp ≤ 1 and (1 − Σp) is the untouched residual. Σp must be close to 1 at small eps.
+        let sp: f64 = p.iter().sum();
+        assert!(sp > 0.99 && sp <= 1.0 + 1e-9, "PPR mass Σp={sp} not ≈1");
+
+        // (2) Matches the power-iteration personalized PR (teleport to the seed), within push tolerance.
+        //     ref[v] = α·s[v] + (1−α)·Σ_{u→v} ref[u]/outdeg[u].  (No dangling by construction.)
+        let mut out_adj: Vec<Vec<usize>> = vec![Vec::new(); n];
+        let mut od = vec![0u32; n];
+        for &(u, v) in &edges {
+            out_adj[u].push(v);
+            od[u] += 1;
+        }
+        let mut piv = vec![0.0f64; n];
+        piv[seeds[0]] = 1.0;
+        for _ in 0..2000 {
+            let mut next = vec![0.0f64; n];
+            next[seeds[0]] += alpha;
+            for u in 0..n {
+                if od[u] > 0 {
+                    let share = (1.0 - alpha) * piv[u] / od[u] as f64;
+                    for &v in &out_adj[u] {
+                        next[v] += share;
+                    }
+                }
+            }
+            piv = next;
+        }
+        let maxd = p
+            .iter()
+            .zip(&piv)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0, f64::max);
+        assert!(
+            maxd < 1e-3,
+            "push PPR diverged from power-iteration PPR: max|Δ| {maxd:e}"
+        );
+        assert!(pushes > 0);
+        // Deterministic run-to-run.
+        assert_eq!(p, g.pagerank_personalized(&seeds, damping, 1e-9).0);
     }
 
     #[test]
