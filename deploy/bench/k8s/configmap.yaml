@@ -28,7 +28,9 @@ data:
   #   dist_gen           = 100B–1T NO-CAP path: distributed generation + all-to-all shuffle → NO node ever
   #                        holds O(m) OR O(n); coordinator is O(k). Verified bit-exact; use for 100B+.
   # HG_RUNTIME: "dist_gen"
-  # HG_ACCEL: "5"   # Anderson acceleration window — ~2× fewer supersteps (both runtimes). Unset = power iteration.
+  # HG_ACCEL: "5"     # Anderson acceleration window — ~2× fewer supersteps (both runtimes). Unset = power iteration.
+  # HG_F32_HALO: "1"  # send ghost values as f32 (4B) not f64 — ½ the recurring halo wire. STACKS with Anderson
+  #                   # (verified: max|Δ| ~1e-12) unlike delta-halo → Anderson×f32 = ~4× less halo network.
   # HG_VERIFY: "0"  # REQUIRED for large dist_gen runs: verify=on makes the coordinator regenerate the whole
   #                 # graph + hold O(n) to cross-check (fine at small scale, defeats the no-cap at 100B). At
   #                 # billion+ set 0 → coordinator holds O(k) and checks Σrank≈1 (mass conservation) instead.
