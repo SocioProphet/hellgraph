@@ -28,7 +28,7 @@ pub use cc::{
     connected_components, distributed_connected_components, partition_undirected, CcShard,
 };
 pub use graph500::Kronecker;
-// pagerank_accel + pagerank_residual are defined below in this module; no re-export needed.
+// pagerank_accel + pagerank_residual + PreparedGraph are defined below in this module; no re-export needed.
 pub use ooc::{pagerank_mmap, write_csr, write_csr_bucketed, write_csr_streaming, MmapCsr};
 pub use partitioner::{balance, edge_cut, fennel_partition, ldg_partition, relabel_contiguous};
 
@@ -118,12 +118,130 @@ fn pagerank_from(
     rank
 }
 
-/// Parallel (rayon) PageRank — the multi-core scale-out of `pagerank`. Pull-based: each node's next
-/// rank is computed independently from its IN-neighbours, so the O(E) work parallelises with no write
-/// contention. The O(n) dangling + convergence reductions are ALSO parallel, via a deterministic
-/// fixed-chunk sum (`det_par_sum`) — the same reduction model `betweenness_parallel` uses — so the
-/// result is identical run-to-run on any core count (matching the serial `pagerank` fixed point to
-/// float tolerance). This is the leg that turns "Rust is faster" from a claim into a number.
+/// A graph with its in-neighbour CSR built ONCE, so many PageRanks (warm-start, personalized, different
+/// damping) reuse it for free. This matters because construction is NOT negligible: with Anderson cutting
+/// convergence to ~13 sweeps, the CSR build measured ~50% of a full CPU run — so amortising it across
+/// repeated recomputes (the refresh framework's incremental use) beats any per-pass micro-optimisation.
+/// The build is serial on purpose (a parallel histogram build was measured *slower* — each chunk's full-n
+/// histogram repeats the random-write pattern, so k chunks do ~k× the random-write traffic).
+pub struct PreparedGraph {
+    n: usize,
+    off: Vec<u32>,      // n+1 in-CSR row pointers
+    in_nbr: Vec<u32>,   // m in-neighbour sources, in edge order
+    out_deg: Vec<u32>,  // n out-degrees (static topology)
+    dangling: Vec<u32>, // indices with out_deg==0, precomputed (static set)
+}
+
+impl PreparedGraph {
+    /// Build the flat in-CSR + out-degrees + dangling list ONCE. O(m), serial (memory-bandwidth-bound).
+    pub fn build(n: usize, edges: &[(usize, usize)]) -> Self {
+        let mut out_deg = vec![0u32; n];
+        let mut off = vec![0u32; n + 1];
+        for &(u, v) in edges {
+            if u < n && v < n {
+                off[v + 1] += 1;
+            }
+        }
+        for v in 0..n {
+            off[v + 1] += off[v];
+        }
+        let mut cursor = off.clone();
+        let mut in_nbr = vec![0u32; off.get(n).copied().unwrap_or(0) as usize];
+        for &(u, v) in edges {
+            if u < n && v < n {
+                out_deg[u] += 1;
+                in_nbr[cursor[v] as usize] = u as u32;
+                cursor[v] += 1;
+            }
+        }
+        let dangling = (0..n as u32)
+            .filter(|&u| out_deg[u as usize] == 0)
+            .collect();
+        PreparedGraph {
+            n,
+            off,
+            in_nbr,
+            out_deg,
+            dangling,
+        }
+    }
+
+    /// PageRank from the uniform 1/n seed. Reuses the prepared CSR — no rebuild.
+    pub fn pagerank(&self, damping: f64, max_iters: usize, tol: f64) -> Vec<f64> {
+        self.run(
+            &vec![1.0 / self.n.max(1) as f64; self.n],
+            damping,
+            max_iters,
+            tol,
+        )
+    }
+
+    /// Warm-start PageRank from `prior` (e.g. the previous result after a small graph delta) — converges in
+    /// a handful of sweeps to the SAME fixed point, on the ALREADY-BUILT CSR. This is the incremental hook
+    /// the refresh framework wants: after a delta, rebuild the CSR once and warm-run repeatedly, near-free.
+    pub fn pagerank_warm(
+        &self,
+        damping: f64,
+        max_iters: usize,
+        tol: f64,
+        prior: &[f64],
+    ) -> Vec<f64> {
+        let seed = if prior.len() == self.n {
+            prior.to_vec()
+        } else {
+            vec![1.0 / self.n.max(1) as f64; self.n]
+        };
+        self.run(&seed, damping, max_iters, tol)
+    }
+
+    /// The iteration loop shared by every entry point: fused-contrib parallel pull + deterministic parallel
+    /// reductions. Identical fixed point (to tolerance) as serial `pagerank`; deterministic run-to-run.
+    fn run(&self, seed: &[f64], damping: f64, max_iters: usize, tol: f64) -> Vec<f64> {
+        let n = self.n;
+        if n == 0 {
+            return Vec::new();
+        }
+        let base = (1.0 - damping) / n as f64;
+        let mut rank = seed.to_vec();
+        let mut contrib = vec![0.0f64; n];
+        for _ in 0..max_iters {
+            // Dangling mass: deterministic fixed-chunk parallel sum over the precomputed list.
+            let dangling = det_par_sum(self.dangling.len(), |i| rank[self.dangling[i] as usize]);
+            let add = base + damping * dangling / n as f64;
+            // FUSED per-vertex contribution contrib[u]=rank[u]/out_deg[u]: n divides not m≈16n, and the
+            // pull's inner loop becomes a SINGLE gather. A dangling u never appears as a source (contrib 0).
+            contrib
+                .par_iter_mut()
+                .zip(&rank)
+                .zip(&self.out_deg)
+                .for_each(|((c, &r), &d)| *c = if d == 0 { 0.0 } else { r / d as f64 });
+            let next: Vec<f64> = (0..n)
+                .into_par_iter()
+                .map(|v| {
+                    let mut acc = 0.0;
+                    for &u in &self.in_nbr[self.off[v] as usize..self.off[v + 1] as usize] {
+                        acc += contrib[u as usize];
+                    }
+                    add + damping * acc
+                })
+                .collect();
+            // Convergence residual: deterministic fixed-chunk parallel sum (gates the stop test only).
+            let diff = det_par_sum(n, |i| (next[i] - rank[i]).abs());
+            rank = next;
+            if diff < tol {
+                break;
+            }
+        }
+        rank
+    }
+}
+
+/// Parallel (rayon) PageRank — the multi-core scale-out of `pagerank`. Pull-based: each node's next rank is
+/// computed independently from its IN-neighbours, so the O(E) work parallelises with no write contention;
+/// the O(n) dangling + convergence reductions are also parallel via a deterministic fixed-chunk sum
+/// (`det_par_sum`, the model `betweenness_parallel` uses). Result identical run-to-run on any core count,
+/// matching serial `pagerank` to float tolerance. Convenience wrapper = build the CSR + one run; when you
+/// recompute repeatedly on the same graph, hold a `PreparedGraph` instead and skip the ~50% build cost.
 pub fn pagerank_parallel(
     n: usize,
     edges: &[(usize, usize)],
@@ -131,77 +249,7 @@ pub fn pagerank_parallel(
     max_iters: usize,
     tol: f64,
 ) -> Vec<f64> {
-    if n == 0 {
-        return Vec::new();
-    }
-    // FLAT CSR + u32 (not Vec<Vec<usize>>): the in-neighbours live in ONE contiguous array indexed by a
-    // per-vertex offset — sequential, cache-friendly, half the id width. Same insertion order as the old
-    // adjacency, so the result is bit-identical; it's just the layout that stops thrashing the cache.
-    let mut out_deg = vec![0u32; n];
-    let mut off = vec![0u32; n + 1];
-    for &(u, v) in edges {
-        if u < n && v < n {
-            off[v + 1] += 1;
-        }
-    }
-    for v in 0..n {
-        off[v + 1] += off[v];
-    }
-    let mut cursor = off.clone();
-    let mut in_nbr = vec![0u32; off[n] as usize];
-    for &(u, v) in edges {
-        if u < n && v < n {
-            out_deg[u] += 1;
-            in_nbr[cursor[v] as usize] = u as u32;
-            cursor[v] += 1;
-        }
-    }
-    // The dangling SET is static (out_deg never changes) but is ~half the vertices on RMAT — so scanning
-    // all n each iteration to re-find them is wasted. Precompute the index list ONCE; the per-iter cost
-    // becomes O(#dangling) over exactly those nodes, not O(n) with a branch.
-    let dangling_idx: Vec<u32> = (0..n as u32)
-        .filter(|&u| out_deg[u as usize] == 0)
-        .collect();
-    let base = (1.0 - damping) / n as f64;
-    let mut rank = vec![1.0 / n as f64; n];
-    let mut contrib = vec![0.0f64; n];
-    for _ in 0..max_iters {
-        // Dangling mass: deterministic fixed-chunk parallel sum over the precomputed list (same reduction
-        // model as betweenness_parallel — fixed chunk count, partials combined in chunk order → identical
-        // run-to-run on any core count). Was a serial O(n) scan; measured ~25% of the kernel.
-        let dangling = det_par_sum(dangling_idx.len(), |i| rank[dangling_idx[i] as usize]);
-        let add = base + damping * dangling / n as f64;
-        // FUSED per-vertex contribution: contrib[u] = rank[u]/out_deg[u], computed ONCE per vertex (n
-        // divides), not once per edge (m ≈ 16n divides) — and it collapses the pull's inner loop to a
-        // SINGLE gather `contrib[u]` instead of gathering rank[u] AND out_deg[u] then dividing. Same value
-        // and same summation order as before → bit-identical result; it just does 16× fewer divides and
-        // half the random gather (the memory-bound path). A dangling u never appears as a source, so its
-        // contrib is unused.
-        contrib
-            .par_iter_mut()
-            .zip(&rank)
-            .zip(&out_deg)
-            .for_each(|((c, &r), &d)| *c = if d == 0 { 0.0 } else { r / d as f64 });
-        // Parallel pull over the O(E) work: next[v] = add + damping·Σ_{u→v} contrib[u].
-        let next: Vec<f64> = (0..n)
-            .into_par_iter()
-            .map(|v| {
-                let mut acc = 0.0;
-                for &u in &in_nbr[off[v] as usize..off[v + 1] as usize] {
-                    acc += contrib[u as usize];
-                }
-                add + damping * acc
-            })
-            .collect();
-        // Convergence residual: deterministic fixed-chunk parallel sum (was serial O(n)). Only gates the
-        // stop test, so the rank values are unaffected; determinism is preserved by the fixed reduction.
-        let diff = det_par_sum(n, |i| (next[i] - rank[i]).abs());
-        rank = next;
-        if diff < tol {
-            break;
-        }
-    }
-    rank
+    PreparedGraph::build(n, edges).pagerank(damping, max_iters, tol)
 }
 
 /// Deterministic parallel sum of `f(0..len)`: a FIXED number of contiguous chunks are each summed serially
@@ -920,6 +968,36 @@ mod tests {
         assert!(
             pushes < power_work,
             "residual ({pushes}) not < power iteration ({power_work})"
+        );
+    }
+
+    #[test]
+    fn prepared_graph_reuse_matches_fresh_and_warm_starts() {
+        use crate::{Kronecker, PreparedGraph};
+        let n = Kronecker::vertices(12);
+        let edges: Vec<(usize, usize)> = Kronecker::new(12, 16, 0x9E1).collect();
+
+        // Build ONCE, run MANY: each reuse must equal the build-every-call convenience wrapper.
+        let g = PreparedGraph::build(n, &edges);
+        for &(dp, it) in &[(0.85, 100usize), (0.5, 100), (0.9, 100)] {
+            let reuse = g.pagerank(dp, it, 1e-12);
+            let fresh = pagerank_parallel(n, &edges, dp, it, 1e-12);
+            assert_eq!(
+                reuse, fresh,
+                "prepared reuse diverged from fresh build at damping {dp}"
+            );
+        }
+        // Warm-start on the prepared CSR converges to the same fixed point as a cold run.
+        let cold = g.pagerank(0.85, 200, 1e-12);
+        let warm = g.pagerank_warm(0.85, 200, 1e-12, &cold);
+        let maxd = cold
+            .iter()
+            .zip(&warm)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0, f64::max);
+        assert!(
+            maxd < 1e-9,
+            "warm-start on prepared graph diverged: {maxd:e}"
         );
     }
 

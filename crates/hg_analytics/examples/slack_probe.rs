@@ -4,7 +4,7 @@
 //!   3. Anderson window sweep: is 2× the ceiling, or does a bigger window do better?
 //!   4. Serial-reduction tax: how much of pagerank_parallel is the SERIAL diff+dangling O(n) scans?
 
-use hg_analytics::{pagerank, pagerank_accel, Kronecker};
+use hg_analytics::{pagerank, pagerank_accel, pagerank_parallel, Kronecker, PreparedGraph};
 use std::time::Instant;
 
 const D: f64 = 0.85;
@@ -114,5 +114,50 @@ fn main() {
     println!(
         "  at billion (n=67M) that's ~{:.0}ms/superstep of PURE SERIAL work × supersteps",
         serial_s / iters as f64 * 1000.0 * (67e6 / n as f64)
+    );
+
+    // ── 5: CSR build cost — the surprise: at Anderson's low sweep count, CONSTRUCTION dominates ───────
+    // (A parallel histogram build was tried and MEASURED slower — k chunks do ~k× the random-write
+    //  traffic. The real win is amortisation: build the CSR once, reuse it across warm/personalized runs.)
+    println!("\nCSR build cost (isolated via pagerank_parallel with 0 iterations):");
+    let mut build = f64::MAX;
+    for _ in 0..3 {
+        let t = Instant::now();
+        let r = pagerank_parallel(n, &edges, D, 0, -1.0);
+        build = build.min(t.elapsed().as_secs_f64());
+        std::hint::black_box(r);
+    }
+    let t = Instant::now();
+    let r = pagerank_parallel(n, &edges, D, 40, -1.0);
+    let full40 = t.elapsed().as_secs_f64();
+    std::hint::black_box(r);
+    let per_pass = (full40 - build) / 40.0;
+    println!(
+        "  build {:.1}ms, one O(E) pass {:.1}ms",
+        build * 1000.0,
+        per_pass * 1000.0
+    );
+    println!(
+        "  ⇒ build is ~{:.0}% of a 13-sweep (Anderson) run — so build-once-run-many removes a larger\n     fraction than any per-pass micro-opt at low iteration counts.",
+        build / (build + 13.0 * per_pass) * 100.0
+    );
+
+    // PROVE it: 3 cold pageranks (rebuild each) vs PreparedGraph::build once + 3 reuses.
+    let g = PreparedGraph::build(n, &edges);
+    let t = Instant::now();
+    for dp in [0.85, 0.5, 0.9] {
+        std::hint::black_box(g.pagerank(dp, 13, 1e-30));
+    }
+    let reuse3 = t.elapsed().as_secs_f64();
+    let t = Instant::now();
+    for dp in [0.85, 0.5, 0.9] {
+        std::hint::black_box(pagerank_parallel(n, &edges, dp, 13, 1e-30));
+    }
+    let cold3 = t.elapsed().as_secs_f64();
+    println!(
+        "  3 recomputes: cold (rebuild each) {:.0}ms  →  PreparedGraph build-once+reuse {:.0}ms  =  {:.2}× faster",
+        cold3 * 1000.0,
+        reuse3 * 1000.0,
+        cold3 / reuse3
     );
 }
