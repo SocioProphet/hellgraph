@@ -3,10 +3,14 @@
 //! edges per vertex. Standard RMAT quadrant probabilities A=0.57, B=0.19, C=0.19, D=0.05.
 //! Deterministic (seeded splitmix64). Feeds straight into the CSR builders as a re-iterable stream.
 
+/// splitmix64's additive constant. The state is a PURE additive counter (`state += GOLDEN` each split),
+/// which is exactly what makes the stream O(1)-seekable: the state after `k` splits is `seed + k·GOLDEN`.
+const GOLDEN: u64 = 0x9e3779b97f4a7c15;
+
 /// splitmix64 step → uniform f64 in [0,1). Deterministic, fast, well-distributed.
 #[inline]
 fn split_next(state: &mut u64) -> f64 {
-    *state = state.wrapping_add(0x9e3779b97f4a7c15);
+    *state = state.wrapping_add(GOLDEN);
     let mut z = *state;
     z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
@@ -30,6 +34,20 @@ impl Kronecker {
             remaining: edgefactor * (1usize << scale),
         }
     }
+    /// O(1) seek to a SLICE of the same deterministic stream: yields EXACTLY the edges the full stream
+    /// (`new(scale, _, seed)`) produces at positions `[start, start+count)`. Each edge consumes `scale`
+    /// splits, so we jump the additive state forward by `start·scale` splits in constant time. This is the
+    /// primitive that lets every worker generate ONLY its own edge range — no coordinator, no shared state,
+    /// no single node ever holding the whole graph.
+    pub fn slice(scale: u32, seed: u64, start: usize, count: usize) -> Self {
+        let splits = (start as u64).wrapping_mul(scale as u64);
+        Kronecker {
+            state: seed.wrapping_add(splits.wrapping_mul(GOLDEN)),
+            scale,
+            remaining: count,
+        }
+    }
+
     /// Vertex count for a scale (= 2^scale).
     pub fn vertices(scale: u32) -> usize {
         1usize << scale
@@ -67,5 +85,31 @@ impl Iterator for Kronecker {
             // else A: top-left — no bits set
         }
         Some((u as usize, v as usize))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Kronecker;
+
+    #[test]
+    fn slice_matches_the_full_stream_exactly() {
+        let scale = 12u32;
+        let ef = 8usize;
+        let seed = 0xA11CE;
+        let full: Vec<(usize, usize)> = Kronecker::new(scale, ef, seed).collect();
+        let m = full.len();
+
+        // Split the stream into k contiguous slices generated independently — the concatenation must be
+        // bit-identical to the full stream (this is the distributed-generation invariant).
+        for k in [1usize, 3, 8, 7] {
+            let mut rebuilt: Vec<(usize, usize)> = Vec::with_capacity(m);
+            for c in 0..k {
+                let start = c * m / k;
+                let end = (c + 1) * m / k;
+                rebuilt.extend(Kronecker::slice(scale, seed, start, end - start));
+            }
+            assert_eq!(rebuilt, full, "k={k}: sliced generation diverged from the full stream");
+        }
     }
 }
