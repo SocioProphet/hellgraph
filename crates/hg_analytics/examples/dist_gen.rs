@@ -110,14 +110,15 @@ fn run_worker(coord_addr: &str, id: usize) {
     let m = Kronecker::edges(scale, ef);
     let start = id * m / k;
     let count = (id + 1) * m / k - start;
-    // 2. Bucket by target-owner. Also accumulate a per-SOURCE out-degree partial: each edge (u,v) is one of
-    //    u's out-edges. Out-degree is a source property but edges shuffle by TARGET, so out_deg can't be
-    //    counted from the received in-edges — we count it here (over the generated slice) and reduce it.
+    // 2. Bucket edges by TARGET-owner AND source-occurrences by SOURCE-owner. Out-degree is a source
+    //    property; routing (source→its owner) lets each worker count only its OWNED out-degree — O(n/k),
+    //    NOT a dense O(n) vector on every worker (which would be 25 GB/worker at 100B). No node holds O(n).
+    let _ = n; // n only used for the (verify-scale) sanity; no dense O(n) allocation here anymore
     let mut buckets: Vec<Vec<(u32, u32)>> = vec![Vec::new(); k];
-    let mut out_deg_partial = vec![0u32; n];
+    let mut src_buckets: Vec<Vec<u32>> = vec![Vec::new(); k];
     for (u, v) in Kronecker::slice(scale, seed, start, count) {
-        out_deg_partial[u] += 1;
         buckets[owner_of(v, &bounds)].push((u as u32, v as u32));
+        src_buckets[owner_of(u, &bounds)].push(u as u32);
     }
 
     // 3. ALL-TO-ALL shuffle. Mesh: connect to higher ids, accept from lower ids (id announced first).
@@ -153,7 +154,9 @@ fn run_worker(coord_addr: &str, id: usize) {
         }
         let mut wr = peers[d].as_ref().unwrap().try_clone().unwrap();
         let b = std::mem::take(&mut buckets[d]);
+        let sb = std::mem::take(&mut src_buckets[d]);
         writers.push(std::thread::spawn(move || {
+            // Section 1: edges targeting d. Section 2: source-occurrences owned by d (for d's out-degree).
             wr.write_all(&(b.len() as u64).to_le_bytes()).unwrap();
             let mut payload = Vec::with_capacity(b.len() * 8);
             for &(u, v) in &b {
@@ -161,6 +164,8 @@ fn run_worker(coord_addr: &str, id: usize) {
                 payload.extend_from_slice(&v.to_le_bytes());
             }
             wr.write_all(&payload).unwrap();
+            wr.write_all(&(sb.len() as u64).to_le_bytes()).unwrap();
+            wr.write_all(bytemuck::cast_slice(&sb)).unwrap();
         }));
     }
     let mut rx = Vec::new();
@@ -171,29 +176,39 @@ fn run_worker(coord_addr: &str, id: usize) {
         let mut rd = peers[d].as_ref().unwrap().try_clone().unwrap();
         let (tx, r) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let cnt = rd_u64(&read_vec(&mut rd, 8).unwrap(), &mut 0) as usize;
-            let body = read_vec(&mut rd, cnt * 8).unwrap();
-            tx.send(body).ok();
+            let ecnt = rd_u64(&read_vec(&mut rd, 8).unwrap(), &mut 0) as usize;
+            let ebody = read_vec(&mut rd, ecnt * 8).unwrap();
+            let scnt = rd_u64(&read_vec(&mut rd, 8).unwrap(), &mut 0) as usize;
+            let sbody = read_vec(&mut rd, scnt * 4).unwrap();
+            tx.send((ebody, sbody)).ok();
         });
         rx.push(r);
     }
-    // My in-edges = my own self-bucket + everything received targeting my range.
+
+    // 4. Local shard: owned range, ghost discovery, in-CSR, and OWNED out-degree (all O(n/k), no dense O(n)).
+    let (lo, hi) = (bounds[id], bounds[id + 1]);
+    let owned = hi - lo;
+    // My in-edges = my self-bucket + received edges. My owned out-degree = my owned source-occurrences
+    // (self + received), counted into an O(owned) vector.
     let mut in_edges: Vec<(u32, u32)> = std::mem::take(&mut buckets[id]);
+    let mut owned_outdeg = vec![0u32; owned];
+    for &s in &src_buckets[id] {
+        owned_outdeg[s as usize - lo] += 1;
+    }
     for r in rx {
-        let body = r.recv().unwrap();
-        for ch in body.chunks_exact(8) {
+        let (ebody, sbody) = r.recv().unwrap();
+        for ch in ebody.chunks_exact(8) {
             let u = u32::from_le_bytes(ch[0..4].try_into().unwrap());
             let v = u32::from_le_bytes(ch[4..8].try_into().unwrap());
             in_edges.push((u, v));
+        }
+        for ch in sbody.chunks_exact(4) {
+            owned_outdeg[u32::from_le_bytes(ch.try_into().unwrap()) as usize - lo] += 1;
         }
     }
     for w in writers {
         w.join().unwrap();
     }
-
-    // 4. Local shard: owned range, ghost discovery, and the local in-CSR for the BSP PageRank.
-    let (lo, hi) = (bounds[id], bounds[id + 1]);
-    let owned = hi - lo;
     let mut ghost_set: BTreeSet<usize> = BTreeSet::new();
     for &(u, _v) in &in_edges {
         if (u as usize) < lo || (u as usize) >= hi {
@@ -237,9 +252,8 @@ fn run_worker(coord_addr: &str, id: usize) {
     ctrl.write_all(&(ghosts.len() as u64).to_le_bytes())
         .unwrap();
     ctrl.write_all(&fp.to_le_bytes()).unwrap();
-    // Out-degree partial (n u32) for the GLOBAL reduce (O(n), not O(m)) + my ghost ids for the routing build.
-    ctrl.write_all(bytemuck::cast_slice(&out_deg_partial))
-        .unwrap();
+    // My OWNED out-degree (owned u32 = O(n/k), computed distributively — no dense O(n)) + my ghost ids.
+    ctrl.write_all(bytemuck::cast_slice(&owned_outdeg)).unwrap();
     let ghost_u32: Vec<u32> = ghosts.iter().map(|&g| g as u32).collect();
     ctrl.write_all(bytemuck::cast_slice(&ghost_u32)).unwrap();
 
@@ -446,9 +460,12 @@ fn run_coordinator(listen: &str, k: usize, spawn: bool) {
         let gc = rd_u64(&read_vec(s, 8).unwrap(), &mut 0) as usize;
         total_ghosts += gc as u64;
         fps[c] = rd_u64(&read_vec(s, 8).unwrap(), &mut 0);
-        let raw = read_vec(s, n * 4).unwrap();
-        for (v, ch) in raw.chunks_exact(4).enumerate() {
-            out_deg[v] += u32::from_le_bytes(ch.try_into().unwrap());
+        // Worker sends its OWNED out-degree range (owned = O(n/k)); place it into the global vector. Each
+        // owned range is exclusive to one worker, so this is a placement, not a sum.
+        let owned_c = bounds[c + 1] - bounds[c];
+        let raw = read_vec(s, owned_c * 4).unwrap();
+        for (i, ch) in raw.chunks_exact(4).enumerate() {
+            out_deg[bounds[c] + i] = u32::from_le_bytes(ch.try_into().unwrap());
         }
         ghost_ids[c] = read_vec(s, gc * 4)
             .unwrap()
