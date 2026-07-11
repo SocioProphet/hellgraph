@@ -22,7 +22,7 @@
 //! Run locally: `cargo run -p hg_analytics --release --example dist_boundary`
 
 use hg_analytics::{
-    fennel_partition, pagerank, partition_edges_boundary_at, relabel_contiguous, Kronecker,
+    fennel_partition, pagerank_parallel, partition_edges_boundary_at, relabel_contiguous, Kronecker,
 };
 use std::collections::BTreeSet;
 use std::io::{Read, Write};
@@ -30,6 +30,15 @@ use std::net::{TcpListener, TcpStream};
 use std::time::Instant;
 
 const D: f64 = 0.85;
+
+/// Enable TCP keepalive so a connection that sits idle through the (possibly minutes-long) setup phase
+/// isn't silently reaped by the cluster's connection tracking. Probes after 30s idle, every 10s.
+fn keepalive(s: &TcpStream) {
+    let ka = socket2::TcpKeepalive::new()
+        .with_time(std::time::Duration::from_secs(30))
+        .with_interval(std::time::Duration::from_secs(10));
+    let _ = socket2::SockRef::from(s).set_tcp_keepalive(&ka);
+}
 
 fn env_usize(key: &str, default: usize) -> usize {
     std::env::var(key)
@@ -76,17 +85,18 @@ fn main() {
 // ── Worker: receives its shard over the socket (local CSR + local out-degrees + which owned nodes to
 //    report up), keeps its owned ranks across supersteps, exchanges only the boundary each step.
 fn run_worker(addr: &str, ordinal: usize) {
-    // Retry the connect: on a cluster the coordinator pod may not be listening yet (k8s does not order
-    // pod startup). Back off up to ~60s before giving up.
+    // Retry the connect generously: on a cluster the coordinator may still be generating + partitioning
+    // (minutes for a large graph) before it accepts. Back off up to ~20 min so workers never die during
+    // setup and leave stale half-open connections behind.
     let mut sock = {
         let mut attempt = 0;
         loop {
             match TcpStream::connect(addr) {
                 Ok(s) => break s,
-                Err(e) if attempt < 60 => {
+                Err(e) if attempt < 1200 => {
                     attempt += 1;
                     std::thread::sleep(std::time::Duration::from_millis(1000));
-                    if attempt % 10 == 0 {
+                    if attempt % 15 == 0 {
                         eprintln!("worker {ordinal}: waiting for coordinator {addr} ({e})");
                     }
                 }
@@ -95,6 +105,7 @@ fn run_worker(addr: &str, ordinal: usize) {
         }
     };
     sock.set_nodelay(true).ok();
+    keepalive(&sock); // survive the long idle while the coordinator generates + partitions
     sock.write_all(&(ordinal as u64).to_le_bytes()).unwrap(); // hello: which shard I am
 
     // Receive setup: [1/n : f64][shard_len : u64][shard bytes].
@@ -177,6 +188,26 @@ fn run_coordinator(listen: &str, shards_n: usize, spawn: bool) {
     let scale = env_usize("HG_SCALE", 18) as u32;
     let edgefactor = env_usize("HG_EDGEFACTOR", 16);
     let iters = env_usize("HG_ITERS", 25);
+
+    // Bind the listener FIRST — before the (slow) graph generation + partition — so workers can connect
+    // immediately and queue in the accept backlog instead of exhausting their connect-retry during setup.
+    let listener = TcpListener::bind(listen).unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let mut kids: Vec<std::process::Child> = Vec::new();
+    if spawn {
+        let exe = std::env::current_exe().unwrap();
+        kids = (0..shards_n)
+            .map(|idx| {
+                std::process::Command::new(&exe)
+                    .args(["worker", &addr, &idx.to_string()])
+                    .spawn()
+                    .unwrap()
+            })
+            .collect();
+    } else {
+        println!("  listener bound on {listen}; generating + partitioning, then accepting {shards_n} workers ...");
+    }
+
     let n = Kronecker::vertices(scale);
     let edges: Vec<(usize, usize)> = Kronecker::new(scale, edgefactor, 0xB0A7).collect();
     let m = edges.len();
@@ -203,29 +234,29 @@ fn run_coordinator(listen: &str, shards_n: usize, spawn: bool) {
         .map(|sh| build_book(sh, &out_deg, &bpos))
         .collect();
 
-    let listener = TcpListener::bind(listen).unwrap();
-    let addr = listener.local_addr().unwrap().to_string();
-    let mut kids: Vec<std::process::Child> = Vec::new();
-    if spawn {
-        let exe = std::env::current_exe().unwrap();
-        kids = (0..shards_n)
-            .map(|idx| {
-                std::process::Command::new(&exe)
-                    .args(["worker", &addr, &idx.to_string()])
-                    .spawn()
-                    .unwrap()
-            })
-            .collect();
-    } else {
-        println!("  waiting for {shards_n} workers to connect on {listen} ...");
-    }
-
-    // Accept, identify by hello ordinal, ship [1/n][shard_len][shard bytes] to each.
+    // Accept until every shard slot is filled by a DISTINCT ordinal — robust to stray, duplicate, or
+    // reconnecting workers (a hello for an already-filled slot is dropped, not fatal). Ship each worker
+    // [1/n][shard_len][shard bytes].
     let mut conns: Vec<Option<TcpStream>> = (0..shards_n).map(|_| None).collect();
-    for _ in 0..shards_n {
-        let (mut s, _) = listener.accept().unwrap();
+    while conns.iter().any(|c| c.is_none()) {
+        let mut s = match listener.accept() {
+            Ok((s, _)) => s,
+            Err(_) => continue,
+        };
         s.set_nodelay(true).ok();
-        let id = u64::from_le_bytes(read_vec(&mut s, 8).unwrap().try_into().unwrap()) as usize;
+        keepalive(&s);
+        // Bounded read for the hello: a STALE half-open connection (a worker that already died) never
+        // sends and would otherwise block/timeout the whole run — skip it fast instead of panicking.
+        s.set_read_timeout(Some(std::time::Duration::from_secs(20))).ok();
+        let hello = match read_vec(&mut s, 8) {
+            Ok(b) => b,
+            Err(_) => continue, // dead/slow/partial → drop this connection
+        };
+        let id = u64::from_le_bytes(hello.try_into().unwrap()) as usize;
+        if id >= shards_n || conns[id].is_some() {
+            continue; // out-of-range or duplicate ordinal → drop
+        }
+        s.set_read_timeout(None).ok(); // clear the timeout for the steady-state run
         s.write_all(&(1.0 / n as f64).to_le_bytes()).unwrap();
         s.write_all(&(books[id].shard.len() as u64).to_le_bytes())
             .unwrap();
@@ -280,7 +311,9 @@ fn run_coordinator(listen: &str, shards_n: usize, spawn: bool) {
         k.wait().ok();
     }
 
-    let single = pagerank(n, &remapped, D, iters, -1.0);
+    // Verify with the PARALLEL single-graph PageRank — uses all coordinator cores (a serial pass over a
+    // billion edges would take minutes on one core). Same fixed point, so the exactness check is unchanged.
+    let single = pagerank_parallel(n, &remapped, D, iters, -1.0);
     let maxdiff = single
         .iter()
         .zip(&rank)

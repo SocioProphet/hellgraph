@@ -8,3 +8,8 @@ hg_core = { path = "../hg_core" }
 rayon = "1.10"
 memmap2 = "0.9"
 bytemuck = "1"
+
+[dev-dependencies]
+# TCP keepalive for the distributed examples: keeps sockets alive through long idle periods (setup) so a
+# quiet connection isn't reaped by the cluster's conntrack. std::net::TcpStream can't set this itself.
+socket2 = "0.5"

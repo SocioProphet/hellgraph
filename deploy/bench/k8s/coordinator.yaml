@@ -20,12 +20,26 @@ metadata:
   labels: { app: hg-bench, role: coordinator }
 spec:
   backoffLimit: 0            # a benchmark run is not idempotent; do not silently retry
+  activeDeadlineSeconds: 3600   # fail LOUD after an hour, never hang the cluster (and its bill) forever
   ttlSecondsAfterFinished: 3600
   template:
     metadata:
       labels: { app: hg-bench, role: coordinator }
     spec:
       restartPolicy: Never
+      # Land on the big coordinator node pool (it holds the whole graph during setup), and tolerate both
+      # the arm64 taint and the coord-pool taint.
+      nodeSelector:
+        cloud.google.com/gke-nodepool: coord
+      tolerations:
+        - key: kubernetes.io/arch
+          operator: Equal
+          value: arm64
+          effect: NoSchedule
+        - key: role
+          operator: Equal
+          value: coordinator
+          effect: NoSchedule
       containers:
         - name: coordinator
           image: IMAGE_PLACEHOLDER          # set by run.sh (registry/hellgraph-bench:tag)
@@ -37,5 +51,5 @@ spec:
           ports:
             - containerPort: 9000
           resources:
-            requests: { cpu: "2", memory: "8Gi" }
-            limits:   { cpu: "4", memory: "16Gi" }
+            requests: { cpu: "8", memory: "100Gi" }   # holds the whole graph during setup
+            limits:   { cpu: "46", memory: "180Gi" }
