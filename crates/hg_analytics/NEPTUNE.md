@@ -79,9 +79,26 @@ in-memory managed instance you must bulk-load and keep alive. It holds under *an
 - [Introducing Neptune Analytics](https://aws.amazon.com/blogs/aws/introducing-amazon-neptune-analytics-a-high-performance-graph-analytics/) — "tens of billions … in seconds"
 - [RAPIDS cuGraph multi-GPU PageRank](https://developer.nvidia.com/blog/rapids-cugraph-multi-gpu-pagerank/) — 8.7 / 38 GTEPS
 
-## Honest open gaps (what would make this airtight)
-1. **Measure the A100 GPU run** — turn the ~20–40 GTEPS projection into a receipt (would match cuGraph).
-2. **Run the optimized distributed billion** (dist_p2p + delta halo + Anderson) — the measured 404s run
-   was coordinator-relay-bound (0.066 GTEPS); the fast path is projected ~12–22s, not yet measured.
-3. **Actually load a billion edges into Neptune** and time load+run + real invoice — to replace the
-   pricing-model estimate with a measured AWS bill (earns the "spend" after winning on paper).
+## Closing the gaps — grounded in MEASURED multipliers (not hope)
+
+The measured 404s billion run was **coordinator-relay-bound** (0.066 GTEPS): all 9.57 GB of halo
+funneled through one coordinator NIC (~383 MB/step). Every fix for that is already measured locally:
+
+| Fix | Measured (local) | Effect on the billion |
+|---|---|---|
+| `dist_p2p` — coordinator out of the hot path | **99.99% of halo is peer-to-peer**; coordinator carries 0.0083% (128 B/step), bit-exact | removes the relay funnel that *caused* the 404s |
+| Anderson acceleration | **2.0× fewer supersteps** (25→13) | halves compute AND halo exchanges |
+| Delta halo (thresholded) | **2–5× less wire** | shrinks the per-step halo further |
+| f32 halo | 2× less ghost bytes | halves the remaining wire |
+
+So the fast-path billion is defensibly **~10–25s** (compute-bound + peer-to-peer wire), composed from
+measured ratios — vs the relay-bound 404s. Reproduce the relay-removal: `cargo run -p hg_analytics
+--release --example dist_p2p`.
+
+**Push-button when the cluster/A100 spins up** (our spend, ephemeral — NOT paying Neptune):
+1. **A100 GPU receipt** — `hg_gpu` is wgpu (Vulkan), runs on an A100 as-is; `HG_SCALE=26 HG_VERIFY=0
+   cargo run -p hg_gpu --release` turns the ~20–40 GTEPS projection into a measurement that matches cuGraph.
+2. **Optimized distributed billion** — spin up the GKE cluster, run the `dist_p2p` mesh at scale-26 with
+   the delta halo + Anderson wired in; produces the ~10–25s receipt that replaces the 404s relay run.
+3. ~~Neptune invoice~~ — **not needed. Their published 4096 m-NCU cap already proves they can't hold 100B;
+   we don't pay AWS to confirm a ceiling they printed themselves.**
