@@ -13,15 +13,20 @@ COPY crates ./crates
 # Build both distributed runtimes: dist_boundary (coordinator-relay, the MVP default) and dist_p2p (pure
 # peer-to-peer mesh, the >tens-of-nodes path — needs each worker to advertise its pod IP via HG_ADVERTISE,
 # e.g. the Downward API POD_IP). Both pull hg_analytics + hg_core.
-RUN cargo build --release -p hg_analytics --example dist_boundary --example dist_p2p \
+# dist_gen is the NO-CAP path: distributed generation + all-to-all shuffle → NO node ever holds O(m) OR
+# O(n), coordinator is O(k). This is the runtime for 100B–1T (where dist_p2p's coordinator-materialization
+# and O(n) structures don't fit any node). Needs HG_ADVERTISE=podIP for the mesh, same as dist_p2p.
+RUN cargo build --release -p hg_analytics --example dist_boundary --example dist_p2p --example dist_gen \
   && cp target/release/examples/dist_boundary /usr/local/bin/dist_boundary \
-  && cp target/release/examples/dist_p2p /usr/local/bin/dist_p2p
+  && cp target/release/examples/dist_p2p /usr/local/bin/dist_p2p \
+  && cp target/release/examples/dist_gen /usr/local/bin/dist_gen
 
 # ---- runtime ----
 FROM debian:bookworm-slim AS runtime
 RUN useradd -r -u 10002 -m hg
 COPY --from=build /usr/local/bin/dist_boundary /usr/local/bin/dist_boundary
 COPY --from=build /usr/local/bin/dist_p2p /usr/local/bin/dist_p2p
+COPY --from=build /usr/local/bin/dist_gen /usr/local/bin/dist_gen
 USER hg
 # Coordinator listens here; workers connect to it. Overridable via HG_LISTEN / HG_COORD.
 # Default = the FAST PATH: dist_p2p (coordinator-free peer-to-peer halo). This is what removes the relay

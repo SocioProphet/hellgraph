@@ -22,3 +22,13 @@ data:
   # save wire — f64 ranks keep wiggling; the saving needs eps>0). Measured local proof: `cargo run --example
   # dist_p2p` with/without HG_DELTA_EPS.
   # HG_DELTA_EPS: "1e-9"
+  # HG_RUNTIME: which distributed runtime the pods exec.
+  #   dist_p2p (default) = billion fast path: coordinator-free P2P halo; coordinator materializes the graph
+  #                        once (needs a big-RAM coordinator node), then O(k) recurring.
+  #   dist_gen           = 100B–1T NO-CAP path: distributed generation + all-to-all shuffle → NO node ever
+  #                        holds O(m) OR O(n); coordinator is O(k). Verified bit-exact; use for 100B+.
+  # HG_RUNTIME: "dist_gen"
+  # HG_ACCEL: "5"   # Anderson acceleration window — ~2× fewer supersteps (both runtimes). Unset = power iteration.
+  # HG_VERIFY: "0"  # REQUIRED for large dist_gen runs: verify=on makes the coordinator regenerate the whole
+  #                 # graph + hold O(n) to cross-check (fine at small scale, defeats the no-cap at 100B). At
+  #                 # billion+ set 0 → coordinator holds O(k) and checks Σrank≈1 (mass conservation) instead.

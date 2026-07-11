@@ -40,8 +40,9 @@ spec:
         - name: coordinator
           image: IMAGE_PLACEHOLDER          # set by run.sh (registry/hellgraph-bench:tag)
           imagePullPolicy: Always           # always pull the pushed tag; never a stale cached image
-          command: ["/usr/local/bin/dist_p2p"]  # FAST PATH: coordinator-free P2P halo (kills the relay that
-                                                # made the 404s billion; coordinator carries O(k), not O(boundary))
+          # Runtime picked from HG_RUNTIME (configmap): dist_p2p = billion fast path (coordinator-free halo);
+          # dist_gen = 100B–1T no-cap path (distributed gen + shuffle, no node holds O(m) or O(n)).
+          command: ["/bin/sh", "-c", "exec /usr/local/bin/${HG_RUNTIME:-dist_p2p}"]
           env:
             - { name: HG_ROLE, value: coordinator }
             - { name: HG_LISTEN, value: "0.0.0.0:9000" }
