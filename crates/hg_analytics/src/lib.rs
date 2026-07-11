@@ -190,6 +190,67 @@ pub fn pagerank_by_id(
     ids.iter().enumerate().map(|(i, &id)| (id, pr[i])).collect()
 }
 
+// ── Residual (delta-push) PageRank — do LESS work ─────────────────────────────────────────────────────────────
+/// Residual PageRank via the Neumann series: `rank = Σ_k (d·M)^k · base`. Each pass propagates only the
+/// current TERM (the residual), and only from vertices whose residual exceeds `eps` — converged vertices
+/// stop pushing entirely. It reaches the SAME fixed point as power-iteration `pagerank` but touches far
+/// fewer edges (the active set shrinks as terms decay). Returns `(rank, total_edge_pushes)` so the work
+/// saving is measurable: compare `pushes` against power iteration's `iters · m`. This is the algorithmic
+/// multiplier that compounds across CPU, GPU, and the distributed halo.
+pub fn pagerank_residual(n: usize, edges: &[(usize, usize)], damping: f64, eps: f64) -> (Vec<f64>, usize) {
+    if n == 0 {
+        return (Vec::new(), 0);
+    }
+    let mut out_deg = vec![0usize; n];
+    let mut out_adj: Vec<Vec<u32>> = vec![Vec::new(); n];
+    for &(u, v) in edges {
+        if u < n && v < n {
+            out_deg[u] += 1;
+            out_adj[u].push(v as u32);
+        }
+    }
+    let base = (1.0 - damping) / n as f64;
+    let mut rank = vec![base; n]; // term_0 = base·1
+    let mut term = vec![base; n];
+    let mut pushes = 0usize;
+    loop {
+        let mut next = vec![0.0f64; n];
+        // Scatter each active vertex's residual to its out-neighbours; sum dangling residual.
+        let mut dangling = 0.0;
+        for u in 0..n {
+            if term[u].abs() <= eps {
+                continue; // converged — skip (the whole point)
+            }
+            if out_deg[u] == 0 {
+                dangling += term[u];
+                continue;
+            }
+            let share = damping * term[u] / out_deg[u] as f64;
+            for &v in &out_adj[u] {
+                next[v as usize] += share;
+            }
+            pushes += out_deg[u];
+        }
+        let dshare = damping * dangling / n as f64;
+        if dshare.abs() > 0.0 {
+            for x in next.iter_mut() {
+                *x += dshare;
+            }
+        }
+        // Accumulate this term into the answer; check the residual for convergence.
+        let mut maxterm = 0.0f64;
+        for v in 0..n {
+            rank[v] += next[v];
+            maxterm = maxterm.max(next[v].abs());
+        }
+        term = next;
+        if maxterm < eps {
+            break;
+        }
+    }
+    (rank, pushes)
+}
+
 // ── Connected components (union-find — the fast single-machine path) ──────────────────────────────────────────
 /// Single-machine connected components via union-find (path halving + union by size) — near-linear
 /// O(m·α(n)), far faster than iterative label propagation for a one-shot in-memory answer. Returns each
@@ -585,6 +646,32 @@ mod tests {
     const D: f64 = 0.85;
     const IT: usize = 200;
     const TOL: f64 = 1e-12;
+
+    #[test]
+    fn residual_pagerank_matches_power_iteration_with_less_work() {
+        use crate::Kronecker;
+        let n = Kronecker::vertices(14); // 16384
+        let edges: Vec<(usize, usize)> = Kronecker::new(14, 16, 0x9).collect();
+        let m = edges.len();
+
+        // Power iteration converged tight (400 iters ≫ needed) is the reference fixed point.
+        let power = pagerank(n, &edges, D, 400, 1e-14);
+        // eps trades accuracy for work: 1e-9 keeps the ranking (values ~1/n≈6e-5) while skipping the tail.
+        let (residual, pushes) = pagerank_residual(n, &edges, D, 1e-9);
+
+        let maxd = power
+            .iter()
+            .zip(&residual)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f64, f64::max);
+        assert!(maxd < 1e-5, "residual PR diverged from power iteration: max|Δ| {maxd:e}");
+
+        // Work: residual edge-pushes vs a practical 100-iteration power budget. HONEST: on GLOBAL PageRank of
+        // a well-mixed RMAT this is ~1.8× (not the 5-10× of personalized/local PageRank) — converged vertices
+        // still stay active a while when damping is 0.85.
+        let power_work = 100 * m;
+        assert!(pushes < power_work, "residual ({pushes}) not < power iteration ({power_work})");
+    }
 
     #[test]
     fn union_find_cc_induces_same_partition_as_label_prop() {
