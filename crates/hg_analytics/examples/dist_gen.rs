@@ -553,15 +553,16 @@ fn run_coordinator(listen: &str, k: usize, spawn: bool) {
             s.write_all(bytemuck::cast_slice(&rg)).unwrap();
         }
     }
-    // Per-step SCALAR dangling all-reduce (the only recurring coordinator traffic).
-    let mut add = seed_add;
+    // Per-step SCALAR dangling all-reduce (the only recurring coordinator traffic). seed_add went to the
+    // workers above; the coordinator recomputes `add` from the reduced dangling mass each step.
+    let _ = seed_add;
     let t2 = Instant::now();
     for _ in 0..iters {
         let mut dangling = 0.0f64;
         for s in conns.iter_mut().flatten() {
             dangling += f64::from_le_bytes(read_vec(s, 8).unwrap().try_into().unwrap());
         }
-        add = base + D * dangling / n as f64;
+        let add = base + D * dangling / n as f64;
         for s in conns.iter_mut().flatten() {
             s.write_all(&add.to_le_bytes()).unwrap();
         }
