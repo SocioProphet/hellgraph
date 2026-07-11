@@ -4,7 +4,10 @@
 //!
 //!   cargo run -p hg_analytics --release --example slack_bench   # HG_SCALE (default 20)
 
-use hg_analytics::{pagerank, pagerank_accel, pagerank_parallel, Kronecker};
+use hg_analytics::{
+    distributed_pagerank_boundary, distributed_pagerank_boundary_delta, pagerank, pagerank_accel,
+    pagerank_parallel, partition_edges_boundary, Kronecker,
+};
 use std::time::Instant;
 
 const D: f64 = 0.85;
@@ -53,7 +56,24 @@ fn main() {
         m as f64 * 40.0 / dt / 1e9
     );
 
-    // ── Combined: Anderson sweep-count × fused kernel = the compounded CPU win ───────────────────────
+    // ── Lever 3: Residual/delta halo — dense vs delta wire on the distributed path ───────────────────
+    println!("\nResidual/delta halo (8 shards, dense f64 ghost vs sparse (id,val) deltas):");
+    let k = 8usize;
+    let (shards, out_deg) = partition_edges_boundary(n, &edges, k);
+    let exact = distributed_pagerank_boundary(n, &shards, &out_deg, D, 200, 1e-10);
+    for &eps in &[0.0, 1e-12, 1e-10, 1e-8] {
+        let (r, s) = distributed_pagerank_boundary_delta(n, &shards, &out_deg, D, 200, 1e-10, eps);
+        let err = r.iter().zip(&exact).map(|(a, b)| (a - b).abs()).fold(0.0, f64::max);
+        let ratio = s.dense_bytes as f64 / s.delta_bytes.max(1) as f64;
+        println!(
+            "  eps={eps:>7.0e}: dense {:>5.1}MB  delta {:>5.1}MB  =  {ratio:>4.2}× less wire   (max|Δ| vs exact {err:.1e}, {} supersteps)",
+            s.dense_bytes as f64 / 1e6,
+            s.delta_bytes as f64 / 1e6,
+            s.supersteps
+        );
+    }
+
+    // ── Compounded: Anderson sweeps × delta halo = the distributed billion's real headroom ───────────
     println!("\nCompounded (Anderson w=5 to 1e-8, fused kernel):");
     let t = Instant::now();
     let (_r, sw) = pagerank_accel(n, &edges, D, 2000, 1e-8, 5);

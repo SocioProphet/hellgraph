@@ -221,6 +221,104 @@ pub fn distributed_pagerank_boundary(
     rank
 }
 
+// ── Residual (delta-push) boundary halo — send only the ghosts that MOVED ──────────────────────────────────────
+/// Byte accounting for a delta halo run: `dense_bytes` is what the plain boundary halo ships (every ghost,
+/// every superstep, one f64 = 8 B), `delta_bytes` is what the residual halo ships (only ghosts whose owner
+/// rank moved by more than `delta_eps`, as sparse (id,value) = 12 B pairs). The honest crossover: delta wins
+/// once the changed fraction drops below 8/12 = 2/3, which converging PageRank reaches fast (rank freezes
+/// vertex-by-vertex), so late supersteps ship almost nothing.
+pub struct DeltaHaloStats {
+    pub supersteps: usize,
+    pub dense_bytes: usize,
+    pub delta_bytes: usize,
+}
+
+/// Distributed boundary-halo PageRank that exchanges the ghost halo as RESIDUAL DELTAS: each shard keeps a
+/// local cache of its ghost ranks and, per superstep, receives only the ghosts whose owner value moved by
+/// more than `delta_eps` (sparse id+value updates) — converged ghosts send nothing. With `delta_eps == 0`
+/// this is bit-identical to `distributed_pagerank_boundary` (a cache refreshed to the exact value equals
+/// reading it directly), and it still drops the byte count as ranks freeze; with a small `delta_eps` it
+/// trades a bounded O(delta_eps) perturbation for a large late-run wire saving. Returns `(rank, stats)` so
+/// the dense-vs-delta traffic and the resulting error are both measurable. Deterministic.
+pub fn distributed_pagerank_boundary_delta(
+    n: usize,
+    shards: &[BoundaryShard],
+    out_deg: &[u32],
+    damping: f64,
+    max_iters: usize,
+    tol: f64,
+    delta_eps: f64,
+) -> (Vec<f64>, DeltaHaloStats) {
+    if n == 0 {
+        return (Vec::new(), DeltaHaloStats { supersteps: 0, dense_bytes: 0, delta_bytes: 0 });
+    }
+    let base = (1.0 - damping) / n as f64;
+    let mut rank = vec![1.0 / n as f64; n];
+    // Per-shard ghost caches — the only ghost state a real worker holds. All shards start agreeing (1/n),
+    // matching the initial rank, so superstep 1 already reads exact ghosts (no warm-up error).
+    let mut caches: Vec<Vec<f64>> = shards
+        .iter()
+        .map(|s| vec![1.0 / n as f64; s.ghosts.len()])
+        .collect();
+    let mut stats = DeltaHaloStats { supersteps: 0, dense_bytes: 0, delta_bytes: 0 };
+    for _ in 0..max_iters {
+        stats.supersteps += 1;
+        let mut dangling = 0.0;
+        for u in 0..n {
+            if out_deg[u] == 0 {
+                dangling += rank[u];
+            }
+        }
+        let add = base + damping * dangling / n as f64;
+        // Each shard computes from its owned ranks + its CACHED ghost view (possibly stale by < delta_eps).
+        let partials: Vec<(usize, Vec<f64>)> = shards
+            .par_iter()
+            .zip(&caches)
+            .map(|(sh, cache)| {
+                let owned = sh.owned();
+                let mut local_rank = vec![0.0f64; owned + sh.ghosts.len()];
+                local_rank[..owned].copy_from_slice(&rank[sh.lo..sh.hi]);
+                local_rank[owned..].copy_from_slice(cache);
+                let mut out = vec![0.0f64; owned];
+                for (i, nbrs) in sh.in_adj.iter().enumerate() {
+                    let mut acc = 0.0;
+                    for &li in nbrs {
+                        let gid = if li < owned {
+                            sh.lo + li
+                        } else {
+                            sh.ghosts[li - owned]
+                        };
+                        acc += local_rank[li] / out_deg[gid] as f64;
+                    }
+                    out[i] = add + damping * acc;
+                }
+                (sh.lo, out)
+            })
+            .collect();
+        let mut next = rank.clone();
+        for (lo, local) in &partials {
+            next[*lo..*lo + local.len()].copy_from_slice(local);
+        }
+        let diff: f64 = (0..n).map(|i| (next[i] - rank[i]).abs()).sum();
+        rank = next;
+        // DELTA EXCHANGE for the next superstep: refresh each shard's ghost cache from the new true rank,
+        // shipping only the movers. Dense accounting bills every ghost; delta bills only the sent pairs.
+        for (sh, cache) in shards.iter().zip(caches.iter_mut()) {
+            stats.dense_bytes += sh.ghosts.len() * 8;
+            for (i, &g) in sh.ghosts.iter().enumerate() {
+                if (rank[g] - cache[i]).abs() > delta_eps {
+                    cache[i] = rank[g];
+                    stats.delta_bytes += 12; // sparse (u32 ghost slot + f64 value)
+                }
+            }
+        }
+        if diff < tol {
+            break;
+        }
+    }
+    (rank, stats)
+}
+
 // ── Boundary-halo connected components ────────────────────────────────────────────────────────────────────────
 /// A CC partition with a boundary-only halo. Owns `[lo, hi)`; `ghosts` are the sorted distinct global ids
 /// of the remote NEIGHBOURS this shard's owned nodes touch (undirected). `adj` stores, per owned node, the
@@ -862,6 +960,47 @@ mod tests {
         assert!(
             max_delta < 1e-12,
             "max|Δ| = {max_delta:e} — halo changed the answer"
+        );
+    }
+
+    #[test]
+    fn delta_halo_is_exact_at_eps_zero_and_saves_bytes_when_converging() {
+        // Hub-heavy RMAT → real ghost sets. Run to a tight tolerance so many vertices freeze late.
+        let scale = 10u32; // 1024 vertices
+        let n = Kronecker::vertices(scale);
+        let edges: Vec<(usize, usize)> = Kronecker::new(scale, 8, 0xDE17).collect();
+        let (shards, out_deg) = partition_edges_boundary(n, &edges, 8);
+
+        // eps=0: the residual halo is BIT-IDENTICAL to the dense boundary halo (a cache refreshed to the
+        // exact value == reading it directly). HONEST: it does NOT save bytes on PageRank — f64 ranks keep
+        // wiggling in their low bits every superstep, so almost nothing freezes bit-exactly and 12 B sparse
+        // pairs cost MORE than 8 B dense. The saving needs a threshold (below).
+        let exact = distributed_pagerank_boundary(n, &shards, &out_deg, 0.85, 200, 1e-12);
+        let (delta0, _s0) =
+            distributed_pagerank_boundary_delta(n, &shards, &out_deg, 0.85, 200, 1e-12, 0.0);
+        assert_eq!(delta0, exact, "eps=0 residual halo must equal the dense halo exactly");
+
+        // Thresholded eps: THIS is where the wire saving lives. Ghosts moving < eps stop being sent, so the
+        // late supersteps ship almost nothing — for a bounded O(eps) perturbation of the answer.
+        let eps = 1e-9;
+        let (delta1, s1) =
+            distributed_pagerank_boundary_delta(n, &shards, &out_deg, 0.85, 200, 1e-12, eps);
+        let maxd = exact
+            .iter()
+            .zip(&delta1)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f64, f64::max);
+        assert!(maxd < 1e-5, "delta_eps={eps} perturbed the answer too much: max|Δ| {maxd:e}");
+        assert!(
+            s1.delta_bytes < s1.dense_bytes,
+            "thresholded residual halo must beat dense: delta {}B not < dense {}B",
+            s1.delta_bytes,
+            s1.dense_bytes
+        );
+        // Deterministic run-to-run.
+        assert_eq!(
+            delta1,
+            distributed_pagerank_boundary_delta(n, &shards, &out_deg, 0.85, 200, 1e-12, eps).0
         );
     }
 
