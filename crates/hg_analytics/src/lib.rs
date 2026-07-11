@@ -120,9 +120,10 @@ fn pagerank_from(
 
 /// Parallel (rayon) PageRank — the multi-core scale-out of `pagerank`. Pull-based: each node's next
 /// rank is computed independently from its IN-neighbours, so the O(E) work parallelises with no write
-/// contention. The O(n) dangling + convergence reductions stay serial, which keeps the result
-/// deterministic (same output every run) AND identical to the serial `pagerank` fixed point. This is
-/// the leg that turns "Rust is faster" from a claim into a number: linear-ish speedup in cores.
+/// contention. The O(n) dangling + convergence reductions are ALSO parallel, via a deterministic
+/// fixed-chunk sum (`det_par_sum`) — the same reduction model `betweenness_parallel` uses — so the
+/// result is identical run-to-run on any core count (matching the serial `pagerank` fixed point to
+/// float tolerance). This is the leg that turns "Rust is faster" from a claim into a number.
 pub fn pagerank_parallel(
     n: usize,
     edges: &[(usize, usize)],
@@ -155,17 +156,20 @@ pub fn pagerank_parallel(
             cursor[v] += 1;
         }
     }
+    // The dangling SET is static (out_deg never changes) but is ~half the vertices on RMAT — so scanning
+    // all n each iteration to re-find them is wasted. Precompute the index list ONCE; the per-iter cost
+    // becomes O(#dangling) over exactly those nodes, not O(n) with a branch.
+    let dangling_idx: Vec<u32> = (0..n as u32)
+        .filter(|&u| out_deg[u as usize] == 0)
+        .collect();
     let base = (1.0 - damping) / n as f64;
     let mut rank = vec![1.0 / n as f64; n];
     let mut contrib = vec![0.0f64; n];
     for _ in 0..max_iters {
-        // Dangling mass + share: serial O(n), deterministic.
-        let mut dangling = 0.0;
-        for u in 0..n {
-            if out_deg[u] == 0 {
-                dangling += rank[u];
-            }
-        }
+        // Dangling mass: deterministic fixed-chunk parallel sum over the precomputed list (same reduction
+        // model as betweenness_parallel — fixed chunk count, partials combined in chunk order → identical
+        // run-to-run on any core count). Was a serial O(n) scan; measured ~25% of the kernel.
+        let dangling = det_par_sum(dangling_idx.len(), |i| rank[dangling_idx[i] as usize]);
         let add = base + damping * dangling / n as f64;
         // FUSED per-vertex contribution: contrib[u] = rank[u]/out_deg[u], computed ONCE per vertex (n
         // divides), not once per edge (m ≈ 16n divides) — and it collapses the pull's inner loop to a
@@ -189,13 +193,43 @@ pub fn pagerank_parallel(
                 add + damping * acc
             })
             .collect();
-        let diff: f64 = (0..n).map(|i| (next[i] - rank[i]).abs()).sum();
+        // Convergence residual: deterministic fixed-chunk parallel sum (was serial O(n)). Only gates the
+        // stop test, so the rank values are unaffected; determinism is preserved by the fixed reduction.
+        let diff = det_par_sum(n, |i| (next[i] - rank[i]).abs());
         rank = next;
         if diff < tol {
             break;
         }
     }
     rank
+}
+
+/// Deterministic parallel sum of `f(0..len)`: a FIXED number of contiguous chunks are each summed serially
+/// (in index order) and their partials combined in chunk order — so the result is identical run-to-run on
+/// any core count (the same determinism model `betweenness_parallel` uses). Not bit-equal to a single serial
+/// left-fold (float add isn't associative), but well-defined and stable, which is what determinism requires.
+fn det_par_sum(len: usize, f: impl Fn(usize) -> f64 + Sync) -> f64 {
+    if len == 0 {
+        return 0.0;
+    }
+    // Fixed chunk count (independent of thread count) keeps the reduction order — and thus the result —
+    // machine-independent. 256 chunks amortises rayon overhead while staying far above any core count.
+    let chunks = 256.min(len);
+    let cs = len.div_ceil(chunks);
+    (0..chunks)
+        .into_par_iter()
+        .map(|c| {
+            let s = c * cs;
+            let e = ((c + 1) * cs).min(len);
+            let mut acc = 0.0;
+            for i in s..e {
+                acc += f(i);
+            }
+            acc
+        })
+        .collect::<Vec<f64>>()
+        .iter()
+        .sum()
 }
 
 /// AtomId-facing wrapper: map ids → dense indices (sorted for determinism), run PageRank, return id → score.

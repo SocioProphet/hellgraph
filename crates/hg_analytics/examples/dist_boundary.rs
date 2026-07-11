@@ -220,11 +220,17 @@ fn run_coordinator(listen: &str, shards_n: usize, spawn: bool) {
         "Boundary-halo distributed PageRank over TCP: {n} nodes / {m} edges / {shards_n} workers \
 (scale {scale}, ef {edgefactor}, {iters} iters)"
     );
-    log(&format!("generated {m} edges in {:.1}s", tg.elapsed().as_secs_f64()));
+    log(&format!(
+        "generated {m} edges in {:.1}s",
+        tg.elapsed().as_secs_f64()
+    ));
 
     let tp = Instant::now();
     let part = fennel_partition(n, &edges, shards_n);
-    log(&format!("Fennel partitioned in {:.1}s", tp.elapsed().as_secs_f64()));
+    log(&format!(
+        "Fennel partitioned in {:.1}s",
+        tp.elapsed().as_secs_f64()
+    ));
     let (remapped, bounds, _perm) = relabel_contiguous(n, &part, shards_n, &edges);
     let (shards, out_deg) = partition_edges_boundary_at(n, &remapped, &bounds);
     log("built boundary shards");
@@ -259,7 +265,8 @@ fn run_coordinator(listen: &str, shards_n: usize, spawn: bool) {
         keepalive(&s);
         // Bounded read for the hello: a STALE half-open connection (a worker that already died) never
         // sends and would otherwise block/timeout the whole run — skip it fast instead of panicking.
-        s.set_read_timeout(Some(std::time::Duration::from_secs(20))).ok();
+        s.set_read_timeout(Some(std::time::Duration::from_secs(20)))
+            .ok();
         let hello = match read_vec(&mut s, 8) {
             Ok(b) => b,
             Err(_) => continue, // dead/slow/partial → drop this connection
@@ -275,10 +282,14 @@ fn run_coordinator(listen: &str, shards_n: usize, spawn: bool) {
         s.write_all(&books[id].shard).unwrap();
         conns[id] = Some(s);
         let have = conns.iter().filter(|c| c.is_some()).count();
-        log(&format!("worker {id} connected + shard shipped ({have}/{shards_n})"));
+        log(&format!(
+            "worker {id} connected + shard shipped ({have}/{shards_n})"
+        ));
     }
     let mut conns: Vec<TcpStream> = conns.into_iter().map(|c| c.unwrap()).collect();
-    log(&format!("all {shards_n} workers connected; running {iters} supersteps"));
+    log(&format!(
+        "all {shards_n} workers connected; running {iters} supersteps"
+    ));
 
     let base = (1.0 - D) / n as f64;
     let mut boundary_val = vec![1.0 / n as f64; b_len];
@@ -313,7 +324,10 @@ fn run_coordinator(listen: &str, shards_n: usize, spawn: bool) {
         add = base + D * dangling / n as f64;
     }
     let dt = t.elapsed();
-    log(&format!("{iters} supersteps done in {:.2}s; gathering + verifying", dt.as_secs_f64()));
+    log(&format!(
+        "{iters} supersteps done in {:.2}s; gathering + verifying",
+        dt.as_secs_f64()
+    ));
 
     // Final O(n) gather (one-time): request full owned vectors, assemble the global answer.
     let mut rank = vec![0.0f64; n];

@@ -250,7 +250,14 @@ pub fn distributed_pagerank_boundary_delta(
     delta_eps: f64,
 ) -> (Vec<f64>, DeltaHaloStats) {
     if n == 0 {
-        return (Vec::new(), DeltaHaloStats { supersteps: 0, dense_bytes: 0, delta_bytes: 0 });
+        return (
+            Vec::new(),
+            DeltaHaloStats {
+                supersteps: 0,
+                dense_bytes: 0,
+                delta_bytes: 0,
+            },
+        );
     }
     let base = (1.0 - damping) / n as f64;
     let mut rank = vec![1.0 / n as f64; n];
@@ -260,7 +267,11 @@ pub fn distributed_pagerank_boundary_delta(
         .iter()
         .map(|s| vec![1.0 / n as f64; s.ghosts.len()])
         .collect();
-    let mut stats = DeltaHaloStats { supersteps: 0, dense_bytes: 0, delta_bytes: 0 };
+    let mut stats = DeltaHaloStats {
+        supersteps: 0,
+        dense_bytes: 0,
+        delta_bytes: 0,
+    };
     for _ in 0..max_iters {
         stats.supersteps += 1;
         let mut dangling = 0.0;
@@ -978,7 +989,10 @@ mod tests {
         let exact = distributed_pagerank_boundary(n, &shards, &out_deg, 0.85, 200, 1e-12);
         let (delta0, _s0) =
             distributed_pagerank_boundary_delta(n, &shards, &out_deg, 0.85, 200, 1e-12, 0.0);
-        assert_eq!(delta0, exact, "eps=0 residual halo must equal the dense halo exactly");
+        assert_eq!(
+            delta0, exact,
+            "eps=0 residual halo must equal the dense halo exactly"
+        );
 
         // Thresholded eps: THIS is where the wire saving lives. Ghosts moving < eps stop being sent, so the
         // late supersteps ship almost nothing — for a bounded O(eps) perturbation of the answer.
@@ -990,7 +1004,10 @@ mod tests {
             .zip(&delta1)
             .map(|(a, b)| (a - b).abs())
             .fold(0.0f64, f64::max);
-        assert!(maxd < 1e-5, "delta_eps={eps} perturbed the answer too much: max|Δ| {maxd:e}");
+        assert!(
+            maxd < 1e-5,
+            "delta_eps={eps} perturbed the answer too much: max|Δ| {maxd:e}"
+        );
         assert!(
             s1.delta_bytes < s1.dense_bytes,
             "thresholded residual halo must beat dense: delta {}B not < dense {}B",

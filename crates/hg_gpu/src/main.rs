@@ -28,24 +28,11 @@ struct Params { n: u32, base: f32, damping: f32, num_wg: u32 };
 
 var<workgroup> sdata: array<f32, 256>;
 
-// Precompute the per-vertex contribution in one COALESCED O(n) pass, so the SpMV's random gather reads a
-// single f32 per edge (contrib[u]) instead of two (rank_in[u] AND inv_outdeg[u]) — halving random traffic.
-@compute @workgroup_size(256)
-fn contrib_kernel(@builtin(local_invocation_id) lid: vec3<u32>,
-                  @builtin(workgroup_id) wid: vec3<u32>,
-                  @builtin(num_workgroups) ng: vec3<u32>) {
-  let stride = ng.x * 256u;
-  var v = wid.x * 256u + lid.x;
-  loop {
-    if (v >= P.n) { break; }
-    contrib[v] = rank_in[v] * inv_outdeg[v];
-    v = v + stride;
-  }
-}
-
-// L1 — GRID-STRIDE: each workgroup strides over the vertices, summing dangling rank, → one partial per wg.
-// (No barrier inside the strided accumulation, so threads may finish at different times — the reduction
-// barrier after is reached uniformly.) num_wg workgroups total (P.num_wg), fixed & small.
+// L1 — GRID-STRIDE, FUSED: each workgroup strides over the vertices reading rank_in[v] ONCE and doing both
+// jobs with it — writing the per-vertex contribution contrib[v]=rank_in[v]·inv_outdeg[v] (so the SpMV's
+// random gather reads a single f32/edge, not two) AND summing dangling mass → one partial per workgroup.
+// Merging the old separate contrib pass in here saves a whole O(n) re-read of rank_in and a dispatch.
+// (No barrier inside the strided accumulation; the reduction barrier after is reached uniformly.)
 @compute @workgroup_size(256)
 fn dangling(@builtin(local_invocation_id) lid: vec3<u32>,
             @builtin(workgroup_id) wid: vec3<u32>,
@@ -55,7 +42,9 @@ fn dangling(@builtin(local_invocation_id) lid: vec3<u32>,
   var v = wid.x * 256u + lid.x;
   loop {
     if (v >= P.n) { break; }
-    if (is_dangling[v] == 1u) { acc = acc + rank_in[v]; }
+    let r = rank_in[v];              // single read, used for both contrib and dangling
+    contrib[v] = r * inv_outdeg[v];  // (0 for dangling v — inv_outdeg is 0 — and unused there)
+    if (is_dangling[v] == 1u) { acc = acc + r; }
     v = v + stride;
   }
   sdata[lid.x] = acc;
@@ -340,9 +329,8 @@ fn main() {
         })
     };
     let pipe_spmv = make_pipe("spmv");
-    let pipe_dng = make_pipe("dangling");
+    let pipe_dng = make_pipe("dangling"); // fused: writes contrib + sums dangling in one rank_in read
     let pipe_reduce = make_pipe("reduce_final");
-    let pipe_contrib = make_pipe("contrib_kernel");
 
     // Two bind groups for ping-pong: dir 0 reads A→writes B; dir 1 reads B→writes A.
     let bind = |rin: &wgpu::Buffer, rout: &wgpu::Buffer| {
@@ -423,9 +411,8 @@ fn main() {
             cp.dispatch_workgroups(groups, 1, 1);
         };
     for _ in 0..iters {
-        pass(&mut enc, &pipe_dng, dir, grid); // L1: per-workgroup dangling partials
+        pass(&mut enc, &pipe_dng, dir, grid); // L1: dangling partials + contrib (fused, one rank_in read)
         pass(&mut enc, &pipe_reduce, dir, 1); // L2: partials → dsum (one workgroup)
-        pass(&mut enc, &pipe_contrib, dir, grid); // fuse rank_in·inv_outdeg → contrib (1 coalesced O(n) pass)
         pass(&mut enc, &pipe_spmv, dir, grid); // rank_out = add + damping·SpMV (ONE gather/edge)
         dir ^= 1;
     }
