@@ -23,6 +23,10 @@ PREFLIGHT=0; [ "${1:-}" = "--preflight" ] && PREFLIGHT=1
 
 : "${PROJECT:?set PROJECT=your-gcp-project}"
 REGION="${REGION:-us-central1}"
+# ZONAL cluster: --num-nodes is then the EXACT node count (a regional cluster multiplies it by 3 zones,
+# which both triples the bill and spreads nodes across zones — worse for the BSP halo latency). Single-zone
+# also gives the tightest node-to-node network for the halo exchange.
+ZONE="${ZONE:-${REGION}-a}"
 CLUSTER="${CLUSTER:-hg-bench}"
 REPO="${REPO:-hellgraph}"
 MACHINE="${MACHINE:-e2-standard-4}"
@@ -30,10 +34,14 @@ SHARDS="$(grep -E '^\s*HG_SHARDS:' "$K8S/configmap.yaml" | grep -oE '[0-9]+' | h
 NODES="${NODES:-$((SHARDS + 1))}"
 AR_HOST="${REGION}-docker.pkg.dev"
 export REGISTRY="${AR_HOST}/${PROJECT}/${REPO}"
+# Spot is OPT-IN (SPOT=1). Default = on-demand: a spot preemption of any node fails the whole non-idempotent
+# run, and we ate exactly that. Spot is fine for throwaway/short runs where you accept the risk.
+SPOT_FLAG=""; [ "${SPOT:-0}" = "1" ] && SPOT_FLAG="--spot"
+CAP=$([ -n "$SPOT_FLAG" ] && echo spot || echo on-demand)
 
 echo "── plan ─────────────────────────────────────────────"
-echo "  project=$PROJECT region=$REGION cluster=$CLUSTER"
-echo "  nodes=$NODES × $MACHINE (spot)   shards=$SHARDS"
+echo "  project=$PROJECT region=$REGION zone=$ZONE cluster=$CLUSTER"
+echo "  nodes=$NODES × $MACHINE ($CAP)   shards=$SHARDS"
 echo "  registry=$REGISTRY   builder=cloudbuild (no local docker)"
 echo "  scale=$(grep -E '^\s*HG_SCALE:' "$K8S/configmap.yaml" | grep -oE '[0-9]+' | head -1) (≈edges = 2^scale × edgefactor)"
 echo "─────────────────────────────────────────────────────"
@@ -69,6 +77,20 @@ for f in sorted(glob.glob(sys.argv[1] + "/*.yaml")):
     list(yaml.safe_load_all(open(f)))
     print(f"  ✓ manifest parses: {f}")
 PY
+# Quota check: a ZONAL cluster uses NODES × vCPU-per-node CPUs of the machine's family. Catch it BEFORE
+# creating (we once blew the T2A regional quota with a regional cluster × 3 zones).
+VCPU_PER=$(echo "$MACHINE" | grep -oE '[0-9]+$'); : "${VCPU_PER:=4}"
+NEED_CPUS=$((NODES * VCPU_PER))
+FAMILY=$(echo "$MACHINE" | cut -d- -f1 | tr '[:lower:]' '[:upper:]')   # t2a → T2A
+QUOTA_METRIC="${FAMILY}_CPUS"; [ "$FAMILY" = "E2" ] && QUOTA_METRIC="CPUS"
+LIMIT=$(gcloud compute regions describe "$REGION" --format="value(quotas)" 2>/dev/null \
+  | tr ';' '\n' | grep -A2 "'$QUOTA_METRIC'" | grep -oE "limit[^,]*" | grep -oE '[0-9]+' | head -1)
+if [ -n "$LIMIT" ] && [ "$NEED_CPUS" -gt "$LIMIT" ]; then
+  echo "  ✗ QUOTA: need $NEED_CPUS $QUOTA_METRIC ($NODES × $VCPU_PER) but limit is $LIMIT in $REGION — reduce NODES or request quota"
+  [ "$PREFLIGHT" = 1 ] && exit 1
+else
+  echo "  ✓ quota: $NEED_CPUS $QUOTA_METRIC needed, limit ${LIMIT:-unknown}"
+fi
 
 if [ "$PREFLIGHT" = 1 ]; then
   echo "▸ preflight OK — nothing was created, no spend. Drop --preflight to run for real."
@@ -77,17 +99,22 @@ fi
 
 # ── cluster lifecycle (ephemeral) ─────────────────────────────────────────────────────────────────────
 teardown() {
-  [ "${KEEP:-0}" = "1" ] && { echo "▸ KEEP=1 — cluster $CLUSTER left UP. Delete it: gcloud container clusters delete $CLUSTER --region $REGION --quiet"; return; }
+  [ "${KEEP:-0}" = "1" ] && { echo "▸ KEEP=1 — cluster $CLUSTER left UP. Delete it: gcloud container clusters delete $CLUSTER --zone $ZONE --quiet"; return; }
   echo "▸ TEAR DOWN cluster $CLUSTER (spin up → work → tear down)"
-  gcloud container clusters delete "$CLUSTER" --region "$REGION" --quiet || true
+  gcloud container clusters delete "$CLUSTER" --zone "$ZONE" --quiet || true
 }
 trap teardown EXIT
 
-echo "▸ create GKE cluster (spot, ephemeral)"
+echo "▸ create GKE cluster (zonal $ZONE, spot, ephemeral) — $NODES × $MACHINE"
+# Node identity: many hardened projects delete the default Compute Engine SA, so allow an explicit node
+# service account via NODE_SA (e.g. gke-prophet-nodes@PROJECT.iam.gserviceaccount.com). If unset, GKE uses
+# the project default (which must exist).
+SA_FLAG=()
+[ -n "${NODE_SA:-}" ] && SA_FLAG=(--service-account "$NODE_SA")
 gcloud container clusters create "$CLUSTER" \
-  --region "$REGION" --num-nodes "$NODES" --machine-type "$MACHINE" --spot \
-  --no-enable-autoupgrade --enable-ip-alias
-gcloud container clusters get-credentials "$CLUSTER" --region "$REGION"
+  --zone "$ZONE" --num-nodes "$NODES" --machine-type "$MACHINE" $SPOT_FLAG \
+  --no-enable-autoupgrade --enable-ip-alias "${SA_FLAG[@]}"
+gcloud container clusters get-credentials "$CLUSTER" --zone "$ZONE"
 
 echo "▸ run the benchmark (Cloud Build image → deploy → stream verified result)"
 BUILDER=cloudbuild "$HERE/run.sh"

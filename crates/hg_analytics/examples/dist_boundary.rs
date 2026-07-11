@@ -208,17 +208,26 @@ fn run_coordinator(listen: &str, shards_n: usize, spawn: bool) {
         println!("  listener bound on {listen}; generating + partitioning, then accepting {shards_n} workers ...");
     }
 
+    // Phase log to STDERR (unbuffered → shows up live in `kubectl logs`), each line timestamped from start.
+    let t0 = Instant::now();
+    let log = |msg: &str| eprintln!("[+{:>6.1}s] {msg}", t0.elapsed().as_secs_f64());
+
     let n = Kronecker::vertices(scale);
+    let tg = Instant::now();
     let edges: Vec<(usize, usize)> = Kronecker::new(scale, edgefactor, 0xB0A7).collect();
     let m = edges.len();
     println!(
         "Boundary-halo distributed PageRank over TCP: {n} nodes / {m} edges / {shards_n} workers \
 (scale {scale}, ef {edgefactor}, {iters} iters)"
     );
+    log(&format!("generated {m} edges in {:.1}s", tg.elapsed().as_secs_f64()));
 
+    let tp = Instant::now();
     let part = fennel_partition(n, &edges, shards_n);
+    log(&format!("Fennel partitioned in {:.1}s", tp.elapsed().as_secs_f64()));
     let (remapped, bounds, _perm) = relabel_contiguous(n, &part, shards_n, &edges);
     let (shards, out_deg) = partition_edges_boundary_at(n, &remapped, &bounds);
+    log("built boundary shards");
 
     // Boundary set B = union of all ghosts; the coordinator's only per-step state (O(boundary)).
     let mut bset: BTreeSet<usize> = BTreeSet::new();
@@ -237,6 +246,9 @@ fn run_coordinator(listen: &str, shards_n: usize, spawn: bool) {
     // Accept until every shard slot is filled by a DISTINCT ordinal — robust to stray, duplicate, or
     // reconnecting workers (a hello for an already-filled slot is dropped, not fatal). Ship each worker
     // [1/n][shard_len][shard bytes].
+    log(&format!(
+        "setup done; accepting {shards_n} workers (this is where a mis-scheduled worker shows up as a stall)"
+    ));
     let mut conns: Vec<Option<TcpStream>> = (0..shards_n).map(|_| None).collect();
     while conns.iter().any(|c| c.is_none()) {
         let mut s = match listener.accept() {
@@ -262,8 +274,11 @@ fn run_coordinator(listen: &str, shards_n: usize, spawn: bool) {
             .unwrap();
         s.write_all(&books[id].shard).unwrap();
         conns[id] = Some(s);
+        let have = conns.iter().filter(|c| c.is_some()).count();
+        log(&format!("worker {id} connected + shard shipped ({have}/{shards_n})"));
     }
     let mut conns: Vec<TcpStream> = conns.into_iter().map(|c| c.unwrap()).collect();
+    log(&format!("all {shards_n} workers connected; running {iters} supersteps"));
 
     let base = (1.0 - D) / n as f64;
     let mut boundary_val = vec![1.0 / n as f64; b_len];
@@ -298,6 +313,7 @@ fn run_coordinator(listen: &str, shards_n: usize, spawn: bool) {
         add = base + D * dangling / n as f64;
     }
     let dt = t.elapsed();
+    log(&format!("{iters} supersteps done in {:.2}s; gathering + verifying", dt.as_secs_f64()));
 
     // Final O(n) gather (one-time): request full owned vectors, assemble the global answer.
     let mut rank = vec![0.0f64; n];

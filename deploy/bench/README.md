@@ -56,6 +56,9 @@ REGISTRY=... BUILDER=docker deploy/bench/run.sh
 ## Files
 
 - `saturday.sh` — full lifecycle: cluster create → Cloud Build → run → cluster teardown; `--preflight`.
+  On-demand nodes by default; `SPOT=1` opts into (cheaper, preemptible) spot. Preflight checks CPU quota.
+- `status.sh` — one-command dashboard: nodes, pod placement, why anything is Pending, coordinator phase log.
+  Run it (or `watch -n5 deploy/bench/status.sh`) any time a run looks stuck.
 - `Dockerfile` — multi-stage Rust 1.96 build → slim runtime; one image, both roles.
 - `cloudbuild.yaml` — server-side build (honours the non-root Dockerfile); no local docker needed.
 - `k8s/configmap.yaml` — `HG_SHARDS` / `HG_SCALE` / `HG_EDGEFACTOR` / `HG_ITERS` (single source of truth).

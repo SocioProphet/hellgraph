@@ -42,6 +42,7 @@ spec:
       containers:
         - name: worker
           image: IMAGE_PLACEHOLDER          # set by run.sh
+          imagePullPolicy: Always           # always pull the pushed tag; never a stale cached image
           env:
             - { name: HG_ROLE, value: worker }
             - { name: HG_COORD, value: "hg-coordinator:9000" }

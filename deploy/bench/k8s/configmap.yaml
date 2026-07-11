@@ -8,6 +8,10 @@ metadata:
   labels: { app: hg-bench }
 data:
   HG_SHARDS: "8"
-  HG_SCALE: "26"        # 2^26 ≈ 67M vertices → ~1B edges at ef=16 (the MVP proof)
+  # NOTE: the coordinator MATERIALIZES the whole graph in RAM before sharding, so single-run scale is
+  # capped by the COORDINATOR node's memory, not the aggregate cluster. On 16 GB nodes, scale 23 (~134M
+  # edges, ~9 GB peak on the coordinator) is the safe ceiling. Hitting 1B needs a big coordinator node
+  # (e.g. t2a-standard-32) or streaming generation — tracked as follow-up.
+  HG_SCALE: "26"        # 2^26 ≈ 67M vertices → ~1.07B edges (the billion, on the big-RAM coordinator)
   HG_EDGEFACTOR: "16"
   HG_ITERS: "25"

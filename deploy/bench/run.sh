@@ -19,6 +19,8 @@ K8S="$HERE/k8s"
 : "${REGISTRY:?set REGISTRY=your.registry/path}"
 TAG="${1:-$(git -C "$ROOT" rev-parse --short HEAD)}"
 IMAGE="$REGISTRY/hellgraph-bench:$TAG"
+# Project id (for the Cloud Build SA resource path) — field 2 of the AR registry host/PROJECT/repo.
+PROJECT_ID="${PROJECT_ID:-$(echo "$REGISTRY" | cut -d/ -f2)}"
 
 # HG_SHARDS is the single source of truth for the worker fan-out.
 SHARDS="$(grep -E '^\s*HG_SHARDS:' "$K8S/configmap.yaml" | grep -oE '[0-9]+' | head -1)"
@@ -33,19 +35,26 @@ teardown() {
 }
 trap teardown EXIT
 
-echo "▸ build + push (BUILDER=${BUILDER:-docker})"
-case "${BUILDER:-docker}" in
-  cloudbuild)
-    # Server-side build — no local docker daemon needed (this is the Saturday path). Uses cloudbuild.yaml
-    # so the non-root Dockerfile (deploy/bench/Dockerfile) is honoured.
-    gcloud builds submit "$ROOT" --config="$HERE/cloudbuild.yaml" --substitutions=_IMAGE="$IMAGE"
-    ;;
-  docker)
-    docker build -f "$HERE/Dockerfile" -t "$IMAGE" "$ROOT"
-    docker push "$IMAGE"
-    ;;
-  *) echo "unknown BUILDER=$BUILDER (want docker|cloudbuild)"; exit 2 ;;
-esac
+if [ "${SKIP_BUILD:-0}" = "1" ]; then
+  echo "▸ SKIP_BUILD=1 — using pre-built image $IMAGE"
+else
+  echo "▸ build + push (BUILDER=${BUILDER:-docker})"
+  case "${BUILDER:-docker}" in
+    cloudbuild)
+      # Server-side build — no local docker daemon needed. Uses cloudbuild.yaml so the non-root Dockerfile
+      # is honoured. CLOUDBUILD_SA lets hardened projects (deleted default compute SA) name a build SA.
+      SA_ARG=()
+      [ -n "${CLOUDBUILD_SA:-}" ] && SA_ARG=(--service-account "projects/$PROJECT_ID/serviceAccounts/$CLOUDBUILD_SA")
+      gcloud builds submit "$ROOT" --config="$HERE/cloudbuild.yaml" \
+        --substitutions=_IMAGE="$IMAGE" "${SA_ARG[@]}"
+      ;;
+    docker)
+      docker build -f "$HERE/Dockerfile" -t "$IMAGE" "$ROOT"
+      docker push "$IMAGE"
+      ;;
+    *) echo "unknown BUILDER=$BUILDER (want docker|cloudbuild)"; exit 2 ;;
+  esac
+fi
 
 echo "▸ apply configmap + coordinator + workers"
 kubectl apply -f "$K8S/configmap.yaml"
