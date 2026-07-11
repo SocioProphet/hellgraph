@@ -17,8 +17,8 @@ fn main() {
         spec.mem_gb_per_node * cfg.usable_mem_fraction
     );
     println!(
-        "{:>7}  {:>13}  {:>10}  {:>20}  {:>10}",
-        "scale", "edges", "resident", "topology", "est wall"
+        "{:>7}  {:>13}  {:>10}  {:>20}  {:>10}  {:>9}",
+        "scale", "edges", "resident", "topology", "est wall", "est $"
     );
     for scale in 18u32..=32 {
         let n = 1usize << scale;
@@ -31,8 +31,8 @@ fn main() {
             Topology::Distributed { shards } => format!("DISTRIBUTED k={shards}"),
         };
         println!(
-            "{:>7}  {:>13}  {:>8.1}GB  {:>20}  {:>8.1}s",
-            scale, m, plan.resident_gb, topo, plan.est_wall_s
+            "{:>7}  {:>13}  {:>8.1}GB  {:>20}  {:>8.1}s  {:>8.4}",
+            scale, m, plan.resident_gb, topo, plan.est_wall_s, plan.est_cost_usd
         );
     }
     // Show the reasoning + the workload-dependent flip (repeated queries replicate instead of single).

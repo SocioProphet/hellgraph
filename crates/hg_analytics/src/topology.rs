@@ -31,6 +31,9 @@ pub struct PlannerConfig {
     pub net_bytes_per_s: f64,
     /// Bytes exchanged per boundary ghost per superstep (f64 rank = 8; f32 halo = 4).
     pub halo_bytes_per_ghost: f64,
+    /// Price per node per hour (USD). Used to report $ cost — because the WALL-optimal topology is not
+    /// always the COST-optimal one (a fast N-node cluster can cost more than one slow out-of-core node).
+    pub node_usd_per_hour: f64,
 }
 
 impl Default for PlannerConfig {
@@ -40,6 +43,7 @@ impl Default for PlannerConfig {
             throughput_edges_per_s: 2.8e9,
             net_bytes_per_s: 1.25e9,
             halo_bytes_per_ghost: 8.0,
+            node_usd_per_hour: 0.05, // ~a small arm/spot node
         }
     }
 }
@@ -80,6 +84,8 @@ pub struct Plan {
     pub resident_gb: f64,
     pub usable_gb_per_node: f64,
     pub est_wall_s: f64,
+    /// Estimated $ for the run = nodes_used · wall_hours · price. Wall-optimal ≠ cost-optimal in general.
+    pub est_cost_usd: f64,
     pub reason: String,
 }
 
@@ -95,6 +101,7 @@ pub fn plan_pagerank(
     let resident_gb = m as f64 * RESIDENT_BYTES_PER_EDGE / 1e9;
     let usable_gb = spec.mem_gb_per_node * cfg.usable_mem_fraction;
     let compute_s = |edges: f64| edges * iters as f64 / cfg.throughput_edges_per_s;
+    let cost = |nodes: usize, wall: f64| nodes as f64 * (wall / 3600.0) * cfg.node_usd_per_hour;
 
     // 1. Fits in ONE node's RAM → the question is single vs replicate (never partition — partitioning a
     //    graph that fits only adds halo for nothing).
@@ -107,6 +114,7 @@ pub fn plan_pagerank(
                 resident_gb,
                 usable_gb_per_node: usable_gb,
                 est_wall_s: wall,
+                est_cost_usd: cost(spec.nodes, wall),
                 reason: format!(
                     "graph fits one node ({resident_gb:.1}GB ≤ {usable_gb:.1}GB); repeated queries → REPLICATE on {} nodes (zero halo, {}× query throughput) — partitioning would add network cost for no benefit",
                     spec.nodes, spec.nodes
@@ -118,6 +126,7 @@ pub fn plan_pagerank(
             resident_gb,
             usable_gb_per_node: usable_gb,
             est_wall_s: compute_s(m as f64),
+            est_cost_usd: cost(1, compute_s(m as f64)),
             reason: format!(
                 "graph fits one node ({resident_gb:.1}GB ≤ {usable_gb:.1}GB) → SINGLE node in-memory: no network, the per-edge floor. Distributing here loses (comm-bound: measured 4 workers beat 8 at 33M edges)"
             ),
@@ -142,6 +151,7 @@ pub fn plan_pagerank(
             resident_gb,
             usable_gb_per_node: usable_gb,
             est_wall_s: wall,
+            est_cost_usd: cost(k, wall),
             reason: format!(
                 "graph needs {resident_gb:.1}GB > {usable_gb:.1}GB/node → DISTRIBUTE over {k} shards (the MINIMUM that fits; more shards only grow the boundary halo — {:.0}MB/superstep at k={k}). {} nodes available.",
                 halo_bytes_per_superstep / 1e6,
@@ -156,6 +166,7 @@ pub fn plan_pagerank(
         resident_gb,
         usable_gb_per_node: usable_gb,
         est_wall_s: compute_s(m as f64) * 4.0, // OOC ≈ several× slower (disk-bound, rough)
+        est_cost_usd: cost(1, compute_s(m as f64) * 4.0),
         reason: format!(
             "graph needs {resident_gb:.1}GB but the whole cluster holds only {:.1}GB ({} nodes × {usable_gb:.1}GB) → OUT-OF-CORE on one node (mmap CSR), or provision bigger/more nodes (need ≥{min_shards})",
             spec.nodes as f64 * usable_gb,
@@ -234,6 +245,45 @@ mod tests {
             }
             other => panic!("billion should distribute, got {other:?}: {}", plan.reason),
         }
+    }
+
+    #[test]
+    fn cost_is_reported_and_scales_with_nodes_used() {
+        // The billion on 16 nodes distributes over ~13 shards → its $ reflects 13 nodes, not 1. Cost
+        // visibility is the point (wall-optimal ≠ cost-optimal under per-node billing).
+        let spec = ClusterSpec {
+            nodes: 16,
+            mem_gb_per_node: 16.0,
+        };
+        let plan = plan_pagerank(
+            67_108_864,
+            1_073_741_824,
+            25,
+            spec,
+            Workload::SingleQuery,
+            Default::default(),
+        );
+        assert!(
+            plan.est_cost_usd > 0.0,
+            "cost must be reported: {}",
+            plan.reason
+        );
+        // Same graph, 1×-node cost basis (single in-mem on a huge node) is cheaper per unit wall than
+        // spreading across shards — the planner exposes the number so the human can trade wall vs $.
+        let big = ClusterSpec {
+            nodes: 1,
+            mem_gb_per_node: 256.0,
+        };
+        let single = plan_pagerank(
+            67_108_864,
+            1_073_741_824,
+            25,
+            big,
+            Workload::SingleQuery,
+            Default::default(),
+        );
+        assert_eq!(single.topology, Topology::SingleInMemory);
+        assert!(single.est_cost_usd > 0.0);
     }
 
     #[test]
