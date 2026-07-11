@@ -221,15 +221,23 @@ fn run_worker(coord_addr: &str, id: usize) {
     // Anderson history (owned slices): previous iterate/residual + the Δ columns.
     let (mut x_old, mut f_old): (Vec<f64>, Vec<f64>) = (Vec::new(), Vec::new());
     let (mut dxh, mut dfh): (Vec<Vec<f64>>, Vec<Vec<f64>>) = (Vec::new(), Vec::new());
+    // Reusable per-vertex contribution buffer (owned + ghost). FUSION: contrib[li]=rank[li]/out_deg[li]
+    // computed ONCE per vertex per step (owned+g divides), not once per EDGE (m≈16× more) — and the pull's
+    // inner loop becomes a single gather. Same value/order → identical result; fewer divides + less work.
+    let mut contrib = vec![0.0f64; s.owned + s.g];
     for _ in 0..s.iters {
         local_rank[..s.owned].copy_from_slice(&owned_rank);
-        // g = one PageRank pull from [x | ghost halo].
+        for li in 0..s.owned + s.g {
+            let d = s.out_deg_local[li];
+            contrib[li] = if d == 0 { 0.0 } else { local_rank[li] / d as f64 };
+        }
+        // g = one PageRank pull from [x | ghost halo] — one gather per edge over the fused contribs.
         let mut g = vec![0.0f64; s.owned];
         #[allow(clippy::needless_range_loop)]
         for v in 0..s.owned {
             let mut acc = 0.0;
             for &li in &s.nbr[s.off[v] as usize..s.off[v + 1] as usize] {
-                acc += local_rank[li as usize] / s.out_deg_local[li as usize] as f64;
+                acc += contrib[li as usize];
             }
             g[v] = add + D * acc;
         }
@@ -462,15 +470,27 @@ fn run_coordinator(listen: &str, k: usize, spawn: bool) {
     let ef = env_usize("HG_EDGEFACTOR", 16);
     let iters = env_usize("HG_ITERS", 25);
     let n = Kronecker::vertices(scale);
-    let edges: Vec<(usize, usize)> = Kronecker::new(scale, ef, 0xB0A7).collect();
+    // PARALLEL generation (seekable slices, bit-identical to the serial stream) — the coordinator's edge
+    // gen was single-threaded (222s of the billion's setup); this saturates its cores. The full fix is
+    // distributed gen (#12: workers gen their own slices → no coordinator materialization), but this alone
+    // cuts the biggest single-thread chunk. HG_PARTITION=range skips Fennel's serial pass (higher edge-cut,
+    // but the halo is p2p so the setup saving wins) — Fennel stays the default for cut quality.
+    let t_setup = Instant::now();
+    let cores = std::thread::available_parallelism().map(|c| c.get()).unwrap_or(8);
+    let edges: Vec<(usize, usize)> = Kronecker::generate_parallel(scale, ef, 0xB0A7, cores * 4);
     let m = edges.len();
     println!(
         "P2P boundary-halo PageRank: {n} nodes / {m} edges / {k} workers (scale {scale}, ef {ef}, {iters} iters)"
     );
 
-    let part = fennel_partition(n, &edges, k);
+    let part = if std::env::var("HG_PARTITION").as_deref() == Ok("range") {
+        (0..n).map(|v| v * k / n).collect::<Vec<usize>>()
+    } else {
+        fennel_partition(n, &edges, k)
+    };
     let (remapped, bounds, _perm) = relabel_contiguous(n, &part, k, &edges);
     let (shards, out_deg) = partition_edges_boundary_at(n, &remapped, &bounds);
+    eprintln!("  setup (parallel gen + partition + shard) in {:.2?}", t_setup.elapsed());
 
     // Routing tables: for each c and peer d, send_local[c][d] (c-owned indices that are d-ghosts, sorted)
     // and recv_ghost[c][d] (c-ghost indices owned by d). By construction these mirror across the pair.
