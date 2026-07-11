@@ -122,9 +122,30 @@ fn main() {
     let scale = env("HG_SCALE", 20) as u32;
     let ef = env("HG_EDGEFACTOR", 16);
     let iters = env("HG_ITERS", 40);
+    let reorder = env("HG_REORDER", 1) != 0;
     let n = Kronecker::vertices(scale);
-    let edges: Vec<(usize, usize)> = Kronecker::new(scale, ef, 0x6907u64).collect();
+    let mut edges: Vec<(usize, usize)> = Kronecker::new(scale, ef, 0x6907u64).collect();
     let m = edges.len();
+
+    // ── LOCALITY REORDER: relabel vertices by DESCENDING out-degree. A high-out-degree vertex is a source
+    // in many edges, so its rank is READ many times in the pull gather — giving it a low id keeps it hot in
+    // cache and stops the random gather from thrashing (the actual bottleneck at 2.38 GTEPS). Cheap: one
+    // sort. The ranking is permutation-invariant, so we relabel the graph and compare in the new order.
+    if reorder {
+        let mut od = vec![0u32; n];
+        for &(u, _) in &edges {
+            od[u] += 1;
+        }
+        let mut order: Vec<u32> = (0..n as u32).collect();
+        order.sort_unstable_by(|&a, &b| od[b as usize].cmp(&od[a as usize]).then(a.cmp(&b)));
+        let mut newid = vec![0u32; n];
+        for (new, &old) in order.iter().enumerate() {
+            newid[old as usize] = new as u32;
+        }
+        for e in edges.iter_mut() {
+            *e = (newid[e.0] as usize, newid[e.1] as usize);
+        }
+    }
 
     // ── Build the in-neighbour CSR + out-degrees on the CPU (once) ───────────────────────────────────
     let mut outdeg = vec![0u32; n];
