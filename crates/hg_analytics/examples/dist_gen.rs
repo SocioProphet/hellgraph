@@ -59,6 +59,18 @@ fn rd_u64(raw: &[u8], p: &mut usize) -> u64 {
     *p += 8;
     v
 }
+/// A shuffled edge as a Pod struct so a bucket `Vec<Edge>` can be written to the socket DIRECTLY via
+/// cast_slice — no separate `payload: Vec<u8>` (which doubled the transient shuffle memory: bucket + copy).
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct Edge {
+    v: u64, // target FIRST so derived Ord sorts by (target, source) — the CSR grouping order
+    u: u64,
+}
+// SAFETY: repr(C), two u64, no padding, every bit pattern valid → Pod. (Avoids the bytemuck derive feature.)
+unsafe impl bytemuck::Zeroable for Edge {}
+unsafe impl bytemuck::Pod for Edge {}
+
 fn to_f64s(b: &[u8]) -> Vec<f64> {
     b.chunks_exact(8).map(|c| f64::from_le_bytes(c.try_into().unwrap())).collect()
 }
@@ -227,10 +239,10 @@ fn run_worker(coord_addr: &str, id: usize) {
     let _ = n; // n only used for the (verify-scale) sanity; no dense O(n) allocation here anymore
     // GLOBAL vertex ids are u64: at 100B edges n≈6.25B > u32's 4.29B, so u32 would silently TRUNCATE ids.
     // (Local per-shard indices stay u32 — a shard holds < 2³² vertices — see the in-CSR build below.)
-    let mut buckets: Vec<Vec<(u64, u64)>> = vec![Vec::new(); k];
+    let mut buckets: Vec<Vec<Edge>> = vec![Vec::new(); k];
     let mut src_buckets: Vec<Vec<u64>> = vec![Vec::new(); k];
     for (u, v) in Kronecker::slice(scale, seed, start, count) {
-        buckets[owner_of(v, &bounds)].push((u as u64, v as u64));
+        buckets[owner_of(v, &bounds)].push(Edge { u: u as u64, v: v as u64 });
         src_buckets[owner_of(u, &bounds)].push(u as u64);
     }
 
@@ -271,12 +283,7 @@ fn run_worker(coord_addr: &str, id: usize) {
         writers.push(std::thread::spawn(move || {
             // Section 1: edges targeting d. Section 2: source-occurrences owned by d (for d's out-degree).
             write_robust(&mut wr, &(b.len() as u64).to_le_bytes());
-            let mut payload = Vec::with_capacity(b.len() * 16);
-            for &(u, v) in &b {
-                payload.extend_from_slice(&u.to_le_bytes()); // u64 = 8 B
-                payload.extend_from_slice(&v.to_le_bytes()); // u64 = 8 B → 16 B/edge
-            }
-            write_robust(&mut wr, &payload);
+            write_robust(&mut wr, bytemuck::cast_slice(&b)); // Vec<Edge> written DIRECTLY (no payload copy)
             write_robust(&mut wr, &(sb.len() as u64).to_le_bytes());
             write_robust(&mut wr, bytemuck::cast_slice(&sb)); // Vec<u64> = 8 B each
         }));
@@ -303,7 +310,7 @@ fn run_worker(coord_addr: &str, id: usize) {
     let owned = hi - lo;
     // My in-edges = my self-bucket + received edges. My owned out-degree = my owned source-occurrences
     // (self + received), counted into an O(owned) vector.
-    let mut in_edges: Vec<(u64, u64)> = std::mem::take(&mut buckets[id]);
+    let mut in_edges: Vec<Edge> = std::mem::take(&mut buckets[id]);
     let mut owned_outdeg = vec![0u32; owned];
     for &s in &src_buckets[id] {
         owned_outdeg[s as usize - lo] += 1;
@@ -311,9 +318,10 @@ fn run_worker(coord_addr: &str, id: usize) {
     for r in rx {
         let (ebody, sbody) = r.recv().unwrap();
         for ch in ebody.chunks_exact(16) {
-            let u = u64::from_le_bytes(ch[0..8].try_into().unwrap());
-            let v = u64::from_le_bytes(ch[8..16].try_into().unwrap());
-            in_edges.push((u, v));
+            // wire order is v then u (Edge field order), matching cast_slice on the sender.
+            let v = u64::from_le_bytes(ch[0..8].try_into().unwrap());
+            let u = u64::from_le_bytes(ch[8..16].try_into().unwrap());
+            in_edges.push(Edge { u, v });
         }
         for ch in sbody.chunks_exact(8) {
             owned_outdeg[u64::from_le_bytes(ch.try_into().unwrap()) as usize - lo] += 1;
@@ -323,35 +331,33 @@ fn run_worker(coord_addr: &str, id: usize) {
         w.join().unwrap();
     }
     let mut ghost_set: BTreeSet<usize> = BTreeSet::new();
-    for &(u, _v) in &in_edges {
-        if (u as usize) < lo || (u as usize) >= hi {
-            ghost_set.insert(u as usize);
+    for e in &in_edges {
+        if (e.u as usize) < lo || (e.u as usize) >= hi {
+            ghost_set.insert(e.u as usize);
         }
     }
     let ghosts: Vec<usize> = ghost_set.into_iter().collect();
     let ghost_idx: HashMap<usize, usize> =
         ghosts.iter().enumerate().map(|(i, &g)| (g, i)).collect();
-    // Sort in-edges by (target, source): the network arrival order is nondeterministic, so sorting makes
-    // the in-CSR — and thus the PageRank sum order — DETERMINISTIC run-to-run (and independent of node
-    // count). Not bit-identical to the centralized generation-order build, but the same fixed point to
-    // float tolerance, which is the bar for the distributed path.
-    in_edges.sort_unstable_by_key(|&(u, v)| (v, u));
+    // Sort by (target, source) — Edge's derived Ord (v first) does exactly this — for a DETERMINISTIC in-CSR
+    // sum order independent of nondeterministic network arrival.
+    in_edges.sort_unstable();
     let mut off = vec![0u32; owned + 1];
-    for &(_u, v) in &in_edges {
-        off[(v as usize - lo) + 1] += 1;
+    for e in &in_edges {
+        off[(e.v as usize - lo) + 1] += 1;
     }
     for v in 0..owned {
         off[v + 1] += off[v];
     }
     let mut nbr = vec![0u32; in_edges.len()];
     let mut cur = off.clone();
-    for &(u, v) in &in_edges {
-        let li = if (u as usize) >= lo && (u as usize) < hi {
-            (u as usize - lo) as u32
+    for e in &in_edges {
+        let li = if (e.u as usize) >= lo && (e.u as usize) < hi {
+            (e.u as usize - lo) as u32
         } else {
-            (owned + ghost_idx[&(u as usize)]) as u32
+            (owned + ghost_idx[&(e.u as usize)]) as u32
         };
-        let t = v as usize - lo;
+        let t = e.v as usize - lo;
         nbr[cur[t] as usize] = li;
         cur[t] += 1;
     }
@@ -566,10 +572,10 @@ fn run_worker(coord_addr: &str, id: usize) {
     }
 }
 
-fn fnv1a(edges: &[(u64, u64)]) -> u64 {
+fn fnv1a(edges: &[Edge]) -> u64 {
     let mut h = 0xcbf29ce484222325u64;
-    for &(u, v) in edges {
-        for b in u.to_le_bytes().iter().chain(v.to_le_bytes().iter()) {
+    for e in edges {
+        for b in e.v.to_le_bytes().iter().chain(e.u.to_le_bytes().iter()) {
             h ^= *b as u64;
             h = h.wrapping_mul(0x100000001b3);
         }
@@ -666,10 +672,10 @@ fn run_coordinator(listen: &str, k: usize, spawn: bool) {
     println!("  distributed gen+shuffle+route: {dt:.2?}");
     if verify {
         assert_eq!(total_edges, m as u64, "distributed shuffle lost/duplicated edges");
-        let mut central: Vec<Vec<(u64, u64)>> = vec![Vec::new(); k];
+        let mut central: Vec<Vec<Edge>> = vec![Vec::new(); k];
         let mut central_outdeg = vec![0u32; n];
         for (u, v) in Kronecker::new(scale, ef, seed) {
-            central[owner_of(v, &bounds)].push((u as u64, v as u64));
+            central[owner_of(v, &bounds)].push(Edge { u: u as u64, v: v as u64 });
             central_outdeg[u] += 1;
         }
         let mut ok = true;
