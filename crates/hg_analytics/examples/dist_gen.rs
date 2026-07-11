@@ -35,9 +35,13 @@ fn read_vec(s: &mut impl Read, bytes: usize) -> std::io::Result<Vec<u8>> {
 /// heavy concurrent all-to-all), a big write can exhaust kernel mbufs mid-flight; back off briefly and
 /// continue rather than crash. On a real cluster NIC this is rare, but the retry costs nothing.
 fn write_robust(s: &mut TcpStream, buf: &[u8]) {
+    // Write in ≤1 MiB chunks: a single multi-MB write on macOS loopback under mbuf pressure can fail/frame
+    // oddly; bounding each syscall keeps it stable (and ENOBUFS/WouldBlock just back off and retry).
+    const CHUNK: usize = 1 << 20;
     let mut off = 0;
     while off < buf.len() {
-        match s.write(&buf[off..]) {
+        let end = (off + CHUNK).min(buf.len());
+        match s.write(&buf[off..end]) {
             Ok(0) => std::thread::sleep(std::time::Duration::from_millis(1)),
             Ok(n) => off += n,
             Err(e)
