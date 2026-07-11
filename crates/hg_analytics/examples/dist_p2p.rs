@@ -42,6 +42,65 @@ fn rd_u64(raw: &[u8], p: &mut usize) -> usize {
     *p += 8;
     v as usize
 }
+/// Parse f64s from a byte buffer WITHOUT alignment assumptions (socket buffers aren't 8-aligned, so
+/// bytemuck::cast_slice panics on them). Used for the small Anderson Gram/rhs/γ messages.
+fn to_f64s(b: &[u8]) -> Vec<f64> {
+    b.chunks_exact(8)
+        .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
+        .collect()
+}
+
+/// Solve the (regularized) Anderson normal equations (G + λI)γ = rhs — a tiny mk×mk system the coordinator
+/// solves once per superstep after summing the per-worker Gram/rhs partials. Gaussian elimination + partial
+/// pivot; deterministic. mk ≤ window (≈5) so this is negligible next to the O(E) worker pull.
+fn solve_gram(mk: usize, gram: &[f64], rhs: &[f64]) -> Vec<f64> {
+    if mk == 0 {
+        return Vec::new();
+    }
+    let mut a = gram.to_vec();
+    let mut b = rhs.to_vec();
+    let tr: f64 = (0..mk).map(|i| a[i * mk + i]).sum();
+    let lam = 1e-12 * (tr / mk as f64).max(1e-300);
+    for i in 0..mk {
+        a[i * mk + i] += lam;
+    }
+    for col in 0..mk {
+        let mut piv = col;
+        for r in (col + 1)..mk {
+            if a[r * mk + col].abs() > a[piv * mk + col].abs() {
+                piv = r;
+            }
+        }
+        for c in 0..mk {
+            a.swap(col * mk + c, piv * mk + c);
+        }
+        b.swap(col, piv);
+        let d = a[col * mk + col];
+        if d.abs() < 1e-300 {
+            continue;
+        }
+        for r in (col + 1)..mk {
+            let fac = a[r * mk + col] / d;
+            for c in col..mk {
+                a[r * mk + c] -= fac * a[col * mk + c];
+            }
+            b[r] -= fac * b[col];
+        }
+    }
+    let mut x = vec![0.0f64; mk];
+    for i in (0..mk).rev() {
+        let mut s = b[i];
+        for j in (i + 1)..mk {
+            s -= a[i * mk + j] * x[j];
+        }
+        x[i] = if a[i * mk + i].abs() < 1e-300 {
+            0.0
+        } else {
+            s / a[i * mk + i]
+        };
+    }
+    x
+}
 
 fn main() {
     if std::env::args().nth(1).as_deref() == Some("worker") {
@@ -154,21 +213,75 @@ fn run_worker(coord_addr: &str, id: usize) {
     }
     let mut sent_bytes = 0usize;
 
-    // BSP loop. Persistent owned ranks; ghost halo assembled from P2P messages.
+    let accel = env_usize("HG_ACCEL", 0); // Anderson window; 0 = plain power iteration (the proven default)
+    // BSP loop. `owned_rank` = current iterate x (owned slice); persistent ghost halo in local_rank[owned..].
     let mut owned_rank = vec![n_recip; s.owned];
     let mut local_rank = vec![n_recip; s.owned + s.g];
     let mut add = s.seed_add;
+    // Anderson history (owned slices): previous iterate/residual + the Δ columns.
+    let (mut x_old, mut f_old): (Vec<f64>, Vec<f64>) = (Vec::new(), Vec::new());
+    let (mut dxh, mut dfh): (Vec<Vec<f64>>, Vec<Vec<f64>>) = (Vec::new(), Vec::new());
     for _ in 0..s.iters {
-        // Compute rank_{t+1} from [owned | ghost halo].
         local_rank[..s.owned].copy_from_slice(&owned_rank);
-        let mut dangling_partial = 0.0f64;
+        // g = one PageRank pull from [x | ghost halo].
+        let mut g = vec![0.0f64; s.owned];
         #[allow(clippy::needless_range_loop)]
         for v in 0..s.owned {
             let mut acc = 0.0;
             for &li in &s.nbr[s.off[v] as usize..s.off[v + 1] as usize] {
                 acc += local_rank[li as usize] / s.out_deg_local[li as usize] as f64;
             }
-            owned_rank[v] = add + D * acc;
+            g[v] = add + D * acc;
+        }
+        // Anderson mixing (accel>0): x_new = g − Σ γ_j (Δx_j+Δf_j). γ is a GLOBAL least-squares the
+        // coordinator solves over per-worker Gram/rhs partials — O(window²) coordinator traffic, no relay.
+        if accel > 0 {
+            let f: Vec<f64> = g.iter().zip(&owned_rank).map(|(a, b)| a - b).collect();
+            if !x_old.is_empty() {
+                dxh.push(owned_rank.iter().zip(&x_old).map(|(a, b)| a - b).collect());
+                dfh.push(f.iter().zip(&f_old).map(|(a, b)| a - b).collect());
+                if dxh.len() > accel {
+                    dxh.remove(0);
+                    dfh.remove(0);
+                }
+            }
+            let mk = dfh.len();
+            let mut gram = vec![0.0f64; mk * mk];
+            let mut rhs = vec![0.0f64; mk];
+            for i in 0..mk {
+                for j in i..mk {
+                    let mut d = 0.0;
+                    for v in 0..s.owned {
+                        d += dfh[i][v] * dfh[j][v];
+                    }
+                    gram[i * mk + j] = d;
+                    gram[j * mk + i] = d;
+                }
+                let mut r = 0.0;
+                for v in 0..s.owned {
+                    r += dfh[i][v] * f[v];
+                }
+                rhs[i] = r;
+            }
+            // Coordinator round-trip: send [mk][gram][rhs], receive the global γ.
+            ctrl.write_all(&(mk as u64).to_le_bytes()).unwrap();
+            ctrl.write_all(bytemuck::cast_slice(&gram)).unwrap();
+            ctrl.write_all(bytemuck::cast_slice(&rhs)).unwrap();
+            let gamma: Vec<f64> = to_f64s(&read_vec(&mut ctrl, mk * 8).unwrap());
+            let mut xn = g.clone();
+            for j in 0..mk {
+                for v in 0..s.owned {
+                    xn[v] -= gamma[j] * (dxh[j][v] + dfh[j][v]);
+                }
+            }
+            x_old = std::mem::replace(&mut owned_rank, xn);
+            f_old = f;
+        } else {
+            owned_rank = g;
+        }
+        // Dangling of the NEW iterate (for next step's teleport add).
+        let mut dangling_partial = 0.0f64;
+        for v in 0..s.owned {
             if s.out_deg_local[v] == 0 {
                 dangling_partial += owned_rank[v];
             }
@@ -465,10 +578,38 @@ fn run_coordinator(listen: &str, k: usize, spawn: bool) {
         s.write_all(&setup).unwrap();
     }
 
-    // Per-step: SCALAR dangling all-reduce only (the sole coordinator hot-path traffic).
+    // Per-step: (optional) Anderson Gram all-reduce [O(window²)] + SCALAR dangling all-reduce [O(k)].
+    // Neither grows with graph size, so the coordinator stays off the O(boundary) hot path.
+    let accel = env_usize("HG_ACCEL", 0);
     let mut coord_bytes = 0usize;
     let t = Instant::now();
     for _ in 0..iters {
+        if accel > 0 {
+            // Sum per-worker Gram/rhs partials → global least-squares → broadcast γ.
+            let (mut mk, mut gram, mut rhs) = (0usize, Vec::new(), Vec::new());
+            for (ci, s) in conns.iter_mut().enumerate() {
+                let m_i = rd_u64(&read_vec(s, 8).unwrap(), &mut 0);
+                let g_i: Vec<f64> = to_f64s(&read_vec(s, m_i * m_i * 8).unwrap());
+                let r_i: Vec<f64> = to_f64s(&read_vec(s, m_i * 8).unwrap());
+                coord_bytes += 8 + m_i * m_i * 8 + m_i * 8;
+                if ci == 0 {
+                    mk = m_i;
+                    gram = vec![0.0f64; mk * mk];
+                    rhs = vec![0.0f64; mk];
+                }
+                for k in 0..mk * mk {
+                    gram[k] += g_i[k];
+                }
+                for k in 0..mk {
+                    rhs[k] += r_i[k];
+                }
+            }
+            let gamma = solve_gram(mk, &gram, &rhs);
+            for s in conns.iter_mut() {
+                s.write_all(bytemuck::cast_slice(&gamma)).unwrap();
+                coord_bytes += mk * 8;
+            }
+        }
         let mut dangling = 0.0f64;
         for s in conns.iter_mut() {
             dangling += f64::from_le_bytes(read_vec(s, 8).unwrap().try_into().unwrap());
@@ -495,13 +636,23 @@ fn run_coordinator(listen: &str, k: usize, spawn: bool) {
         kid.wait().ok();
     }
 
-    // Verify + report the P2P vs coordinator split.
-    let single = pagerank(n, &remapped, D, iters, -1.0);
-    let maxdiff = single
-        .iter()
-        .zip(&rank)
-        .map(|(a, b)| (a - b).abs())
-        .fold(0.0, f64::max);
+    // Verify. Power-iteration path: compare to single-graph power iteration at the SAME iters (bit-exact).
+    // Anderson path: it reaches a MORE-converged point than power@iters, so compare to the CONVERGED fixed
+    // point and show it beats power@iters — that's the proof of fewer effective iterations.
+    let maxdiff = if accel > 0 {
+        let converged = pagerank(n, &remapped, D, 2000, 1e-13);
+        let acc_err = converged.iter().zip(&rank).map(|(a, b)| (a - b).abs()).fold(0.0, f64::max);
+        let power = pagerank(n, &remapped, D, iters, -1.0);
+        let power_err = converged.iter().zip(&power).map(|(a, b)| (a - b).abs()).fold(0.0, f64::max);
+        println!(
+            "  ANDERSON(window {accel}) @ {iters} steps: max|Δ| vs CONVERGED {acc_err:.2e}  —  power iteration @ {iters}: {power_err:.2e}  ⇒ {:.0}× closer in the same steps",
+            power_err / acc_err.max(1e-300)
+        );
+        acc_err
+    } else {
+        let single = pagerank(n, &remapped, D, iters, -1.0);
+        single.iter().zip(&rank).map(|(a, b)| (a - b).abs()).fold(0.0, f64::max)
+    };
     // Total P2P bytes = Σ_steps Σ_{c,d} |send c→d| × 8.
     let mut p2p_per_step = 0usize;
     for c in 0..k {
@@ -545,8 +696,15 @@ fn run_coordinator(listen: &str, k: usize, spawn: bool) {
         100.0 * coord_bytes as f64 / (coord_bytes + p2p_total).max(1) as f64,
         100.0 * p2p_total as f64 / (coord_bytes + p2p_total).max(1) as f64,
     );
-    // "EXACT" only when we didn't trade accuracy for wire (dense, or delta eps=0). eps>0 is a bounded approx.
-    let exact = std::env::var("HG_DELTA_EPS").map(|e| e == "0").unwrap_or(true);
-    let tag = if exact { "EXACT" } else { "bounded approx (eps>0 traded for wire)" };
+    // Verdict tag: bit-EXACT for the dense/eps=0 power path; Anderson lands on the same converged fixed
+    // point (verified above); delta eps>0 is a bounded approximation traded for wire.
+    let delta_exact = std::env::var("HG_DELTA_EPS").map(|e| e == "0").unwrap_or(true);
+    let tag = if accel > 0 {
+        "Anderson → same converged fixed point (verified vs power-iteration limit)"
+    } else if delta_exact {
+        "EXACT"
+    } else {
+        "bounded approx (eps>0 traded for wire)"
+    };
     println!("  == single-graph PageRank: max|Δ| {maxdiff:.2e}   ({tag})");
 }
