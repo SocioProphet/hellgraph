@@ -227,8 +227,6 @@ fn run_worker(coord_addr: &str, id: usize) {
         nbr[cur[t] as usize] = li;
         cur[t] += 1;
     }
-    let _ = (&off, &nbr); // in-CSR ready for the BSP layer (round 2)
-
     // Fingerprint the in-edge SET in the CANONICAL (u,v) order (matches the coordinator's centralized sort,
     // independent of my (v,u) CSR ordering) so the cross-check compares SETS, not orderings.
     let mut fp_sorted = in_edges.clone();
@@ -239,10 +237,127 @@ fn run_worker(coord_addr: &str, id: usize) {
     ctrl.write_all(&(ghosts.len() as u64).to_le_bytes())
         .unwrap();
     ctrl.write_all(&fp.to_le_bytes()).unwrap();
-    // Send the out-degree partial (n u32) for the GLOBAL out-degree reduce on the coordinator (O(n), not
-    // O(m) — the coordinator still never holds the edges).
+    // Out-degree partial (n u32) for the GLOBAL reduce (O(n), not O(m)) + my ghost ids for the routing build.
     ctrl.write_all(bytemuck::cast_slice(&out_deg_partial))
         .unwrap();
+    let ghost_u32: Vec<u32> = ghosts.iter().map(|&g| g as u32).collect();
+    ctrl.write_all(bytemuck::cast_slice(&ghost_u32)).unwrap();
+
+    // ── Round 2: receive routing + out-degree, then run the boundary-halo BSP PageRank on the assembled
+    //    shard (reusing the mesh sockets from the shuffle). This makes dist_gen a full distributed PageRank
+    //    with NO coordinator materialization — the path to a 100B receipt.
+    let n_recip = 1.0 / n as f64;
+    let g = ghosts.len();
+    let seed_add = f64::from_le_bytes(read_vec(&mut ctrl, 8).unwrap().try_into().unwrap());
+    let odl = read_vec(&mut ctrl, (owned + g) * 4).unwrap();
+    let out_deg_local: Vec<u32> = odl
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    let mut send_local: Vec<Vec<u32>> = Vec::with_capacity(k);
+    let mut recv_ghost: Vec<Vec<u32>> = Vec::with_capacity(k);
+    for _ in 0..k {
+        let sl = rd_u64(&read_vec(&mut ctrl, 8).unwrap(), &mut 0) as usize;
+        send_local.push(
+            read_vec(&mut ctrl, sl * 4)
+                .unwrap()
+                .chunks_exact(4)
+                .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+                .collect(),
+        );
+        let rl = rd_u64(&read_vec(&mut ctrl, 8).unwrap(), &mut 0) as usize;
+        recv_ghost.push(
+            read_vec(&mut ctrl, rl * 4)
+                .unwrap()
+                .chunks_exact(4)
+                .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+                .collect(),
+        );
+    }
+    let iters = _iters as usize;
+
+    // Halo reader threads on the REUSED peer sockets (clean after the one-shot shuffle).
+    let mut rx_map: HashMap<usize, std::sync::mpsc::Receiver<Vec<u8>>> = HashMap::new();
+    let mut hwr: HashMap<usize, TcpStream> = HashMap::new();
+    for d in 0..k {
+        if d == id {
+            continue;
+        }
+        let sock = peers[d].as_ref().unwrap();
+        hwr.insert(d, sock.try_clone().unwrap());
+        let recv_n = recv_ghost[d].len();
+        if recv_n > 0 {
+            let mut rd = sock.try_clone().unwrap();
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                for _ in 0..iters {
+                    match read_vec(&mut rd, recv_n * 8) {
+                        Ok(b) => {
+                            if tx.send(b).is_err() {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+            rx_map.insert(d, rx);
+        }
+    }
+
+    const D: f64 = 0.85;
+    let mut owned_rank = vec![n_recip; owned];
+    let mut local_rank = vec![n_recip; owned + g];
+    let mut contrib = vec![0.0f64; owned + g];
+    let mut add = seed_add;
+    for _ in 0..iters {
+        local_rank[..owned].copy_from_slice(&owned_rank);
+        for li in 0..owned + g {
+            let d = out_deg_local[li];
+            contrib[li] = if d == 0 {
+                0.0
+            } else {
+                local_rank[li] / d as f64
+            };
+        }
+        let mut dangling_partial = 0.0f64;
+        for v in 0..owned {
+            let mut acc = 0.0;
+            for &li in &nbr[off[v] as usize..off[v + 1] as usize] {
+                acc += contrib[li as usize];
+            }
+            owned_rank[v] = add + D * acc;
+            if out_deg_local[v] == 0 {
+                dangling_partial += owned_rank[v];
+            }
+        }
+        for d in 0..k {
+            if d == id || send_local[d].is_empty() {
+                continue;
+            }
+            let vals: Vec<f64> = send_local[d]
+                .iter()
+                .map(|&li| owned_rank[li as usize])
+                .collect();
+            hwr.get_mut(&d)
+                .unwrap()
+                .write_all(bytemuck::cast_slice(&vals))
+                .unwrap();
+        }
+        for (&d, rx) in &rx_map {
+            let body = rx.recv().unwrap();
+            let vals: Vec<f64> = body
+                .chunks_exact(8)
+                .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
+                .collect();
+            for (i, &gi) in recv_ghost[d].iter().enumerate() {
+                local_rank[owned + gi as usize] = vals[i];
+            }
+        }
+        ctrl.write_all(&dangling_partial.to_le_bytes()).unwrap();
+        add = f64::from_le_bytes(read_vec(&mut ctrl, 8).unwrap().try_into().unwrap());
+    }
+    ctrl.write_all(bytemuck::cast_slice(&owned_rank)).unwrap();
 }
 
 fn fnv1a(edges: &[(u32, u32)]) -> u64 {
@@ -321,23 +436,30 @@ fn run_coordinator(listen: &str, k: usize, spawn: bool) {
     let mut total_ghosts = 0u64;
     let mut fps = vec![0u64; k];
     let mut out_deg = vec![0u32; n];
+    let mut ghost_ids: Vec<Vec<u32>> = vec![Vec::new(); k];
     for (c, s) in conns
         .iter_mut()
         .enumerate()
         .map(|(c, o)| (c, o.as_mut().unwrap()))
     {
         total_edges += rd_u64(&read_vec(s, 8).unwrap(), &mut 0);
-        total_ghosts += rd_u64(&read_vec(s, 8).unwrap(), &mut 0);
+        let gc = rd_u64(&read_vec(s, 8).unwrap(), &mut 0) as usize;
+        total_ghosts += gc as u64;
         fps[c] = rd_u64(&read_vec(s, 8).unwrap(), &mut 0);
         let raw = read_vec(s, n * 4).unwrap();
         for (v, ch) in raw.chunks_exact(4).enumerate() {
             out_deg[v] += u32::from_le_bytes(ch.try_into().unwrap());
         }
+        ghost_ids[c] = read_vec(s, gc * 4)
+            .unwrap()
+            .chunks_exact(4)
+            .map(|ch| u32::from_le_bytes(ch.try_into().unwrap()))
+            .collect();
     }
     let dt = t.elapsed();
-    for kid in kids.iter_mut() {
-        kid.wait().ok();
-    }
+    // NOTE: workers do NOT exit after the summary now — they continue into the BSP. So DON'T wait for them
+    // here (that would deadlock: coordinator waits for exit, workers wait for the routing we send below).
+    // The wait happens at the very end.
 
     println!("  distributed gen+shuffle: {dt:.2?}, {total_edges} in-edges assembled, {total_ghosts} total ghosts");
     assert_eq!(
@@ -383,5 +505,104 @@ fn run_coordinator(listen: &str, k: usize, spawn: bool) {
         println!(
             "  [HG_VERIFY=0: skipped the centralized cross-check — the coordinator holds NO edges]"
         );
+    }
+
+    // ── Round 2: routing tables (from ghost lists, O(boundary)) + BSP PageRank dangling all-reduce ──
+    // Routing per pair (c,d), sorted by global id so send/recv mirror:
+    //   send_local[c][d] = d's ghosts that lie in c's range  → local index (g - bounds[c])
+    //   recv_ghost[c][d] = c's ghosts owned by d             → position in c's (sorted) ghost list
+    const D: f64 = 0.85;
+    let base = (1.0 - D) / n as f64;
+    let n_dangle = out_deg.iter().filter(|&&d| d == 0).count();
+    let seed_add = base + D * (n_dangle as f64 / n as f64) / n as f64;
+    let ghost_pos: Vec<std::collections::HashMap<u32, u32>> = ghost_ids
+        .iter()
+        .map(|gs| gs.iter().enumerate().map(|(i, &g)| (g, i as u32)).collect())
+        .collect();
+    for (c, s) in conns
+        .iter_mut()
+        .enumerate()
+        .map(|(c, o)| (c, o.as_mut().unwrap()))
+    {
+        let (lo, hi) = (bounds[c] as u32, bounds[c + 1] as u32);
+        s.write_all(&seed_add.to_le_bytes()).unwrap();
+        // out_deg_local = owned range ++ ghost out-degrees.
+        let mut odl: Vec<u32> = out_deg[bounds[c]..bounds[c + 1]].to_vec();
+        for &gg in &ghost_ids[c] {
+            odl.push(out_deg[gg as usize]);
+        }
+        s.write_all(bytemuck::cast_slice(&odl)).unwrap();
+        for d in 0..k {
+            // send c→d: c-owned that are d-ghosts (d's ghosts in c's range), sorted by global id.
+            let mut sl: Vec<u32> = ghost_ids[d]
+                .iter()
+                .filter(|&&gg| gg >= lo && gg < hi)
+                .map(|&gg| gg - lo)
+                .collect();
+            sl.sort_unstable();
+            // recv c←d: c-ghosts owned by d, as c's ghost positions, sorted by global id.
+            let mut rg: Vec<u32> = ghost_ids[c]
+                .iter()
+                .filter(|&&gg| gg >= bounds[d] as u32 && gg < bounds[d + 1] as u32)
+                .map(|&gg| ghost_pos[c][&gg])
+                .collect();
+            rg.sort_unstable();
+            s.write_all(&(sl.len() as u64).to_le_bytes()).unwrap();
+            s.write_all(bytemuck::cast_slice(&sl)).unwrap();
+            s.write_all(&(rg.len() as u64).to_le_bytes()).unwrap();
+            s.write_all(bytemuck::cast_slice(&rg)).unwrap();
+        }
+    }
+    // Per-step SCALAR dangling all-reduce (the only recurring coordinator traffic).
+    let mut add = seed_add;
+    let t2 = Instant::now();
+    for _ in 0..iters {
+        let mut dangling = 0.0f64;
+        for s in conns.iter_mut().flatten() {
+            dangling += f64::from_le_bytes(read_vec(s, 8).unwrap().try_into().unwrap());
+        }
+        add = base + D * dangling / n as f64;
+        for s in conns.iter_mut().flatten() {
+            s.write_all(&add.to_le_bytes()).unwrap();
+        }
+    }
+    let bsp_dt = t2.elapsed();
+    // Final gather.
+    let mut rank = vec![0.0f64; n];
+    for (c, s) in conns
+        .iter_mut()
+        .enumerate()
+        .map(|(c, o)| (c, o.as_mut().unwrap()))
+    {
+        let owned = bounds[c + 1] - bounds[c];
+        let raw = read_vec(s, owned * 8).unwrap();
+        for (i, ch) in raw.chunks_exact(8).enumerate() {
+            rank[bounds[c] + i] = f64::from_le_bytes(ch.try_into().unwrap());
+        }
+    }
+    println!("  distributed PageRank ({iters} supersteps): {bsp_dt:.2?}  — coordinator materialized ZERO edges");
+    if std::env::var("HG_VERIFY").as_deref() != Ok("0") {
+        let edges: Vec<(usize, usize)> = Kronecker::new(scale, ef, seed).collect();
+        let single = hg_analytics::pagerank(n, &edges, D, iters, -1.0);
+        let maxd = single
+            .iter()
+            .zip(&rank)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0, f64::max);
+        println!(
+            "  == vs single-graph PageRank: max|Δ| {maxd:.2e}  ({})",
+            if maxd < 1e-9 {
+                "VERIFIED ✓ (same fixed point to tolerance; sum order differs from centralized)"
+            } else {
+                "DIVERGED ✗"
+            }
+        );
+        assert!(
+            maxd < 1e-9,
+            "distributed-gen PageRank diverged from single-graph"
+        );
+    }
+    for kid in kids.iter_mut() {
+        kid.wait().ok();
     }
 }
