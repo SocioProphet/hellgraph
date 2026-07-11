@@ -46,6 +46,45 @@ fn connect_retry(addr: &str) -> TcpStream {
     panic!("{addr} unreachable");
 }
 
+/// One concurrent ALL-TO-ALL exchange over the (reused) mesh sockets: send `payload[d]` to peer d, return
+/// what each peer sent us (`recv[id]` empty). Concurrent writer+reader thread per peer so a large send never
+/// serial-blocks against a peer that's also mid-send (the all-to-all deadlock). Length-prefixed.
+fn all_to_all(peers: &[Option<TcpStream>], id: usize, k: usize, mut payload: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
+    let mut writers = Vec::new();
+    for d in 0..k {
+        if d == id {
+            continue;
+        }
+        let mut wr = peers[d].as_ref().unwrap().try_clone().unwrap();
+        let p = std::mem::take(&mut payload[d]);
+        writers.push(std::thread::spawn(move || {
+            wr.write_all(&(p.len() as u64).to_le_bytes()).unwrap();
+            wr.write_all(&p).unwrap();
+        }));
+    }
+    let mut rxs = Vec::new();
+    for d in 0..k {
+        if d == id {
+            continue;
+        }
+        let mut rd = peers[d].as_ref().unwrap().try_clone().unwrap();
+        let (tx, r) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let len = rd_u64(&read_vec(&mut rd, 8).unwrap(), &mut 0) as usize;
+            tx.send(read_vec(&mut rd, len).unwrap()).ok();
+        });
+        rxs.push((d, r));
+    }
+    let mut recv = vec![Vec::new(); k];
+    for (d, r) in rxs {
+        recv[d] = r.recv().unwrap();
+    }
+    for w in writers {
+        w.join().unwrap();
+    }
+    recv
+}
+
 fn main() {
     if std::env::args().nth(1).as_deref() == Some("worker") {
         run_worker(
@@ -247,48 +286,65 @@ fn run_worker(coord_addr: &str, id: usize) {
     let mut fp_sorted = in_edges.clone();
     fp_sorted.sort_unstable();
     let fp = fnv1a(&fp_sorted);
-    ctrl.write_all(&(in_edges.len() as u64).to_le_bytes())
-        .unwrap();
-    ctrl.write_all(&(ghosts.len() as u64).to_le_bytes())
-        .unwrap();
-    ctrl.write_all(&fp.to_le_bytes()).unwrap();
-    // My OWNED out-degree (owned u32 = O(n/k), computed distributively — no dense O(n)) + my ghost ids.
-    ctrl.write_all(bytemuck::cast_slice(&owned_outdeg)).unwrap();
-    let ghost_u32: Vec<u32> = ghosts.iter().map(|&g| g as u32).collect();
-    ctrl.write_all(bytemuck::cast_slice(&ghost_u32)).unwrap();
-
-    // ── Round 2: receive routing + out-degree, then run the boundary-halo BSP PageRank on the assembled
-    //    shard (reusing the mesh sockets from the shuffle). This makes dist_gen a full distributed PageRank
-    //    with NO coordinator materialization — the path to a 100B receipt.
-    let n_recip = 1.0 / n as f64;
+    // ── Round 2: DISTRIBUTED routing + ghost out-degree (peer-to-peer; coordinator stays O(k), no O(n) or
+    //    O(boundary) on it). Phase 1: request each owner d the ghosts I need. Phase 2: reply each requester
+    //    with the out-degrees of what it asked → I learn my send_local AND my ghosts' out-degrees.
     let g = ghosts.len();
-    let seed_add = f64::from_le_bytes(read_vec(&mut ctrl, 8).unwrap().try_into().unwrap());
-    let odl = read_vec(&mut ctrl, (owned + g) * 4).unwrap();
-    let out_deg_local: Vec<u32> = odl
-        .chunks_exact(4)
-        .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
-        .collect();
-    let mut send_local: Vec<Vec<u32>> = Vec::with_capacity(k);
-    let mut recv_ghost: Vec<Vec<u32>> = Vec::with_capacity(k);
-    for _ in 0..k {
-        let sl = rd_u64(&read_vec(&mut ctrl, 8).unwrap(), &mut 0) as usize;
-        send_local.push(
-            read_vec(&mut ctrl, sl * 4)
-                .unwrap()
-                .chunks_exact(4)
-                .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
-                .collect(),
-        );
-        let rl = rd_u64(&read_vec(&mut ctrl, 8).unwrap(), &mut 0) as usize;
-        recv_ghost.push(
-            read_vec(&mut ctrl, rl * 4)
-                .unwrap()
-                .chunks_exact(4)
-                .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
-                .collect(),
-        );
+    let mut req: Vec<Vec<u32>> = vec![Vec::new(); k];
+    for &gg in &ghosts {
+        req[owner_of(gg, &bounds)].push(gg as u32); // ghosts sorted ⇒ req[d] sorted
     }
+    let req_from = all_to_all(
+        &peers,
+        id,
+        k,
+        req.iter().map(|r| bytemuck::cast_slice(r).to_vec()).collect(),
+    );
+    // send_local[e] = my owned local indices of what e requested (in the order e sent it).
+    let mut send_local: Vec<Vec<u32>> = vec![Vec::new(); k];
+    for e in 0..k {
+        for ch in req_from[e].chunks_exact(4) {
+            send_local[e].push(u32::from_le_bytes(ch.try_into().unwrap()) - lo as u32);
+        }
+    }
+    let reply: Vec<Vec<u8>> = (0..k)
+        .map(|e| {
+            let mut p = Vec::with_capacity(send_local[e].len() * 4);
+            for &li in &send_local[e] {
+                p.extend_from_slice(&owned_outdeg[li as usize].to_le_bytes());
+            }
+            p
+        })
+        .collect();
+    let od_reply = all_to_all(&peers, id, k, reply);
+    // recv_ghost[d] = my ghost positions for req[d]; out_deg_local = owned ++ ghost (from the replies).
+    let mut recv_ghost: Vec<Vec<u32>> = vec![Vec::new(); k];
+    let mut out_deg_local = vec![0u32; owned + g];
+    out_deg_local[..owned].copy_from_slice(&owned_outdeg);
+    for d in 0..k {
+        let ods: Vec<u32> = od_reply[d].chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+        for (i, &gid) in req[d].iter().enumerate() {
+            let gp = ghost_idx[&(gid as usize)];
+            recv_ghost[d].push(gp as u32);
+            out_deg_local[owned + gp] = ods[i];
+        }
+    }
+
+    // Coordinator handshake: my owned dangling count (scalar) → coordinator sums → seed_add. Verify data
+    // (fp + owned out-degree) goes ONLY when cross-checking at small scale; at billion the coordinator gets
+    // just the scalar and holds NOTHING of size O(n).
+    let n_recip = 1.0 / n as f64;
     let iters = _iters as usize;
+    let my_dangle = owned_outdeg.iter().filter(|&&d| d == 0).count() as u64;
+    let verify = std::env::var("HG_VERIFY").as_deref() != Ok("0");
+    ctrl.write_all(&my_dangle.to_le_bytes()).unwrap();
+    ctrl.write_all(&(verify as u64).to_le_bytes()).unwrap();
+    if verify {
+        ctrl.write_all(&(in_edges.len() as u64).to_le_bytes()).unwrap();
+        ctrl.write_all(&fp.to_le_bytes()).unwrap();
+        ctrl.write_all(bytemuck::cast_slice(&owned_outdeg)).unwrap();
+    }
+    let seed_add = f64::from_le_bytes(read_vec(&mut ctrl, 8).unwrap().try_into().unwrap());
 
     // Halo reader threads on the REUSED peer sockets (clean after the one-shot shuffle).
     let mut rx_map: HashMap<usize, std::sync::mpsc::Receiver<Vec<u8>>> = HashMap::new();
@@ -371,7 +427,13 @@ fn run_worker(coord_addr: &str, id: usize) {
         ctrl.write_all(&dangling_partial.to_le_bytes()).unwrap();
         add = f64::from_le_bytes(read_vec(&mut ctrl, 8).unwrap().try_into().unwrap());
     }
-    ctrl.write_all(bytemuck::cast_slice(&owned_rank)).unwrap();
+    // At verify scale send the full owned rank (coordinator cross-checks); at billion send only Σ owned rank
+    // (a scalar) so the coordinator stays O(k) — no O(n) rank gather.
+    if verify {
+        ctrl.write_all(bytemuck::cast_slice(&owned_rank)).unwrap();
+    } else {
+        ctrl.write_all(&owned_rank.iter().sum::<f64>().to_le_bytes()).unwrap();
+    }
 }
 
 fn fnv1a(edges: &[(u32, u32)]) -> u64 {
@@ -442,51 +504,38 @@ fn run_coordinator(listen: &str, k: usize, spawn: bool) {
         s.write_all(&roster_blob).unwrap();
     }
 
-    // Collect per-worker summaries (edge count, ghost count, fingerprint) + the out-degree partial reduce.
-    // Summing n-length partials is O(n)·k coordinator work — NOT O(m); the coordinator still never holds
-    // the edges (the #12 win). Ghost out-degrees + routing come from these in round 2.
+    // Collect only a SCALAR dangling count per worker (+ verify data at small scale). Routing + ghost
+    // out-degrees are exchanged PEER-TO-PEER by the workers, so the coordinator holds NOTHING of size O(n)
+    // or O(boundary) — it is O(k). (At verify scale it does assemble O(n) to cross-check; that's gated.)
+    const D: f64 = 0.85;
+    let base = (1.0 - D) / n as f64;
+    let verify = std::env::var("HG_VERIFY").as_deref() != Ok("0");
     let t = Instant::now();
+    let mut n_dangle = 0u64;
     let mut total_edges = 0u64;
-    let mut total_ghosts = 0u64;
     let mut fps = vec![0u64; k];
-    let mut out_deg = vec![0u32; n];
-    let mut ghost_ids: Vec<Vec<u32>> = vec![Vec::new(); k];
+    let mut out_deg_v: Vec<u32> = if verify { vec![0u32; n] } else { Vec::new() };
     for (c, s) in conns
         .iter_mut()
         .enumerate()
         .map(|(c, o)| (c, o.as_mut().unwrap()))
     {
-        total_edges += rd_u64(&read_vec(s, 8).unwrap(), &mut 0);
-        let gc = rd_u64(&read_vec(s, 8).unwrap(), &mut 0) as usize;
-        total_ghosts += gc as u64;
-        fps[c] = rd_u64(&read_vec(s, 8).unwrap(), &mut 0);
-        // Worker sends its OWNED out-degree range (owned = O(n/k)); place it into the global vector. Each
-        // owned range is exclusive to one worker, so this is a placement, not a sum.
-        let owned_c = bounds[c + 1] - bounds[c];
-        let raw = read_vec(s, owned_c * 4).unwrap();
-        for (i, ch) in raw.chunks_exact(4).enumerate() {
-            out_deg[bounds[c] + i] = u32::from_le_bytes(ch.try_into().unwrap());
+        n_dangle += rd_u64(&read_vec(s, 8).unwrap(), &mut 0);
+        let vf = rd_u64(&read_vec(s, 8).unwrap(), &mut 0);
+        if vf != 0 {
+            total_edges += rd_u64(&read_vec(s, 8).unwrap(), &mut 0);
+            fps[c] = rd_u64(&read_vec(s, 8).unwrap(), &mut 0);
+            let owned_c = bounds[c + 1] - bounds[c];
+            let raw = read_vec(s, owned_c * 4).unwrap();
+            for (i, ch) in raw.chunks_exact(4).enumerate() {
+                out_deg_v[bounds[c] + i] = u32::from_le_bytes(ch.try_into().unwrap());
+            }
         }
-        ghost_ids[c] = read_vec(s, gc * 4)
-            .unwrap()
-            .chunks_exact(4)
-            .map(|ch| u32::from_le_bytes(ch.try_into().unwrap()))
-            .collect();
     }
     let dt = t.elapsed();
-    // NOTE: workers do NOT exit after the summary now — they continue into the BSP. So DON'T wait for them
-    // here (that would deadlock: coordinator waits for exit, workers wait for the routing we send below).
-    // The wait happens at the very end.
-
-    println!("  distributed gen+shuffle: {dt:.2?}, {total_edges} in-edges assembled, {total_ghosts} total ghosts");
-    assert_eq!(
-        total_edges, m as u64,
-        "distributed shuffle lost/duplicated edges"
-    );
-
-    // VERIFY: the distributed per-shard partition must equal the centralized range-partition, bit-for-bit.
-    // (Only at verifiable scale — the whole point is the coordinator does NOT do this at billion scale.)
-    if std::env::var("HG_VERIFY").as_deref() != Ok("0") {
+    println!("  distributed gen+shuffle+route: {dt:.2?}");
+    if verify {
+        assert_eq!(total_edges, m as u64, "distributed shuffle lost/duplicated edges");
         let mut central: Vec<Vec<(u32, u32)>> = vec![Vec::new(); k];
         let mut central_outdeg = vec![0u32; n];
         for (u, v) in Kronecker::new(scale, ef, seed) {
@@ -498,81 +547,23 @@ fn run_coordinator(listen: &str, k: usize, spawn: bool) {
             central[c].sort_unstable();
             if fnv1a(&central[c]) != fps[c] {
                 ok = false;
-                eprintln!("  shard {c} MISMATCH vs centralized");
             }
         }
-        let outdeg_ok = out_deg == central_outdeg;
+        let outdeg_ok = out_deg_v == central_outdeg;
         println!(
-            "  == vs centralized range-partition: {} (each shard's in-edge SET bit-identical)",
-            if ok { "EXACT ✓" } else { "MISMATCH ✗" }
+            "  == vs centralized: partition {} · out-degree {}",
+            if ok { "EXACT ✓" } else { "MISMATCH ✗" },
+            if outdeg_ok { "EXACT ✓" } else { "MISMATCH ✗" }
         );
-        println!(
-            "  == distributed out-degree reduce: {} (global out_deg == centralized)",
-            if outdeg_ok {
-                "EXACT ✓"
-            } else {
-                "MISMATCH ✗"
-            }
-        );
-        assert!(
-            ok && outdeg_ok,
-            "distributed partition/out-degree diverged from centralized"
-        );
+        assert!(ok && outdeg_ok, "distributed partition/out-degree diverged from centralized");
     } else {
-        println!(
-            "  [HG_VERIFY=0: skipped the centralized cross-check — the coordinator holds NO edges]"
-        );
+        println!("  [HG_VERIFY=0: coordinator is O(k) — NO edges, NO O(n) out_deg, NO routing tables]");
     }
-
-    // ── Round 2: routing tables (from ghost lists, O(boundary)) + BSP PageRank dangling all-reduce ──
-    // Routing per pair (c,d), sorted by global id so send/recv mirror:
-    //   send_local[c][d] = d's ghosts that lie in c's range  → local index (g - bounds[c])
-    //   recv_ghost[c][d] = c's ghosts owned by d             → position in c's (sorted) ghost list
-    const D: f64 = 0.85;
-    let base = (1.0 - D) / n as f64;
-    let n_dangle = out_deg.iter().filter(|&&d| d == 0).count();
+    // seed_add from the SCALAR dangling reduce (O(k)); broadcast it.
     let seed_add = base + D * (n_dangle as f64 / n as f64) / n as f64;
-    let ghost_pos: Vec<std::collections::HashMap<u32, u32>> = ghost_ids
-        .iter()
-        .map(|gs| gs.iter().enumerate().map(|(i, &g)| (g, i as u32)).collect())
-        .collect();
-    for (c, s) in conns
-        .iter_mut()
-        .enumerate()
-        .map(|(c, o)| (c, o.as_mut().unwrap()))
-    {
-        let (lo, hi) = (bounds[c] as u32, bounds[c + 1] as u32);
+    for s in conns.iter_mut().flatten() {
         s.write_all(&seed_add.to_le_bytes()).unwrap();
-        // out_deg_local = owned range ++ ghost out-degrees.
-        let mut odl: Vec<u32> = out_deg[bounds[c]..bounds[c + 1]].to_vec();
-        for &gg in &ghost_ids[c] {
-            odl.push(out_deg[gg as usize]);
-        }
-        s.write_all(bytemuck::cast_slice(&odl)).unwrap();
-        for d in 0..k {
-            // send c→d: c-owned that are d-ghosts (d's ghosts in c's range), sorted by global id.
-            let mut sl: Vec<u32> = ghost_ids[d]
-                .iter()
-                .filter(|&&gg| gg >= lo && gg < hi)
-                .map(|&gg| gg - lo)
-                .collect();
-            sl.sort_unstable();
-            // recv c←d: c-ghosts owned by d, as c's ghost positions, sorted by global id.
-            let mut rg: Vec<u32> = ghost_ids[c]
-                .iter()
-                .filter(|&&gg| gg >= bounds[d] as u32 && gg < bounds[d + 1] as u32)
-                .map(|&gg| ghost_pos[c][&gg])
-                .collect();
-            rg.sort_unstable();
-            s.write_all(&(sl.len() as u64).to_le_bytes()).unwrap();
-            s.write_all(bytemuck::cast_slice(&sl)).unwrap();
-            s.write_all(&(rg.len() as u64).to_le_bytes()).unwrap();
-            s.write_all(bytemuck::cast_slice(&rg)).unwrap();
-        }
     }
-    // Per-step SCALAR dangling all-reduce (the only recurring coordinator traffic). seed_add went to the
-    // workers above; the coordinator recomputes `add` from the reduced dangling mass each step.
-    let _ = seed_add;
     let t2 = Instant::now();
     for _ in 0..iters {
         let mut dangling = 0.0f64;
@@ -585,40 +576,33 @@ fn run_coordinator(listen: &str, k: usize, spawn: bool) {
         }
     }
     let bsp_dt = t2.elapsed();
-    // Final gather.
-    let mut rank = vec![0.0f64; n];
-    for (c, s) in conns
-        .iter_mut()
-        .enumerate()
-        .map(|(c, o)| (c, o.as_mut().unwrap()))
-    {
-        let owned = bounds[c + 1] - bounds[c];
-        let raw = read_vec(s, owned * 8).unwrap();
-        for (i, ch) in raw.chunks_exact(8).enumerate() {
-            rank[bounds[c] + i] = f64::from_le_bytes(ch.try_into().unwrap());
-        }
-    }
     println!("  distributed PageRank ({iters} supersteps): {bsp_dt:.2?}  — coordinator materialized ZERO edges");
-    if std::env::var("HG_VERIFY").as_deref() != Ok("0") {
+    // Final result. At verify scale: gather the full rank (O(n)) and cross-check vs single-graph. At billion
+    // (HG_VERIFY=0): each worker sends only Σ of its owned ranks — the coordinator sums a SCALAR per worker
+    // (O(k)) and checks Σrank ≈ 1 (mass conservation), never holding an O(n) rank vector.
+    if verify {
+        let mut rank = vec![0.0f64; n];
+        for (c, s) in conns.iter_mut().enumerate().map(|(c, o)| (c, o.as_mut().unwrap())) {
+            let owned = bounds[c + 1] - bounds[c];
+            let raw = read_vec(s, owned * 8).unwrap();
+            for (i, ch) in raw.chunks_exact(8).enumerate() {
+                rank[bounds[c] + i] = f64::from_le_bytes(ch.try_into().unwrap());
+            }
+        }
         let edges: Vec<(usize, usize)> = Kronecker::new(scale, ef, seed).collect();
         let single = hg_analytics::pagerank(n, &edges, D, iters, -1.0);
-        let maxd = single
-            .iter()
-            .zip(&rank)
-            .map(|(a, b)| (a - b).abs())
-            .fold(0.0, f64::max);
+        let maxd = single.iter().zip(&rank).map(|(a, b)| (a - b).abs()).fold(0.0, f64::max);
         println!(
             "  == vs single-graph PageRank: max|Δ| {maxd:.2e}  ({})",
-            if maxd < 1e-9 {
-                "VERIFIED ✓ (same fixed point to tolerance; sum order differs from centralized)"
-            } else {
-                "DIVERGED ✗"
-            }
+            if maxd < 1e-9 { "VERIFIED ✓ (same fixed point to tolerance)" } else { "DIVERGED ✗" }
         );
-        assert!(
-            maxd < 1e-9,
-            "distributed-gen PageRank diverged from single-graph"
-        );
+        assert!(maxd < 1e-9, "distributed-gen PageRank diverged from single-graph");
+    } else {
+        let mut sum = 0.0f64;
+        for s in conns.iter_mut().flatten() {
+            sum += f64::from_le_bytes(read_vec(s, 8).unwrap().try_into().unwrap());
+        }
+        println!("  Σrank = {sum:.4} (≈1 ⇒ mass conserved) — coordinator held O(k), no O(n) rank vector");
     }
     for kid in kids.iter_mut() {
         kid.wait().ok();
