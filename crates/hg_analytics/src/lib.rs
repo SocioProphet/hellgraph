@@ -27,6 +27,7 @@ pub use cc::{
     connected_components, distributed_connected_components, partition_undirected, CcShard,
 };
 pub use graph500::Kronecker;
+// pagerank_accel + pagerank_residual are defined below in this module; no re-export needed.
 pub use ooc::{pagerank_mmap, write_csr, write_csr_bucketed, write_csr_streaming, MmapCsr};
 pub use partitioner::{balance, edge_cut, fennel_partition, ldg_partition, relabel_contiguous};
 
@@ -155,6 +156,7 @@ pub fn pagerank_parallel(
     }
     let base = (1.0 - damping) / n as f64;
     let mut rank = vec![1.0 / n as f64; n];
+    let mut contrib = vec![0.0f64; n];
     for _ in 0..max_iters {
         // Dangling mass + share: serial O(n), deterministic.
         let mut dangling = 0.0;
@@ -164,13 +166,24 @@ pub fn pagerank_parallel(
             }
         }
         let add = base + damping * dangling / n as f64;
-        // Parallel pull over the O(E) work: next[v] = add + damping·Σ_{u→v} rank[u]/out_deg[u].
+        // FUSED per-vertex contribution: contrib[u] = rank[u]/out_deg[u], computed ONCE per vertex (n
+        // divides), not once per edge (m ≈ 16n divides) — and it collapses the pull's inner loop to a
+        // SINGLE gather `contrib[u]` instead of gathering rank[u] AND out_deg[u] then dividing. Same value
+        // and same summation order as before → bit-identical result; it just does 16× fewer divides and
+        // half the random gather (the memory-bound path). A dangling u never appears as a source, so its
+        // contrib is unused.
+        contrib
+            .par_iter_mut()
+            .zip(&rank)
+            .zip(&out_deg)
+            .for_each(|((c, &r), &d)| *c = if d == 0 { 0.0 } else { r / d as f64 });
+        // Parallel pull over the O(E) work: next[v] = add + damping·Σ_{u→v} contrib[u].
         let next: Vec<f64> = (0..n)
             .into_par_iter()
             .map(|v| {
                 let mut acc = 0.0;
                 for &u in &in_nbr[off[v] as usize..off[v + 1] as usize] {
-                    acc += rank[u as usize] / out_deg[u as usize] as f64; // out_deg[u] ≥ 1
+                    acc += contrib[u as usize];
                 }
                 add + damping * acc
             })
@@ -263,6 +276,182 @@ pub fn pagerank_residual(n: usize, edges: &[(usize, usize)], damping: f64, eps: 
         }
     }
     (rank, pushes)
+}
+
+// ── Anderson-accelerated PageRank — do FEWER sweeps ───────────────────────────────────────────────────────────
+/// PageRank with Anderson acceleration (Walker–Ni, type-II, history `window`, mixing β=1). Each sweep is
+/// one ordinary PageRank step `g(x)`; Anderson then mixes the last `window` fixed-point residuals through a
+/// tiny `window×window` least-squares solve to cancel the slow error modes that make plain power iteration
+/// crawl at damping 0.85 — landing on the SAME fixed point in far fewer O(E) sweeps. Robust for PageRank's
+/// nonsymmetric operator (Chebyshev assumes a real spectrum; PageRank's is complex). Deterministic: fixed
+/// window, fixed reduction order, no RNG. `window == 0` is exactly plain power iteration (empty history →
+/// no mixing), so the same code path measures the sweep saving. Returns `(rank, sweeps)`; the convergence
+/// test `Σ|g(x)−x| < tol` is byte-for-byte the one `pagerank` uses, so sweep counts compare apples-to-apples.
+pub fn pagerank_accel(
+    n: usize,
+    edges: &[(usize, usize)],
+    damping: f64,
+    max_iters: usize,
+    tol: f64,
+    window: usize,
+) -> (Vec<f64>, usize) {
+    if n == 0 {
+        return (Vec::new(), 0);
+    }
+    // Flat in-CSR (same layout as pagerank_parallel) so g(x) is one cache-friendly pull.
+    let mut out_deg = vec![0u32; n];
+    let mut off = vec![0u32; n + 1];
+    for &(u, v) in edges {
+        if u < n && v < n {
+            off[v + 1] += 1;
+        }
+    }
+    for v in 0..n {
+        off[v + 1] += off[v];
+    }
+    let mut cursor = off.clone();
+    let mut in_nbr = vec![0u32; off[n] as usize];
+    for &(u, v) in edges {
+        if u < n && v < n {
+            out_deg[u] += 1;
+            in_nbr[cursor[v] as usize] = u as u32;
+            cursor[v] += 1;
+        }
+    }
+    let base = (1.0 - damping) / n as f64;
+
+    // One PageRank sweep g(x) = add + damping·(pull), identical to pagerank_parallel's body.
+    let mut contrib = vec![0.0f64; n];
+    let step = |x: &[f64], contrib: &mut [f64]| -> Vec<f64> {
+        let mut dangling = 0.0;
+        for u in 0..n {
+            if out_deg[u] == 0 {
+                dangling += x[u];
+            }
+        }
+        let add = base + damping * dangling / n as f64;
+        contrib
+            .par_iter_mut()
+            .zip(x)
+            .zip(&out_deg)
+            .for_each(|((c, &r), &d)| *c = if d == 0 { 0.0 } else { r / d as f64 });
+        (0..n)
+            .into_par_iter()
+            .map(|v| {
+                let mut acc = 0.0;
+                for &u in &in_nbr[off[v] as usize..off[v + 1] as usize] {
+                    acc += contrib[u as usize];
+                }
+                add + damping * acc
+            })
+            .collect()
+    };
+
+    let mut x = vec![1.0 / n as f64; n];
+    let mut x_old: Vec<f64> = Vec::new();
+    let mut f_old: Vec<f64> = Vec::new();
+    let mut dx: Vec<Vec<f64>> = Vec::new(); // history columns Δx
+    let mut df: Vec<Vec<f64>> = Vec::new(); // history columns Δf
+    let mut sweeps = 0usize;
+    loop {
+        let g = step(&x, &mut contrib);
+        sweeps += 1;
+        let f: Vec<f64> = g.iter().zip(&x).map(|(a, b)| a - b).collect();
+        let diff: f64 = f.iter().map(|z| z.abs()).sum();
+        if diff < tol || sweeps >= max_iters {
+            return (g, sweeps);
+        }
+        // Grow the difference history from the previous point (needs one prior iterate).
+        if !x_old.is_empty() {
+            dx.push(x.iter().zip(&x_old).map(|(a, b)| a - b).collect());
+            df.push(f.iter().zip(&f_old).map(|(a, b)| a - b).collect());
+            if dx.len() > window {
+                dx.remove(0);
+                df.remove(0);
+            }
+        }
+        // γ = argmin_γ ‖f − Δf·γ‖  via the tiny (mk×mk) normal equations, then the Anderson update
+        // x_new = g − Σ γ_j (Δx_j + Δf_j). window==0 ⇒ df empty ⇒ γ empty ⇒ x_new = g (power iteration).
+        let gamma = anderson_lsq(&df, &f);
+        let mut x_new = g;
+        for (j, &gj) in gamma.iter().enumerate() {
+            for i in 0..n {
+                x_new[i] -= gj * (dx[j][i] + df[j][i]);
+            }
+        }
+        x_old = x;
+        f_old = f;
+        x = x_new;
+    }
+}
+
+/// Solve the Anderson least-squares γ = argmin ‖f − C·γ‖ for history columns `C` (each length n) via the
+/// regularized normal equations (CᵀC + λI)γ = Cᵀf with Gaussian elimination + partial pivoting. mk is tiny
+/// (≤ window), so this is negligible next to the O(E) sweep. Deterministic (fixed-order dot products).
+fn anderson_lsq(cols: &[Vec<f64>], f: &[f64]) -> Vec<f64> {
+    let mk = cols.len();
+    if mk == 0 {
+        return Vec::new();
+    }
+    let n = f.len();
+    let mut a = vec![vec![0.0f64; mk]; mk];
+    let mut b = vec![0.0f64; mk];
+    for i in 0..mk {
+        for j in i..mk {
+            let mut s = 0.0;
+            for t in 0..n {
+                s += cols[i][t] * cols[j][t];
+            }
+            a[i][j] = s;
+            a[j][i] = s;
+        }
+        let mut s = 0.0;
+        for t in 0..n {
+            s += cols[i][t] * f[t];
+        }
+        b[i] = s;
+    }
+    // Tikhonov regularization scaled to the matrix trace keeps the solve stable when columns near-align.
+    let tr: f64 = (0..mk).map(|i| a[i][i]).sum();
+    let lambda = 1e-12 * (tr / mk as f64).max(1e-300);
+    for (i, ai) in a.iter_mut().enumerate() {
+        ai[i] += lambda;
+    }
+    // Gaussian elimination with partial pivoting on the mk×mk system.
+    for col in 0..mk {
+        let mut piv = col;
+        for r in (col + 1)..mk {
+            if a[r][col].abs() > a[piv][col].abs() {
+                piv = r;
+            }
+        }
+        a.swap(col, piv);
+        b.swap(col, piv);
+        let d = a[col][col];
+        if d.abs() < 1e-300 {
+            continue;
+        }
+        for r in (col + 1)..mk {
+            let factor = a[r][col] / d;
+            for c in col..mk {
+                a[r][c] -= factor * a[col][c];
+            }
+            b[r] -= factor * b[col];
+        }
+    }
+    let mut gamma = vec![0.0f64; mk];
+    for i in (0..mk).rev() {
+        let mut s = b[i];
+        for j in (i + 1)..mk {
+            s -= a[i][j] * gamma[j];
+        }
+        gamma[i] = if a[i][i].abs() < 1e-300 {
+            0.0
+        } else {
+            s / a[i][i]
+        };
+    }
+    gamma
 }
 
 // ── Connected components (union-find — the fast single-machine path) ──────────────────────────────────────────
@@ -685,6 +874,34 @@ mod tests {
         // still stay active a while when damping is 0.85.
         let power_work = 100 * m;
         assert!(pushes < power_work, "residual ({pushes}) not < power iteration ({power_work})");
+    }
+
+    #[test]
+    fn anderson_reaches_same_fixed_point_in_fewer_sweeps() {
+        use crate::Kronecker;
+        let n = Kronecker::vertices(14); // 16384
+        let edges: Vec<(usize, usize)> = Kronecker::new(14, 16, 0x9).collect();
+        let tol = 1e-10;
+
+        // window==0 IS plain power iteration (same code path); window=5 is Anderson-accelerated.
+        let (power, power_sweeps) = pagerank_accel(n, &edges, D, 1000, tol, 0);
+        let (accel, accel_sweeps) = pagerank_accel(n, &edges, D, 1000, tol, 5);
+
+        // Same fixed point as the canonical serial engine (both, to tolerance).
+        let reference = pagerank(n, &edges, D, 1000, tol);
+        let dp = power.iter().zip(&reference).map(|(a, b)| (a - b).abs()).fold(0.0, f64::max);
+        let da = accel.iter().zip(&reference).map(|(a, b)| (a - b).abs()).fold(0.0, f64::max);
+        assert!(dp < 1e-8, "power-iteration path diverged: {dp:e}");
+        assert!(da < 1e-8, "Anderson landed on a different fixed point: {da:e}");
+
+        // The whole point: FEWER O(E) sweeps to the same tolerance.
+        assert!(
+            accel_sweeps < power_sweeps,
+            "Anderson ({accel_sweeps}) must beat power iteration ({power_sweeps}) in sweeps"
+        );
+
+        // Deterministic run-to-run.
+        assert_eq!(accel, pagerank_accel(n, &edges, D, 1000, tol, 5).0, "deterministic");
     }
 
     #[test]
