@@ -835,7 +835,10 @@ mod tests {
             }
         }
 
-        assert_eq!(central, dist, "distributed generation+routing diverged from centralized partition");
+        assert_eq!(
+            central, dist,
+            "distributed generation+routing diverged from centralized partition"
+        );
     }
 
     #[test]
