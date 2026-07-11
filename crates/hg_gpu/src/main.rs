@@ -189,7 +189,8 @@ fn main() {
         Vec::new()
     };
 
-    // ── GPU setup ────────────────────────────────────────────────────────────────────────────────────
+    // ── GPU setup (device + CSR upload + pipelines) — the ONE-TIME cost a repeated query amortises ──────
+    let t_setup = Instant::now();
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::default());
     let adapter = instance
         .request_adapter(&wgpu::RequestAdapterOptions {
@@ -240,13 +241,14 @@ fn main() {
     let b_inv = buf(bytemuck::cast_slice(&inv_outdeg), st);
     let b_dng = buf(bytemuck::cast_slice(&is_dangling), st);
     let init = vec![1.0f32 / n as f32; n];
+    // COPY_DST too: a repeated query re-seeds these to 1/n (reusing the uploaded CSR + pipelines).
     let b_a = buf(
         bytemuck::cast_slice(&init),
-        st | wgpu::BufferUsages::COPY_SRC,
+        st | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
     );
     let b_b = buf(
         bytemuck::cast_slice(&init),
-        st | wgpu::BufferUsages::COPY_SRC,
+        st | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
     );
     let b_part = device.create_buffer(&wgpu::BufferDescriptor {
         label: None,
@@ -397,45 +399,75 @@ fn main() {
         }),
     );
 
-    // Batch ALL iterations into ONE command buffer → a single CPU↔GPU sync for the whole run. Each superstep
-    // is 3 passes (dangling L1 → reduce L2 → spmv); separate passes give the memory barrier the data
-    // dependency needs, and the ping-pong alternates bind groups.
-    let t = Instant::now();
-    let mut enc = device.create_command_encoder(&Default::default());
-    let mut dir = 0usize;
-    let pass =
-        |enc: &mut wgpu::CommandEncoder, pipe: &wgpu::ComputePipeline, bgi: usize, groups: u32| {
+    let setup_s = t_setup.elapsed().as_secs_f64();
+
+    // A PageRank query that REUSES the uploaded CSR + pipelines (the "PreparedGpuGraph" idea): re-seed the
+    // ping-pong buffers to 1/n, batch all iterations into ONE command buffer (a single CPU↔GPU sync), read
+    // back. The uploaded CSR/pipelines are NOT rebuilt — that's the whole point of holding the engine.
+    let run_query = || -> (Vec<f32>, f64) {
+        queue.write_buffer(&b_a, 0, bytemuck::cast_slice(&init));
+        queue.write_buffer(&b_b, 0, bytemuck::cast_slice(&init));
+        let t = Instant::now();
+        let mut enc = device.create_command_encoder(&Default::default());
+        let mut dir = 0usize;
+        let pass = |enc: &mut wgpu::CommandEncoder,
+                    pipe: &wgpu::ComputePipeline,
+                    bgi: usize,
+                    groups: u32| {
             let mut cp = enc.begin_compute_pass(&Default::default());
             cp.set_pipeline(pipe);
             cp.set_bind_group(0, &bg[bgi], &[]);
             cp.dispatch_workgroups(groups, 1, 1);
         };
-    for _ in 0..iters {
-        pass(&mut enc, &pipe_dng, dir, grid); // L1: dangling partials + contrib (fused, one rank_in read)
-        pass(&mut enc, &pipe_reduce, dir, 1); // L2: partials → dsum (one workgroup)
-        pass(&mut enc, &pipe_spmv, dir, grid); // rank_out = add + damping·SpMV (ONE gather/edge)
-        dir ^= 1;
-    }
-    queue.submit([enc.finish()]);
-    device.poll(wgpu::Maintain::Wait);
-    let gpu_s = t.elapsed().as_secs_f64();
+        for _ in 0..iters {
+            pass(&mut enc, &pipe_dng, dir, grid); // L1: dangling partials + contrib (fused)
+            pass(&mut enc, &pipe_reduce, dir, 1); // L2: partials → dsum
+            pass(&mut enc, &pipe_spmv, dir, grid); // SpMV (ONE gather/edge)
+            dir ^= 1;
+        }
+        queue.submit([enc.finish()]);
+        device.poll(wgpu::Maintain::Wait);
+        let gpu_s = t.elapsed().as_secs_f64();
+        let final_buf = if dir == 0 { &b_a } else { &b_b };
+        let mut enc = device.create_command_encoder(&Default::default());
+        enc.copy_buffer_to_buffer(final_buf, 0, &staging, 0, (n as u64) * 4);
+        queue.submit([enc.finish()]);
+        let slice = staging.slice(0..(n as u64) * 4);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        device.poll(wgpu::Maintain::Wait);
+        let rank: Vec<f32> = bytemuck::cast_slice::<u8, f32>(&slice.get_mapped_range()).to_vec();
+        staging.unmap();
+        (rank, gpu_s)
+    };
 
-    // ── Read back the final rank (it's in the buffer we'd read next) ─────────────────────────────────
-    let final_buf = if dir == 0 { &b_a } else { &b_b };
-    let mut enc = device.create_command_encoder(&Default::default());
-    enc.copy_buffer_to_buffer(final_buf, 0, &staging, 0, (n as u64) * 4);
-    queue.submit([enc.finish()]);
-    let slice = staging.slice(0..(n as u64) * 4);
-    slice.map_async(wgpu::MapMode::Read, |_| {});
-    device.poll(wgpu::Maintain::Wait);
-    let gpu_rank: Vec<f32> = bytemuck::cast_slice::<u8, f32>(&slice.get_mapped_range()).to_vec();
-    staging.unmap();
-
+    let (gpu_rank, gpu_s) = run_query();
     let gteps = m as f64 * iters as f64 / gpu_s / 1e9;
     println!(
         "  GPU {iters} iters: {gpu_s:.3}s  →  {gteps:.2} GTEPS  ({:.1} Medges·it/s)",
         gteps * 1000.0
     );
+    // Build-once-run-many on the GPU: setup (upload+pipelines) is paid ONCE; a repeated query is just the
+    // compute. HG_REPEAT>1 measures it — the analog of the CPU PreparedGraph win.
+    let repeat = env("HG_REPEAT", 1);
+    if repeat > 1 {
+        let mut reuse = 0.0;
+        for _ in 0..repeat {
+            reuse += run_query().1;
+        }
+        let cold = setup_s + gpu_s; // a fresh engine per query = setup + compute each time
+        let warm = reuse / repeat as f64; // reused engine = compute only
+        println!(
+            "  build-once-run-many: setup {:.0}ms paid once; per-query compute {:.0}ms",
+            setup_s * 1000.0,
+            warm * 1000.0
+        );
+        println!(
+            "  ⇒ {repeat} queries: rebuild-each {:.0}ms vs reuse {:.0}ms = {:.2}× faster",
+            repeat as f64 * cold * 1000.0,
+            (setup_s + reuse) * 1000.0,
+            (repeat as f64 * cold) / (setup_s + reuse)
+        );
+    }
     if verify {
         let maxd = cpu
             .iter()
