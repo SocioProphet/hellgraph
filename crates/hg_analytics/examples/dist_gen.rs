@@ -15,7 +15,7 @@
 //!   HG_SCALE=18 HG_SHARDS=8 cargo run -p hg_analytics --release --example dist_gen
 
 use hg_analytics::{owner_of, range_bounds, Kronecker};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::time::Instant;
@@ -106,12 +106,17 @@ fn run_worker(coord_addr: &str, id: usize) {
         .collect();
 
     // 1. Generate ONLY this worker's edge slice (O(1) seek — no coordinator, no whole graph).
+    let n = Kronecker::vertices(scale);
     let m = Kronecker::edges(scale, ef);
     let start = id * m / k;
     let count = (id + 1) * m / k - start;
-    // 2. Bucket by target-owner.
+    // 2. Bucket by target-owner. Also accumulate a per-SOURCE out-degree partial: each edge (u,v) is one of
+    //    u's out-edges. Out-degree is a source property but edges shuffle by TARGET, so out_deg can't be
+    //    counted from the received in-edges — we count it here (over the generated slice) and reduce it.
     let mut buckets: Vec<Vec<(u32, u32)>> = vec![Vec::new(); k];
+    let mut out_deg_partial = vec![0u32; n];
     for (u, v) in Kronecker::slice(scale, seed, start, count) {
+        out_deg_partial[u] += 1;
         buckets[owner_of(v, &bounds)].push((u as u32, v as u32));
     }
 
@@ -186,25 +191,58 @@ fn run_worker(coord_addr: &str, id: usize) {
         w.join().unwrap();
     }
 
-    // 4. Local shard: owned range + ghost discovery. (Bit-exact-verifiable summary sent to coordinator.)
+    // 4. Local shard: owned range, ghost discovery, and the local in-CSR for the BSP PageRank.
     let (lo, hi) = (bounds[id], bounds[id + 1]);
-    let mut ghosts: BTreeSet<usize> = BTreeSet::new();
-    for &(u, v) in &in_edges {
-        debug_assert!((v as usize) >= lo && (v as usize) < hi);
+    let owned = hi - lo;
+    let mut ghost_set: BTreeSet<usize> = BTreeSet::new();
+    for &(u, _v) in &in_edges {
         if (u as usize) < lo || (u as usize) >= hi {
-            ghosts.insert(u as usize);
+            ghost_set.insert(u as usize);
         }
     }
-    // Deterministic fingerprint of this shard's in-edge SET (sorted) so the coordinator can verify the
-    // distributed partition matches the centralized one bit-for-bit.
-    let mut sorted = in_edges.clone();
-    sorted.sort_unstable();
-    let fp = fnv1a(&sorted);
+    let ghosts: Vec<usize> = ghost_set.into_iter().collect();
+    let ghost_idx: HashMap<usize, usize> =
+        ghosts.iter().enumerate().map(|(i, &g)| (g, i)).collect();
+    // Sort in-edges by (target, source): the network arrival order is nondeterministic, so sorting makes
+    // the in-CSR — and thus the PageRank sum order — DETERMINISTIC run-to-run (and independent of node
+    // count). Not bit-identical to the centralized generation-order build, but the same fixed point to
+    // float tolerance, which is the bar for the distributed path.
+    in_edges.sort_unstable_by_key(|&(u, v)| (v, u));
+    let mut off = vec![0u32; owned + 1];
+    for &(_u, v) in &in_edges {
+        off[(v as usize - lo) + 1] += 1;
+    }
+    for v in 0..owned {
+        off[v + 1] += off[v];
+    }
+    let mut nbr = vec![0u32; in_edges.len()];
+    let mut cur = off.clone();
+    for &(u, v) in &in_edges {
+        let li = if (u as usize) >= lo && (u as usize) < hi {
+            (u as usize - lo) as u32
+        } else {
+            (owned + ghost_idx[&(u as usize)]) as u32
+        };
+        let t = v as usize - lo;
+        nbr[cur[t] as usize] = li;
+        cur[t] += 1;
+    }
+    let _ = (&off, &nbr); // in-CSR ready for the BSP layer (round 2)
+
+    // Fingerprint the in-edge SET in the CANONICAL (u,v) order (matches the coordinator's centralized sort,
+    // independent of my (v,u) CSR ordering) so the cross-check compares SETS, not orderings.
+    let mut fp_sorted = in_edges.clone();
+    fp_sorted.sort_unstable();
+    let fp = fnv1a(&fp_sorted);
     ctrl.write_all(&(in_edges.len() as u64).to_le_bytes())
         .unwrap();
     ctrl.write_all(&(ghosts.len() as u64).to_le_bytes())
         .unwrap();
     ctrl.write_all(&fp.to_le_bytes()).unwrap();
+    // Send the out-degree partial (n u32) for the GLOBAL out-degree reduce on the coordinator (O(n), not
+    // O(m) — the coordinator still never holds the edges).
+    ctrl.write_all(bytemuck::cast_slice(&out_deg_partial))
+        .unwrap();
 }
 
 fn fnv1a(edges: &[(u32, u32)]) -> u64 {
@@ -275,11 +313,14 @@ fn run_coordinator(listen: &str, k: usize, spawn: bool) {
         s.write_all(&roster_blob).unwrap();
     }
 
-    // Collect per-worker summaries (edge count, ghost count, fingerprint).
+    // Collect per-worker summaries (edge count, ghost count, fingerprint) + the out-degree partial reduce.
+    // Summing n-length partials is O(n)·k coordinator work — NOT O(m); the coordinator still never holds
+    // the edges (the #12 win). Ghost out-degrees + routing come from these in round 2.
     let t = Instant::now();
     let mut total_edges = 0u64;
     let mut total_ghosts = 0u64;
     let mut fps = vec![0u64; k];
+    let mut out_deg = vec![0u32; n];
     for (c, s) in conns
         .iter_mut()
         .enumerate()
@@ -288,6 +329,10 @@ fn run_coordinator(listen: &str, k: usize, spawn: bool) {
         total_edges += rd_u64(&read_vec(s, 8).unwrap(), &mut 0);
         total_ghosts += rd_u64(&read_vec(s, 8).unwrap(), &mut 0);
         fps[c] = rd_u64(&read_vec(s, 8).unwrap(), &mut 0);
+        let raw = read_vec(s, n * 4).unwrap();
+        for (v, ch) in raw.chunks_exact(4).enumerate() {
+            out_deg[v] += u32::from_le_bytes(ch.try_into().unwrap());
+        }
     }
     let dt = t.elapsed();
     for kid in kids.iter_mut() {
@@ -304,8 +349,10 @@ fn run_coordinator(listen: &str, k: usize, spawn: bool) {
     // (Only at verifiable scale — the whole point is the coordinator does NOT do this at billion scale.)
     if std::env::var("HG_VERIFY").as_deref() != Ok("0") {
         let mut central: Vec<Vec<(u32, u32)>> = vec![Vec::new(); k];
+        let mut central_outdeg = vec![0u32; n];
         for (u, v) in Kronecker::new(scale, ef, seed) {
             central[owner_of(v, &bounds)].push((u as u32, v as u32));
+            central_outdeg[u] += 1;
         }
         let mut ok = true;
         for c in 0..k {
@@ -315,11 +362,23 @@ fn run_coordinator(listen: &str, k: usize, spawn: bool) {
                 eprintln!("  shard {c} MISMATCH vs centralized");
             }
         }
+        let outdeg_ok = out_deg == central_outdeg;
         println!(
             "  == vs centralized range-partition: {} (each shard's in-edge SET bit-identical)",
             if ok { "EXACT ✓" } else { "MISMATCH ✗" }
         );
-        assert!(ok, "distributed partition diverged from centralized");
+        println!(
+            "  == distributed out-degree reduce: {} (global out_deg == centralized)",
+            if outdeg_ok {
+                "EXACT ✓"
+            } else {
+                "MISMATCH ✗"
+            }
+        );
+        assert!(
+            ok && outdeg_ok,
+            "distributed partition/out-degree diverged from centralized"
+        );
     } else {
         println!(
             "  [HG_VERIFY=0: skipped the centralized cross-check — the coordinator holds NO edges]"
