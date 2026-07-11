@@ -31,6 +31,25 @@ fn read_vec(s: &mut impl Read, bytes: usize) -> std::io::Result<Vec<u8>> {
     s.read_exact(&mut b)?;
     Ok(b)
 }
+/// write_all that RETRIES on ENOBUFS (OS 55) / WouldBlock instead of panicking. On loopback (and under
+/// heavy concurrent all-to-all), a big write can exhaust kernel mbufs mid-flight; back off briefly and
+/// continue rather than crash. On a real cluster NIC this is rare, but the retry costs nothing.
+fn write_robust(s: &mut TcpStream, buf: &[u8]) {
+    let mut off = 0;
+    while off < buf.len() {
+        match s.write(&buf[off..]) {
+            Ok(0) => std::thread::sleep(std::time::Duration::from_millis(1)),
+            Ok(n) => off += n,
+            Err(e)
+                if e.raw_os_error() == Some(55)
+                    || e.kind() == std::io::ErrorKind::WouldBlock =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            Err(e) => panic!("write failed: {e}"),
+        }
+    }
+}
 fn rd_u64(raw: &[u8], p: &mut usize) -> u64 {
     let v = u64::from_le_bytes(raw[*p..*p + 8].try_into().unwrap());
     *p += 8;
@@ -58,8 +77,8 @@ fn all_to_all(peers: &[Option<TcpStream>], id: usize, k: usize, mut payload: Vec
         let mut wr = peers[d].as_ref().unwrap().try_clone().unwrap();
         let p = std::mem::take(&mut payload[d]);
         writers.push(std::thread::spawn(move || {
-            wr.write_all(&(p.len() as u64).to_le_bytes()).unwrap();
-            wr.write_all(&p).unwrap();
+            write_robust(&mut wr, &(p.len() as u64).to_le_bytes());
+            write_robust(&mut wr, &p);
         }));
     }
     let mut rxs = Vec::new();
@@ -196,15 +215,15 @@ fn run_worker(coord_addr: &str, id: usize) {
         let sb = std::mem::take(&mut src_buckets[d]);
         writers.push(std::thread::spawn(move || {
             // Section 1: edges targeting d. Section 2: source-occurrences owned by d (for d's out-degree).
-            wr.write_all(&(b.len() as u64).to_le_bytes()).unwrap();
+            write_robust(&mut wr, &(b.len() as u64).to_le_bytes());
             let mut payload = Vec::with_capacity(b.len() * 8);
             for &(u, v) in &b {
                 payload.extend_from_slice(&u.to_le_bytes());
                 payload.extend_from_slice(&v.to_le_bytes());
             }
-            wr.write_all(&payload).unwrap();
-            wr.write_all(&(sb.len() as u64).to_le_bytes()).unwrap();
-            wr.write_all(bytemuck::cast_slice(&sb)).unwrap();
+            write_robust(&mut wr, &payload);
+            write_robust(&mut wr, &(sb.len() as u64).to_le_bytes());
+            write_robust(&mut wr, bytemuck::cast_slice(&sb));
         }));
     }
     let mut rx = Vec::new();
