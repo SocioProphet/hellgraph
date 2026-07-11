@@ -15,6 +15,7 @@ mod cc;
 mod graph500;
 mod ooc;
 mod partitioner;
+mod topology;
 pub use boundary::{
     distributed_bfs_boundary, distributed_cc_boundary, distributed_cdlp_boundary,
     distributed_lcc_boundary, distributed_pagerank_boundary, distributed_pagerank_boundary_delta,
@@ -31,6 +32,9 @@ pub use graph500::Kronecker;
 // pagerank_accel + pagerank_residual + PreparedGraph are defined below in this module; no re-export needed.
 pub use ooc::{pagerank_mmap, write_csr, write_csr_bucketed, write_csr_streaming, MmapCsr};
 pub use partitioner::{balance, edge_cut, fennel_partition, ldg_partition, relabel_contiguous};
+pub use topology::{
+    plan_pagerank, ClusterSpec, Plan, PlannerConfig, Topology, Workload, RESIDENT_BYTES_PER_EDGE,
+};
 
 /// Cold PageRank over a 0..n indexed graph. Dangling nodes (no out-edges) redistribute their mass uniformly.
 pub fn pagerank(
