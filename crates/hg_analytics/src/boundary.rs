@@ -47,6 +47,28 @@ pub fn total_halo_bytes(shards: &[BoundaryShard]) -> usize {
     shards.iter().map(BoundaryShard::halo_bytes).sum()
 }
 
+/// The `k` equal contiguous vertex ranges (the range partition). Boundary `c` owns `[bounds[c], bounds[c+1])`.
+/// This is the partition each worker can compute LOCALLY with no coordinator — the basis for distributed
+/// generation: a worker knows which vertices it owns, generates its own edge slice, and routes each edge to
+/// the shard owning its target. No node ever holds the whole graph.
+pub fn range_bounds(n: usize, k: usize) -> Vec<usize> {
+    if n == 0 {
+        return vec![0];
+    }
+    let k = k.clamp(1, n);
+    let size = n.div_ceil(k);
+    (0..=k).map(|c| (c * size).min(n)).collect()
+}
+
+/// Which shard owns vertex `v`, given contiguous `bounds` — the routing function for the edge shuffle.
+pub fn owner_of(v: usize, bounds: &[usize]) -> usize {
+    let k = bounds.len() - 1;
+    match bounds.binary_search(&v) {
+        Ok(c) => c.min(k - 1),
+        Err(c) => c - 1,
+    }
+}
+
 /// Range-partition into `k` boundary shards (each owns a contiguous node range) + the global out-degree
 /// vector (static setup metadata). Each shard's ghost set is discovered from the in-edges it owns.
 pub fn partition_edges_boundary(
@@ -780,6 +802,40 @@ mod tests {
             }
         }
         dist
+    }
+
+    #[test]
+    fn distributed_generation_reproduces_centralized_partition() {
+        // THE #12 invariant: each worker independently generates its OWN edge slice (via the seekable
+        // Kronecker) and routes each edge to the shard owning its target vertex — and the resulting per-shard
+        // in-edge partition is BIT-IDENTICAL to a coordinator range-partitioning the whole graph. If this
+        // holds, the distributed engine (no node holds the whole graph) computes the same verified answer.
+        let scale = 12u32;
+        let ef = 8usize;
+        let seed = 0xB0A7u64;
+        let k = 8usize;
+        let n = Kronecker::vertices(scale);
+        let m = Kronecker::edges(scale, ef);
+        let bounds = range_bounds(n, k);
+
+        // Centralized: the whole graph, range-partitioned by target vertex.
+        let mut central: Vec<BTreeSet<(usize, usize)>> = vec![BTreeSet::new(); k];
+        for e in Kronecker::new(scale, ef, seed) {
+            central[owner_of(e.1, &bounds)].insert(e);
+        }
+
+        // Distributed: every worker generates ONLY its edge slice, routes each edge to the owner. No worker
+        // ever sees the whole graph; the slices are disjoint and cover [0, m).
+        let mut dist: Vec<BTreeSet<(usize, usize)>> = vec![BTreeSet::new(); k];
+        for c in 0..k {
+            let start = c * m / k;
+            let count = (c + 1) * m / k - start;
+            for e in Kronecker::slice(scale, seed, start, count) {
+                dist[owner_of(e.1, &bounds)].insert(e);
+            }
+        }
+
+        assert_eq!(central, dist, "distributed generation+routing diverged from centralized partition");
     }
 
     #[test]
