@@ -131,12 +131,26 @@ pub fn pagerank_parallel(
     if n == 0 {
         return Vec::new();
     }
-    let mut out_deg = vec![0usize; n];
-    let mut in_adj: Vec<Vec<usize>> = vec![Vec::new(); n];
+    // FLAT CSR + u32 (not Vec<Vec<usize>>): the in-neighbours live in ONE contiguous array indexed by a
+    // per-vertex offset — sequential, cache-friendly, half the id width. Same insertion order as the old
+    // adjacency, so the result is bit-identical; it's just the layout that stops thrashing the cache.
+    let mut out_deg = vec![0u32; n];
+    let mut off = vec![0u32; n + 1];
+    for &(u, v) in edges {
+        if u < n && v < n {
+            off[v + 1] += 1;
+        }
+    }
+    for v in 0..n {
+        off[v + 1] += off[v];
+    }
+    let mut cursor = off.clone();
+    let mut in_nbr = vec![0u32; off[n] as usize];
     for &(u, v) in edges {
         if u < n && v < n {
             out_deg[u] += 1;
-            in_adj[v].push(u);
+            in_nbr[cursor[v] as usize] = u as u32;
+            cursor[v] += 1;
         }
     }
     let base = (1.0 - damping) / n as f64;
@@ -155,8 +169,8 @@ pub fn pagerank_parallel(
             .into_par_iter()
             .map(|v| {
                 let mut acc = 0.0;
-                for &u in &in_adj[v] {
-                    acc += rank[u] / out_deg[u] as f64; // out_deg[u] ≥ 1 (u has edge u→v)
+                for &u in &in_nbr[off[v] as usize..off[v + 1] as usize] {
+                    acc += rank[u as usize] / out_deg[u as usize] as f64; // out_deg[u] ≥ 1
                 }
                 add + damping * acc
             })
