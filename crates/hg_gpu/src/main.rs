@@ -11,10 +11,9 @@ use std::time::Instant;
 use wgpu::util::DeviceExt;
 
 const D: f32 = 0.85;
-const WG: u32 = 256; // workgroup size
 
 const SHADER: &str = r#"
-struct Params { n: u32, base: f32, damping: f32, add: f32 };
+struct Params { n: u32, base: f32, damping: f32, num_wg: u32 };
 @group(0) @binding(0) var<uniform> P: Params;
 @group(0) @binding(1) var<storage, read> offsets: array<u32>;      // n+1 (in-CSR row pointers)
 @group(0) @binding(2) var<storage, read> in_nbr: array<u32>;       // m   (in-neighbour sources)
@@ -22,42 +21,84 @@ struct Params { n: u32, base: f32, damping: f32, add: f32 };
 @group(0) @binding(4) var<storage, read> is_dangling: array<u32>;  // n   (1 if outdeg==0)
 @group(0) @binding(5) var<storage, read> rank_in: array<f32>;      // n
 @group(0) @binding(6) var<storage, read_write> rank_out: array<f32>; // n
-@group(0) @binding(7) var<storage, read_write> partials: array<f32>; // one per workgroup (dangling sum)
+@group(0) @binding(7) var<storage, read_write> partials: array<f32>; // one per workgroup (dangling partials)
+@group(0) @binding(8) var<storage, read_write> dsum: array<f32>;   // [0] = total dangling mass (GPU-resident)
 
-// SpMV pull: rank_out[v] = add + damping * sum_{u->v} rank_in[u] * inv_outdeg[u].
+var<workgroup> sdata: array<f32, 256>;
+
+// L1 — GRID-STRIDE: each workgroup strides over the vertices, summing dangling rank, → one partial per wg.
+// (No barrier inside the strided accumulation, so threads may finish at different times — the reduction
+// barrier after is reached uniformly.) num_wg workgroups total (P.num_wg), fixed & small.
 @compute @workgroup_size(256)
-fn spmv(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let v = gid.x;
-  if (v >= P.n) { return; }
+fn dangling(@builtin(local_invocation_id) lid: vec3<u32>,
+            @builtin(workgroup_id) wid: vec3<u32>,
+            @builtin(num_workgroups) ng: vec3<u32>) {
+  let stride = ng.x * 256u;
   var acc = 0.0;
-  let s = offsets[v];
-  let e = offsets[v + 1u];
-  for (var i = s; i < e; i = i + 1u) {
-    let u = in_nbr[i];
-    acc = acc + rank_in[u] * inv_outdeg[u];
+  var v = wid.x * 256u + lid.x;
+  loop {
+    if (v >= P.n) { break; }
+    if (is_dangling[v] == 1u) { acc = acc + rank_in[v]; }
+    v = v + stride;
   }
-  rank_out[v] = P.add + P.damping * acc;
+  sdata[lid.x] = acc;
+  workgroupBarrier();
+  var s = 128u;
+  loop { if (s == 0u) { break; } if (lid.x < s) { sdata[lid.x] = sdata[lid.x] + sdata[lid.x + s]; } workgroupBarrier(); s = s / 2u; }
+  if (lid.x == 0u) { partials[wid.x] = sdata[0]; }
 }
 
-// Dangling mass: workgroup reduction of rank_in[v] over dangling v → one partial per workgroup.
-var<workgroup> sdata: array<f32, 256>;
+// L2 — ONE workgroup grid-strides all `num_wg` partials → dsum[0]. Dangling mass stays on-device.
 @compute @workgroup_size(256)
-fn dangling(@builtin(global_invocation_id) gid: vec3<u32>,
-            @builtin(local_invocation_id) lid: vec3<u32>,
-            @builtin(workgroup_id) wid: vec3<u32>) {
-  let v = gid.x;
-  var val = 0.0;
-  if (v < P.n && is_dangling[v] == 1u) { val = rank_in[v]; }
-  sdata[lid.x] = val;
+fn reduce_final(@builtin(local_invocation_id) lid: vec3<u32>) {
+  var acc = 0.0;
+  var i = lid.x;
+  loop { if (i >= P.num_wg) { break; } acc = acc + partials[i]; i = i + 256u; }
+  sdata[lid.x] = acc;
   workgroupBarrier();
-  var stride = 128u;
+  var s = 128u;
+  loop { if (s == 0u) { break; } if (lid.x < s) { sdata[lid.x] = sdata[lid.x] + sdata[lid.x + s]; } workgroupBarrier(); s = s / 2u; }
+  if (lid.x == 0u) { dsum[0] = sdata[0]; }
+}
+
+// SpMV — WARP-PER-VERTEX + GRID-STRIDE: a 32-lane sub-warp cooperatively sums each vertex's in-neighbours
+// (so a million-degree hub is split across 32 threads, not stalling one), and the workgroup grid-strides
+// over vertices. `base_v` is UNIFORM across the workgroup so every barrier is reached by all threads.
+@compute @workgroup_size(256)
+fn spmv(@builtin(local_invocation_id) lid: vec3<u32>,
+        @builtin(workgroup_id) wid: vec3<u32>,
+        @builtin(num_workgroups) ng: vec3<u32>) {
+  let lane = lid.x & 31u;
+  let sw = lid.x >> 5u;
+  let step = ng.x * 8u;   // sub-warps across the whole grid
+  let add = P.base + P.damping * dsum[0] / f32(P.n);
+  var base_v = wid.x * 8u; // UNIFORM per workgroup → uniform loop count → uniform barriers
   loop {
-    if (stride == 0u) { break; }
-    if (lid.x < stride) { sdata[lid.x] = sdata[lid.x] + sdata[lid.x + stride]; }
+    if (base_v >= P.n) { break; }
+    let v = base_v + sw;
+    var acc = 0.0;
+    if (v < P.n) {
+      let s = offsets[v];
+      let e = offsets[v + 1u];
+      for (var i = s + lane; i < e; i = i + 32u) {
+        let u = in_nbr[i];
+        acc = acc + rank_in[u] * inv_outdeg[u];
+      }
+    }
+    sdata[lid.x] = acc;
     workgroupBarrier();
-    stride = stride / 2u;
+    if (lane < 16u) { sdata[lid.x] = sdata[lid.x] + sdata[lid.x + 16u]; }
+    workgroupBarrier();
+    if (lane < 8u) { sdata[lid.x] = sdata[lid.x] + sdata[lid.x + 8u]; }
+    workgroupBarrier();
+    if (lane < 4u) { sdata[lid.x] = sdata[lid.x] + sdata[lid.x + 4u]; }
+    workgroupBarrier();
+    if (lane < 2u) { sdata[lid.x] = sdata[lid.x] + sdata[lid.x + 2u]; }
+    workgroupBarrier();
+    if (lane == 0u && v < P.n) { rank_out[v] = add + P.damping * (sdata[lid.x] + sdata[lid.x + 1u]); }
+    workgroupBarrier();
+    base_v = base_v + step;
   }
-  if (lid.x == 0u) { partials[wid.x] = sdata[0]; }
 }
 "#;
 
@@ -67,7 +108,7 @@ struct Params {
     n: u32,
     base: f32,
     damping: f32,
-    add: f32,
+    num_wg: u32,
 }
 
 fn env(k: &str, d: usize) -> usize {
@@ -146,7 +187,9 @@ fn main() {
         .block_on()
         .expect("no device");
 
-    let num_wg = n.div_ceil(WG as usize) as u32;
+    // Fixed grid-stride dispatch: `grid` workgroups each stride over many vertices → covers ANY graph size
+    // with one dispatch (no 65535 cap), and keeps the GPU saturated. `partials` has one entry per workgroup.
+    let grid = 8192u32;
     let buf = |data: &[u8], usage: wgpu::BufferUsages| {
         device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: None,
@@ -170,7 +213,13 @@ fn main() {
     );
     let b_part = device.create_buffer(&wgpu::BufferDescriptor {
         label: None,
-        size: (num_wg as u64) * 4,
+        size: (grid as u64) * 4,
+        usage: st | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let b_dsum = device.create_buffer(&wgpu::BufferDescriptor {
+        label: None,
+        size: 4, // one f32: total dangling mass, kept GPU-resident (no per-iter readback)
         usage: st | wgpu::BufferUsages::COPY_SRC,
         mapped_at_creation: false,
     });
@@ -182,7 +231,7 @@ fn main() {
     });
     let staging = device.create_buffer(&wgpu::BufferDescriptor {
         label: None,
-        size: (n as u64).max(num_wg as u64) * 4,
+        size: (n as u64) * 4,
         usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
@@ -217,6 +266,7 @@ fn main() {
             bge(5, ro),
             bge(6, rw),
             bge(7, rw),
+            bge(8, rw),
         ],
     });
     let pipe_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -236,6 +286,7 @@ fn main() {
     };
     let pipe_spmv = make_pipe("spmv");
     let pipe_dng = make_pipe("dangling");
+    let pipe_reduce = make_pipe("reduce_final");
 
     // Two bind groups for ping-pong: dir 0 reads A→writes B; dir 1 reads B→writes A.
     let bind = |rin: &wgpu::Buffer, rout: &wgpu::Buffer| {
@@ -275,63 +326,49 @@ fn main() {
                     binding: 7,
                     resource: b_part.as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: b_dsum.as_entire_binding(),
+                },
             ],
         })
     };
     let bg = [bind(&b_a, &b_b), bind(&b_b, &b_a)];
 
     let base = (1.0 - D) / n as f32;
-    // Read back `num_wg` partials, sum → dangling.
-    let read_partials = |device: &wgpu::Device, queue: &wgpu::Queue| -> f32 {
-        let mut enc = device.create_command_encoder(&Default::default());
-        enc.copy_buffer_to_buffer(&b_part, 0, &staging, 0, (num_wg as u64) * 4);
-        queue.submit([enc.finish()]);
-        let slice = staging.slice(0..(num_wg as u64) * 4);
-        slice.map_async(wgpu::MapMode::Read, |_| {});
-        device.poll(wgpu::Maintain::Wait);
-        let sum: f32 = bytemuck::cast_slice::<u8, f32>(&slice.get_mapped_range())
-            .iter()
-            .sum();
-        staging.unmap();
-        sum
-    };
+    // Params are constant across iterations — `add` is computed ON-DEVICE from the GPU-resident dangling
+    // mass, so there is no per-iteration CPU write or readback (that sync was the whole first-version stall).
+    queue.write_buffer(
+        &b_params,
+        0,
+        bytemuck::bytes_of(&Params {
+            n: n as u32,
+            base,
+            damping: D,
+            num_wg: grid,
+        }),
+    );
 
-    // ── Run: dangling → add → spmv, ping-ponging, for `iters` supersteps ─────────────────────────────
+    // Batch ALL iterations into ONE command buffer → a single CPU↔GPU sync for the whole run. Each superstep
+    // is 3 passes (dangling L1 → reduce L2 → spmv); separate passes give the memory barrier the data
+    // dependency needs, and the ping-pong alternates bind groups.
     let t = Instant::now();
-    let mut dir = 0usize; // which bind group / read buffer
+    let mut enc = device.create_command_encoder(&Default::default());
+    let mut dir = 0usize;
+    let pass =
+        |enc: &mut wgpu::CommandEncoder, pipe: &wgpu::ComputePipeline, bgi: usize, groups: u32| {
+            let mut cp = enc.begin_compute_pass(&Default::default());
+            cp.set_pipeline(pipe);
+            cp.set_bind_group(0, &bg[bgi], &[]);
+            cp.dispatch_workgroups(groups, 1, 1);
+        };
     for _ in 0..iters {
-        // 1) dangling reduction over the current rank (rank_in of this dir).
-        let mut enc = device.create_command_encoder(&Default::default());
-        {
-            let mut cp = enc.begin_compute_pass(&Default::default());
-            cp.set_pipeline(&pipe_dng);
-            cp.set_bind_group(0, &bg[dir], &[]);
-            cp.dispatch_workgroups(num_wg, 1, 1);
-        }
-        queue.submit([enc.finish()]);
-        let dangling = read_partials(&device, &queue);
-        let add = base + D * dangling / n as f32;
-        queue.write_buffer(
-            &b_params,
-            0,
-            bytemuck::bytes_of(&Params {
-                n: n as u32,
-                base,
-                damping: D,
-                add,
-            }),
-        );
-        // 2) spmv.
-        let mut enc = device.create_command_encoder(&Default::default());
-        {
-            let mut cp = enc.begin_compute_pass(&Default::default());
-            cp.set_pipeline(&pipe_spmv);
-            cp.set_bind_group(0, &bg[dir], &[]);
-            cp.dispatch_workgroups(num_wg, 1, 1);
-        }
-        queue.submit([enc.finish()]);
+        pass(&mut enc, &pipe_dng, dir, grid); // L1: per-workgroup dangling partials
+        pass(&mut enc, &pipe_reduce, dir, 1); // L2: partials → dsum (one workgroup)
+        pass(&mut enc, &pipe_spmv, dir, grid); // rank_out = add + damping·SpMV (warp-per-vertex)
         dir ^= 1;
     }
+    queue.submit([enc.finish()]);
     device.poll(wgpu::Maintain::Wait);
     let gpu_s = t.elapsed().as_secs_f64();
 
