@@ -13,7 +13,10 @@ use std::time::Instant;
 const D: f64 = 0.85;
 
 fn env(k: &str, d: usize) -> usize {
-    std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+    std::env::var(k)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(d)
 }
 
 fn main() {
@@ -24,6 +27,23 @@ fn main() {
     let m = edges.len();
     println!("slack_bench: n={n} m={m} scale={scale}\n");
 
+    // ── Lever 4: Parallel generation — the single-threaded setup wall (222s at the billion) ─────────
+    println!("Parallel generation (seekable slices, bit-identical to serial):");
+    let t = Instant::now();
+    let serial_gen = Kronecker::new(scale, ef, 0x6907).collect::<Vec<_>>();
+    let ser_s = t.elapsed().as_secs_f64();
+    let cores = std::thread::available_parallelism()
+        .map(|c| c.get())
+        .unwrap_or(8);
+    let t = Instant::now();
+    let par_gen = Kronecker::generate_parallel(scale, ef, 0x6907, cores * 4);
+    let par_s = t.elapsed().as_secs_f64();
+    println!(
+        "  serial {ser_s:.3}s  →  parallel({cores} cores) {par_s:.3}s  =  {:.2}× faster  (identical: {})\n",
+        ser_s / par_s,
+        par_gen == serial_gen
+    );
+
     // ── Lever 2: Anderson acceleration — sweeps to convergence vs power iteration ────────────────────
     println!("Anderson acceleration (sweeps to Σ|Δ|<tol, same fixed point):");
     let reference = pagerank(n, &edges, D, 2000, 1e-12);
@@ -32,12 +52,20 @@ fn main() {
         let mut best = (usize::MAX, 0usize, 0.0f64);
         for w in [3usize, 5, 8] {
             let (ra, sa) = pagerank_accel(n, &edges, D, 2000, tol, w);
-            let err = ra.iter().zip(&reference).map(|(a, b)| (a - b).abs()).fold(0.0, f64::max);
+            let err = ra
+                .iter()
+                .zip(&reference)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0, f64::max);
             if sa < best.0 {
                 best = (sa, w, err);
             }
         }
-        let errp = rp.iter().zip(&reference).map(|(a, b)| (a - b).abs()).fold(0.0, f64::max);
+        let errp = rp
+            .iter()
+            .zip(&reference)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0, f64::max);
         let (sa, w, erra) = best;
         println!(
             "  tol={tol:>6.0e}: power {sp:>4} sweeps (max|Δ|{errp:.1e})  →  Anderson(w={w}) {sa:>3} sweeps (max|Δ|{erra:.1e})  =  {:.2}× fewer",
@@ -63,7 +91,11 @@ fn main() {
     let exact = distributed_pagerank_boundary(n, &shards, &out_deg, D, 200, 1e-10);
     for &eps in &[0.0, 1e-12, 1e-10, 1e-8] {
         let (r, s) = distributed_pagerank_boundary_delta(n, &shards, &out_deg, D, 200, 1e-10, eps);
-        let err = r.iter().zip(&exact).map(|(a, b)| (a - b).abs()).fold(0.0, f64::max);
+        let err = r
+            .iter()
+            .zip(&exact)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0, f64::max);
         let ratio = s.dense_bytes as f64 / s.delta_bytes.max(1) as f64;
         println!(
             "  eps={eps:>7.0e}: dense {:>5.1}MB  delta {:>5.1}MB  =  {ratio:>4.2}× less wire   (max|Δ| vs exact {err:.1e}, {} supersteps)",

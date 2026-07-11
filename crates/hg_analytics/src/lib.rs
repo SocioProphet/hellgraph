@@ -225,7 +225,12 @@ pub fn pagerank_by_id(
 /// fewer edges (the active set shrinks as terms decay). Returns `(rank, total_edge_pushes)` so the work
 /// saving is measurable: compare `pushes` against power iteration's `iters · m`. This is the algorithmic
 /// multiplier that compounds across CPU, GPU, and the distributed halo.
-pub fn pagerank_residual(n: usize, edges: &[(usize, usize)], damping: f64, eps: f64) -> (Vec<f64>, usize) {
+pub fn pagerank_residual(
+    n: usize,
+    edges: &[(usize, usize)],
+    damping: f64,
+    eps: f64,
+) -> (Vec<f64>, usize) {
     if n == 0 {
         return (Vec::new(), 0);
     }
@@ -389,6 +394,7 @@ pub fn pagerank_accel(
 /// Solve the Anderson least-squares γ = argmin ‖f − C·γ‖ for history columns `C` (each length n) via the
 /// regularized normal equations (CᵀC + λI)γ = Cᵀf with Gaussian elimination + partial pivoting. mk is tiny
 /// (≤ window), so this is negligible next to the O(E) sweep. Deterministic (fixed-order dot products).
+#[allow(clippy::needless_range_loop)] // explicit i/j/t indices read clearer for the mk×mk normal-equation solve
 fn anderson_lsq(cols: &[Vec<f64>], f: &[f64]) -> Vec<f64> {
     let mk = cols.len();
     if mk == 0 {
@@ -868,13 +874,19 @@ mod tests {
             .zip(&residual)
             .map(|(a, b)| (a - b).abs())
             .fold(0.0f64, f64::max);
-        assert!(maxd < 1e-5, "residual PR diverged from power iteration: max|Δ| {maxd:e}");
+        assert!(
+            maxd < 1e-5,
+            "residual PR diverged from power iteration: max|Δ| {maxd:e}"
+        );
 
         // Work: residual edge-pushes vs a practical 100-iteration power budget. HONEST: on GLOBAL PageRank of
         // a well-mixed RMAT this is ~1.8× (not the 5-10× of personalized/local PageRank) — converged vertices
         // still stay active a while when damping is 0.85.
         let power_work = 100 * m;
-        assert!(pushes < power_work, "residual ({pushes}) not < power iteration ({power_work})");
+        assert!(
+            pushes < power_work,
+            "residual ({pushes}) not < power iteration ({power_work})"
+        );
     }
 
     #[test]
@@ -890,10 +902,21 @@ mod tests {
 
         // Same fixed point as the canonical serial engine (both, to tolerance).
         let reference = pagerank(n, &edges, D, 1000, tol);
-        let dp = power.iter().zip(&reference).map(|(a, b)| (a - b).abs()).fold(0.0, f64::max);
-        let da = accel.iter().zip(&reference).map(|(a, b)| (a - b).abs()).fold(0.0, f64::max);
+        let dp = power
+            .iter()
+            .zip(&reference)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0, f64::max);
+        let da = accel
+            .iter()
+            .zip(&reference)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0, f64::max);
         assert!(dp < 1e-8, "power-iteration path diverged: {dp:e}");
-        assert!(da < 1e-8, "Anderson landed on a different fixed point: {da:e}");
+        assert!(
+            da < 1e-8,
+            "Anderson landed on a different fixed point: {da:e}"
+        );
 
         // The whole point: FEWER O(E) sweeps to the same tolerance.
         assert!(
@@ -902,7 +925,11 @@ mod tests {
         );
 
         // Deterministic run-to-run.
-        assert_eq!(accel, pagerank_accel(n, &edges, D, 1000, tol, 5).0, "deterministic");
+        assert_eq!(
+            accel,
+            pagerank_accel(n, &edges, D, 1000, tol, 5).0,
+            "deterministic"
+        );
     }
 
     #[test]

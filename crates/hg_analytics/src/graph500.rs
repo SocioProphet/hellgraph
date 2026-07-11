@@ -48,6 +48,36 @@ impl Kronecker {
         }
     }
 
+    /// Generate the FULL deterministic edge stream in PARALLEL: split `[0, m)` into `chunks` contiguous
+    /// slices, generate each independently via the O(1) seek, and concatenate IN ORDER. Bit-identical to the
+    /// serial `new(...).collect()` (the slice invariant), but saturating all cores — the single-node analog
+    /// of distributed generation (#12): the same seekable slices, one per core here vs one per worker on the
+    /// cluster. This is what kills the single-threaded generation wall (222s at the billion). The per-chunk
+    /// generation (the expensive `scale` splits/edge) is parallel; the final concat is a cheap ordered memcpy.
+    pub fn generate_parallel(
+        scale: u32,
+        edgefactor: usize,
+        seed: u64,
+        chunks: usize,
+    ) -> Vec<(usize, usize)> {
+        use rayon::prelude::*;
+        let m = Self::edges(scale, edgefactor);
+        if m == 0 {
+            return Vec::new();
+        }
+        let chunks = chunks.clamp(1, m);
+        // rayon `collect` into a Vec preserves iterator order, so `concat` yields the exact serial stream.
+        let parts: Vec<Vec<(usize, usize)>> = (0..chunks)
+            .into_par_iter()
+            .map(|c| {
+                let start = c * m / chunks;
+                let end = (c + 1) * m / chunks;
+                Kronecker::slice(scale, seed, start, end - start).collect()
+            })
+            .collect();
+        parts.concat()
+    }
+
     /// Vertex count for a scale (= 2^scale).
     pub fn vertices(scale: u32) -> usize {
         1usize << scale
@@ -93,6 +123,19 @@ mod tests {
     use super::Kronecker;
 
     #[test]
+    fn parallel_generation_is_bit_identical_to_serial() {
+        let (scale, ef, seed) = (14u32, 16usize, 0xF00Du64);
+        let serial: Vec<(usize, usize)> = Kronecker::new(scale, ef, seed).collect();
+        for chunks in [1usize, 4, 16, 64, 100] {
+            let parallel = Kronecker::generate_parallel(scale, ef, seed, chunks);
+            assert_eq!(
+                parallel, serial,
+                "chunks={chunks}: parallel generation diverged from the serial stream"
+            );
+        }
+    }
+
+    #[test]
     fn slice_matches_the_full_stream_exactly() {
         let scale = 12u32;
         let ef = 8usize;
@@ -109,7 +152,10 @@ mod tests {
                 let end = (c + 1) * m / k;
                 rebuilt.extend(Kronecker::slice(scale, seed, start, end - start));
             }
-            assert_eq!(rebuilt, full, "k={k}: sliced generation diverged from the full stream");
+            assert_eq!(
+                rebuilt, full,
+                "k={k}: sliced generation diverged from the full stream"
+            );
         }
     }
 }
