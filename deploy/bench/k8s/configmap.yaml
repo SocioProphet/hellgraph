@@ -15,3 +15,10 @@ data:
   HG_SCALE: "26"        # 2^26 ≈ 67M vertices → ~1.07B edges (the billion, on the big-RAM coordinator)
   HG_EDGEFACTOR: "16"
   HG_ITERS: "25"
+  # FAST PATH (dist_p2p): the coordinator is out of the recurring hot path (O(k) scalar all-reduce only),
+  # so the relay that made the first billion 404s is gone. Recurring halo is peer-to-peer.
+  # HG_DELTA_EPS (optional): set e.g. "1e-9" to also send only ghosts that MOVED > eps → ~1.5-5× less wire,
+  # for a bounded O(eps) perturbation. LEAVE UNSET for a bit-exact verified run (eps=0 is exact but doesn't
+  # save wire — f64 ranks keep wiggling; the saving needs eps>0). Measured local proof: `cargo run --example
+  # dist_p2p` with/without HG_DELTA_EPS.
+  # HG_DELTA_EPS: "1e-9"

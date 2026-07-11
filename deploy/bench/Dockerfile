@@ -24,7 +24,9 @@ COPY --from=build /usr/local/bin/dist_boundary /usr/local/bin/dist_boundary
 COPY --from=build /usr/local/bin/dist_p2p /usr/local/bin/dist_p2p
 USER hg
 # Coordinator listens here; workers connect to it. Overridable via HG_LISTEN / HG_COORD.
-# Default = the coordinator-relay MVP runtime; swap the k8s command to /usr/local/bin/dist_p2p for the
-# peer-to-peer mesh at larger node counts.
+# Default = the FAST PATH: dist_p2p (coordinator-free peer-to-peer halo). This is what removes the relay
+# funnel that made the first billion run 404s (coordinator now carries O(k), not O(boundary)). The k8s
+# manifests set the same command explicitly + HG_ADVERTISE=podIP so the mesh forms across pods. The older
+# coordinator-relay MVP is still in the image at /usr/local/bin/dist_boundary for comparison.
 EXPOSE 9000
-ENTRYPOINT ["/usr/local/bin/dist_boundary"]
+ENTRYPOINT ["/usr/local/bin/dist_p2p"]

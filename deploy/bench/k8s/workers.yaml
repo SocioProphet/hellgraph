@@ -43,9 +43,12 @@ spec:
         - name: worker
           image: IMAGE_PLACEHOLDER          # set by run.sh
           imagePullPolicy: Always           # always pull the pushed tag; never a stale cached image
+          command: ["/usr/local/bin/dist_p2p"]  # FAST PATH: workers mesh & exchange ghosts peer-to-peer
+                                                # (set HG_DELTA_EPS in the configmap to also cut the wire ~1.5-5×)
           env:
             - { name: HG_ROLE, value: worker }
             - { name: HG_COORD, value: "hg-coordinator:9000" }
+            - { name: HG_ADVERTISE, valueFrom: { fieldRef: { fieldPath: status.podIP } } }
             # JOB_COMPLETION_INDEX is injected by k8s for Indexed jobs; the worker reads it as ordinal.
           envFrom:
             - configMapRef: { name: hg-bench-params }

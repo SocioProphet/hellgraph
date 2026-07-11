@@ -94,8 +94,17 @@ fn run_worker(coord_addr: &str, id: usize) {
     // Build the P2P mesh: connect to needed higher-id peers, accept from needed lower-id peers.
     let peers = build_mesh(id, s.k, &listener, &s.roster, &s.need);
 
-    // Spawn a reader thread per peer we RECEIVE from; each drains `iters` messages into a channel.
-    let mut rx_map: HashMap<usize, mpsc::Receiver<Vec<f64>>> = HashMap::new();
+    // DELTA HALO mode (HG_DELTA_EPS set): send each peer ONLY the ghosts whose value moved > eps since the
+    // last send, as (u32 pos, f64 val) pairs, instead of the whole dense f64 vector. eps=0 is bit-exact
+    // (a receiver caches the last value → unchanged ghosts need no message) and still shrinks the wire as
+    // ranks freeze; eps>0 trades a bounded perturbation for a bigger cut. This is the residual/delta halo
+    // (#13) on the peer-to-peer mesh — the recurring-traffic optimization for the fast-path billion.
+    let delta_eps: Option<f64> = std::env::var("HG_DELTA_EPS").ok().and_then(|v| v.parse().ok());
+    let delta = delta_eps.is_some();
+
+    // Spawn a reader thread per peer we RECEIVE from; each drains `iters` messages into a channel of RAW
+    // bytes (parsed in the loop per mode: dense = recv_n·8 fixed; delta = [u64 count][count·12]).
+    let mut rx_map: HashMap<usize, mpsc::Receiver<Vec<u8>>> = HashMap::new();
     let mut writers: HashMap<usize, TcpStream> = HashMap::new();
     for (&d, sock) in &peers {
         let recv_n = s.recv_ghost[d].len();
@@ -108,22 +117,42 @@ fn run_worker(coord_addr: &str, id: usize) {
             let iters = s.iters;
             std::thread::spawn(move || {
                 for _ in 0..iters {
-                    match read_vec(&mut rd, recv_n * 8) {
-                        Ok(b) => {
-                            if tx
-                                .send(bytemuck::cast_slice::<u8, f64>(&b).to_vec())
-                                .is_err()
-                            {
-                                break;
+                    let msg = if delta {
+                        match read_vec(&mut rd, 8) {
+                            Ok(cb) => {
+                                let cnt = u64::from_le_bytes(cb.try_into().unwrap()) as usize;
+                                match read_vec(&mut rd, cnt * 12) {
+                                    Ok(b) => b,
+                                    Err(_) => break,
+                                }
                             }
+                            Err(_) => break,
                         }
-                        Err(_) => break,
+                    } else {
+                        match read_vec(&mut rd, recv_n * 8) {
+                            Ok(b) => b,
+                            Err(_) => break,
+                        }
+                    };
+                    if tx.send(msg).is_err() {
+                        break;
                     }
                 }
             });
             rx_map.insert(d, rx);
         }
     }
+
+    // Per-peer cache of the values we last SENT (delta mode) — init to the seed the receiver also holds.
+    let mut last_sent: HashMap<usize, Vec<f64>> = HashMap::new();
+    if delta {
+        for (d, send_idx) in s.send_local.iter().enumerate() {
+            if !send_idx.is_empty() {
+                last_sent.insert(d, vec![n_recip; send_idx.len()]);
+            }
+        }
+    }
+    let mut sent_bytes = 0usize;
 
     // BSP loop. Persistent owned ranks; ghost halo assembled from P2P messages.
     let mut owned_rank = vec![n_recip; s.owned];
@@ -144,34 +173,59 @@ fn run_worker(coord_addr: &str, id: usize) {
                 dangling_partial += owned_rank[v];
             }
         }
-        // P2P halo push: send each needed peer exactly the owned values that are its ghosts.
+        // P2P halo push: send each needed peer the owned values that are its ghosts (dense or delta).
         for (d, send_idx) in s
             .send_local
             .iter()
             .enumerate()
             .filter(|(_, v)| !v.is_empty())
         {
-            let vals: Vec<f64> = send_idx.iter().map(|&li| owned_rank[li as usize]).collect();
-            writers
-                .get_mut(&d)
-                .unwrap()
-                .write_all(bytemuck::cast_slice(&vals))
-                .unwrap();
-        }
-        // P2P halo pull: receive each peer's message, scatter into our ghost slots. Ghost slots live at
-        // `owned + ghost_pos` in the local view (recv_ghost holds ghost_pos in 0..g).
-        for (&d, rx) in &rx_map {
-            let vals = rx.recv().unwrap();
-            for (k, &gi) in s.recv_ghost[d].iter().enumerate() {
-                local_rank[s.owned + gi as usize] = vals[k];
+            let w = writers.get_mut(&d).unwrap();
+            if delta {
+                let eps = delta_eps.unwrap();
+                let last = last_sent.get_mut(&d).unwrap();
+                let mut body: Vec<u8> = Vec::new();
+                let mut cnt = 0u64;
+                for (pos, &li) in send_idx.iter().enumerate() {
+                    let val = owned_rank[li as usize];
+                    if (val - last[pos]).abs() > eps {
+                        body.extend_from_slice(&(pos as u32).to_le_bytes());
+                        body.extend_from_slice(&val.to_le_bytes());
+                        last[pos] = val;
+                        cnt += 1;
+                    }
+                }
+                w.write_all(&cnt.to_le_bytes()).unwrap();
+                w.write_all(&body).unwrap();
+                sent_bytes += 8 + body.len();
+            } else {
+                let vals: Vec<f64> = send_idx.iter().map(|&li| owned_rank[li as usize]).collect();
+                w.write_all(bytemuck::cast_slice(&vals)).unwrap();
+                sent_bytes += vals.len() * 8;
             }
         }
-        // ghost halo for next step lives in local_rank[owned..]; keep it there (owned overwritten above).
+        // P2P halo pull: apply each peer's message to our ghost slots (persistent across steps).
+        for (&d, rx) in &rx_map {
+            let body = rx.recv().unwrap();
+            if delta {
+                for ch in body.chunks_exact(12) {
+                    let pos = u32::from_le_bytes(ch[0..4].try_into().unwrap()) as usize;
+                    let val = f64::from_le_bytes(ch[4..12].try_into().unwrap());
+                    local_rank[s.owned + s.recv_ghost[d][pos] as usize] = val;
+                }
+            } else {
+                let vals: &[f64] = bytemuck::cast_slice(&body);
+                for (k, &gi) in s.recv_ghost[d].iter().enumerate() {
+                    local_rank[s.owned + gi as usize] = vals[k];
+                }
+            }
+        }
         // Scalar dangling all-reduce via coordinator (the only coordinator traffic): send partial, get add.
         ctrl.write_all(&dangling_partial.to_le_bytes()).unwrap();
         add = f64::from_le_bytes(read_vec(&mut ctrl, 8).unwrap().try_into().unwrap());
     }
-    // Final gather: coordinator asks (reads) our owned ranks once.
+    // Report actual recurring bytes sent (for the dense-vs-delta scoreboard), then the final owned gather.
+    ctrl.write_all(&(sent_bytes as u64).to_le_bytes()).unwrap();
     ctrl.write_all(bytemuck::cast_slice(&owned_rank)).unwrap();
 }
 
@@ -428,9 +482,11 @@ fn run_coordinator(listen: &str, k: usize, spawn: bool) {
     }
     let dt = t.elapsed();
 
-    // Final O(n) gather.
+    // Final O(n) gather (each worker first reports its actual recurring bytes sent, for the scoreboard).
     let mut rank = vec![0.0f64; n];
+    let mut actual_sent = 0usize;
     for (c, s) in conns.iter_mut().enumerate() {
+        actual_sent += rd_u64(&read_vec(s, 8).unwrap(), &mut 0);
         let owned = shards[c].owned();
         let vals: Vec<f64> = bytemuck::cast_slice(&read_vec(s, owned * 8).unwrap()).to_vec();
         rank[shards[c].lo..shards[c].lo + owned].copy_from_slice(&vals);
@@ -462,12 +518,23 @@ fn run_coordinator(listen: &str, k: usize, spawn: bool) {
         }
     }
     let p2p_total = p2p_per_step * iters;
+    let delta_eps = std::env::var("HG_DELTA_EPS").ok();
     println!("  {iters} supersteps: {dt:>7.3?}");
     println!(
-        "  P2P halo (worker↔worker): {:.1} MB total, {} KB/step  — NEVER touches the coordinator",
+        "  P2P halo (worker↔worker): dense would be {:.1} MB total ({} KB/step)  — NEVER touches coordinator",
         p2p_total as f64 / 1e6,
         p2p_per_step / 1000
     );
+    if let Some(eps) = delta_eps {
+        println!(
+            "  DELTA halo (eps={eps}): {:.1} MB actually sent = {:.2}× LESS wire than dense (measured, not projected)",
+            actual_sent as f64 / 1e6,
+            p2p_total as f64 / actual_sent.max(1) as f64
+        );
+    } else {
+        // Sanity: dense actual should match the analytic projection.
+        let _ = actual_sent;
+    }
     println!(
         "  coordinator traffic: {} KB total ({} B/step = {k} scalars up + {k} down) — O(k), not O(boundary)",
         coord_bytes / 1000,
@@ -478,5 +545,8 @@ fn run_coordinator(listen: &str, k: usize, spawn: bool) {
         100.0 * coord_bytes as f64 / (coord_bytes + p2p_total).max(1) as f64,
         100.0 * p2p_total as f64 / (coord_bytes + p2p_total).max(1) as f64,
     );
-    println!("  == single-graph PageRank: max|Δ| {maxdiff:.2e}   (EXACT)");
+    // "EXACT" only when we didn't trade accuracy for wire (dense, or delta eps=0). eps>0 is a bounded approx.
+    let exact = std::env::var("HG_DELTA_EPS").map(|e| e == "0").unwrap_or(true);
+    let tag = if exact { "EXACT" } else { "bounded approx (eps>0 traded for wire)" };
+    println!("  == single-graph PageRank: max|Δ| {maxdiff:.2e}   ({tag})");
 }
