@@ -33,8 +33,9 @@ pub use graph500::Kronecker;
 pub use ooc::{pagerank_mmap, write_csr, write_csr_bucketed, write_csr_streaming, MmapCsr};
 pub use partitioner::{balance, edge_cut, fennel_partition, ldg_partition, relabel_contiguous};
 pub use topology::{
-    plan_hetero, plan_pagerank, AlgoConfig, ClusterSpec, HeteroPlan, NodeKind, NodeType, Objective,
-    Plan, PlannerConfig, Topology, Workload, RESIDENT_BYTES_PER_EDGE,
+    plan_federated, plan_hetero, plan_pagerank, AlgoConfig, ClusterSpec, FederatedPlan,
+    FederatedShard, HeteroPlan, NodeKind, NodeType, Objective, Plan, PlannerConfig, Topology,
+    Workload, RESIDENT_BYTES_PER_EDGE,
 };
 
 /// Cold PageRank over a 0..n indexed graph. Dangling nodes (no out-edges) redistribute their mass uniformly.

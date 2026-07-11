@@ -317,9 +317,199 @@ pub fn plan_hetero(
     best
 }
 
+// ── Sovereign federation: the topology is DICTATED by where the data lives, not chosen ───────────────────────
+/// One sovereign participant's shard, as it ALREADY EXISTS in a federation. Unlike the greenfield planner,
+/// none of this is chosen: the participant owns exactly these edges on exactly this node, and the boundary
+/// (`ghost_count`) is whatever the sovereign placement happens to produce — you cannot repartition data that
+/// belongs to someone else.
+#[derive(Clone, Copy, Debug)]
+pub struct FederatedShard {
+    /// Edges this participant sovereignly holds (fixed).
+    pub owned_edges: usize,
+    /// Boundary ghosts it must RECEIVE per superstep — determined by the placement, not by a min-cut.
+    pub ghost_count: usize,
+    /// The participant's own node RAM (heterogeneous, sovereign — you don't get to size it).
+    pub node_mem_gb: f64,
+}
+
+/// A plan for a federation whose placement is FIXED. It can only tune the halo protocol + algorithm and tell
+/// you the truth about the placement you were handed — including the sovereignty TAX vs an ideal cluster.
+#[derive(Clone, Debug)]
+pub struct FederatedPlan {
+    /// True only if EVERY participant's shard fits its own node's RAM (else that participant is out-of-core
+    /// or the federation can't run in-memory — and you can't move its data to fix it).
+    pub feasible_in_memory: bool,
+    /// Index of the binding constraint: an over-capacity participant if any, else the compute straggler.
+    pub bottleneck_shard: usize,
+    pub halo_bytes_per_superstep: usize,
+    /// Wall is STRAGGLER-bound: the BSP barrier waits for the slowest shard + the halo exchange. Sovereign
+    /// shards are uneven (they follow ownership, not load) and you can't rebalance them.
+    pub est_wall_s: f64,
+    /// Federated wall ÷ an ideal balanced + min-cut cluster of the same node count. This is the price of
+    /// sovereignty — how much the "data stays put" moat costs in performance vs greenfield placement.
+    pub sovereignty_tax: f64,
+    pub algo: AlgoConfig,
+    pub reason: String,
+}
+
+/// Plan analytics over an EXISTING sovereign federation: the shards are given, the placement is fixed, and
+/// the planner may only choose the halo protocol + algorithm. It reports feasibility, the straggler-bound
+/// wall, and the sovereignty tax — the honest cost of the federation moat that the greenfield `plan_pagerank`
+/// assumes away.
+pub fn plan_federated(
+    shards: &[FederatedShard],
+    iters: usize,
+    cfg: PlannerConfig,
+) -> FederatedPlan {
+    let k = shards.len().max(1);
+    let total_edges: usize = shards.iter().map(|s| s.owned_edges).sum();
+    // Per-shard resident + fit against its own node.
+    let mut feasible = true;
+    let mut bottleneck = 0usize;
+    let mut worst_overflow = 0.0f64;
+    for (i, s) in shards.iter().enumerate() {
+        let resident_gb = s.owned_edges as f64 * RESIDENT_BYTES_PER_EDGE / 1e9;
+        let usable = s.node_mem_gb * cfg.usable_mem_fraction;
+        let overflow = resident_gb - usable;
+        if overflow > 0.0 {
+            feasible = false;
+            if overflow > worst_overflow {
+                worst_overflow = overflow;
+                bottleneck = i; // the participant that can't hold its own shard
+            }
+        }
+    }
+    // Wall is straggler-bound: the barrier waits for the slowest shard's compute + the halo exchange.
+    let per_shard_compute = |s: &FederatedShard| s.owned_edges as f64 / cfg.throughput_edges_per_s;
+    let (straggler_idx, straggler_compute) = shards
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (i, per_shard_compute(s)))
+        .fold((0usize, 0.0f64), |acc, x| if x.1 > acc.1 { x } else { acc });
+    if feasible {
+        bottleneck = straggler_idx; // if it fits, the binding constraint is the slowest shard
+    }
+    let halo_bytes_per_superstep = (shards.iter().map(|s| s.ghost_count).sum::<usize>() as f64
+        * cfg.halo_bytes_per_ghost) as usize;
+    let per_superstep = straggler_compute + halo_bytes_per_superstep as f64 / cfg.net_bytes_per_s;
+    let est_wall_s = per_superstep * iters as f64;
+
+    // Ideal reference: same node count, but BALANCED compute (total/k) and a min-cut halo (~20% of the
+    // sovereign boundary — an optimized partition cuts far fewer edges). The ratio is the sovereignty tax.
+    let ideal_compute = (total_edges as f64 / k as f64) / cfg.throughput_edges_per_s;
+    let ideal_halo = 0.2 * halo_bytes_per_superstep as f64 / cfg.net_bytes_per_s;
+    let ideal_wall = (ideal_compute + ideal_halo) * iters as f64;
+    let sovereignty_tax = if ideal_wall > 0.0 {
+        est_wall_s / ideal_wall
+    } else {
+        1.0
+    };
+
+    let reason = if !feasible {
+        let s = &shards[bottleneck];
+        format!(
+            "INFEASIBLE in-memory: participant {bottleneck} holds {} edges (~{:.1}GB) but its node has only {:.1}GB usable — and you CANNOT move sovereign data to rebalance. That participant must go out-of-core, or the federation is stuck. Straggler tax {sovereignty_tax:.1}× vs ideal.",
+            s.owned_edges,
+            s.owned_edges as f64 * RESIDENT_BYTES_PER_EDGE / 1e9,
+            s.node_mem_gb * cfg.usable_mem_fraction
+        )
+    } else {
+        format!(
+            "feasible; STRAGGLER-bound by participant {bottleneck} ({} edges = {:.0}% of the federation) — sovereign shards are uneven and you can't rebalance them. Halo {:.0}MB/superstep (dictated by the placement, not min-cut). Sovereignty tax {sovereignty_tax:.1}× vs an ideal balanced+min-cut cluster.",
+            shards[bottleneck].owned_edges,
+            shards[bottleneck].owned_edges as f64 / total_edges.max(1) as f64 * 100.0,
+            halo_bytes_per_superstep as f64 / 1e6
+        )
+    };
+
+    FederatedPlan {
+        feasible_in_memory: feasible,
+        bottleneck_shard: bottleneck,
+        halo_bytes_per_superstep,
+        est_wall_s,
+        sovereignty_tax,
+        // Federation is inherently distributed + network-bound → the halo levers matter most here.
+        algo: algo_for(Topology::Distributed { shards: k }, Workload::SingleQuery),
+        reason,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn federated_balanced_placement_has_low_sovereignty_tax() {
+        // A well-balanced federation (each participant ~equal, modest boundary) should be near the ideal.
+        let shards: Vec<FederatedShard> = (0..8)
+            .map(|_| FederatedShard {
+                owned_edges: 100_000_000,
+                ghost_count: 2_000_000,
+                node_mem_gb: 32.0,
+            })
+            .collect();
+        let plan = plan_federated(&shards, 25, Default::default());
+        assert!(plan.feasible_in_memory, "{}", plan.reason);
+        // Balanced → straggler == average, so the tax is driven only by the halo cut ratio (bounded).
+        assert!(
+            plan.sovereignty_tax < 6.0,
+            "balanced tax should be modest, got {}",
+            plan.sovereignty_tax
+        );
+    }
+
+    #[test]
+    fn federated_skewed_placement_is_straggler_bound_and_you_cant_fix_it() {
+        // One whale participant holds 10× the others — sovereign, so it can't be rebalanced.
+        let mut shards: Vec<FederatedShard> = (0..7)
+            .map(|_| FederatedShard {
+                owned_edges: 50_000_000,
+                ghost_count: 1_000_000,
+                node_mem_gb: 32.0,
+            })
+            .collect();
+        shards.push(FederatedShard {
+            owned_edges: 500_000_000,
+            ghost_count: 5_000_000,
+            node_mem_gb: 96.0,
+        });
+        let plan = plan_federated(&shards, 25, Default::default());
+        assert!(plan.feasible_in_memory, "{}", plan.reason);
+        assert_eq!(
+            plan.bottleneck_shard, 7,
+            "the whale is the straggler: {}",
+            plan.reason
+        );
+        assert!(
+            plan.sovereignty_tax > 3.0,
+            "skew should cost a real tax, got {}",
+            plan.sovereignty_tax
+        );
+    }
+
+    #[test]
+    fn federated_participant_that_overflows_its_node_is_infeasible() {
+        // A participant sovereignly owns more than its node can hold — and you can't move its data.
+        let shards = vec![
+            FederatedShard {
+                owned_edges: 100_000_000,
+                ghost_count: 2_000_000,
+                node_mem_gb: 32.0,
+            },
+            FederatedShard {
+                owned_edges: 800_000_000,
+                ghost_count: 4_000_000,
+                node_mem_gb: 16.0,
+            }, // ~100GB on 16GB
+        ];
+        let plan = plan_federated(&shards, 25, Default::default());
+        assert!(
+            !plan.feasible_in_memory,
+            "over-capacity participant must be infeasible: {}",
+            plan.reason
+        );
+        assert_eq!(plan.bottleneck_shard, 1);
+    }
 
     #[test]
     fn small_graph_picks_single_node_not_a_cluster() {

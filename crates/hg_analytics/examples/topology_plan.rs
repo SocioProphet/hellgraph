@@ -3,8 +3,8 @@
 //! topology-dependent.  cargo run -p hg_analytics --release --example topology_plan
 
 use hg_analytics::{
-    plan_hetero, plan_pagerank, ClusterSpec, NodeKind, NodeType, Objective, PlannerConfig,
-    Topology, Workload,
+    plan_federated, plan_hetero, plan_pagerank, ClusterSpec, FederatedShard, NodeKind, NodeType,
+    Objective, PlannerConfig, Topology, Workload,
 };
 
 fn main() {
@@ -110,6 +110,39 @@ fn main() {
         println!(
             "  scale-{scale}: min-wall → {:?} ({:.2}s), min-cost → {:?} (${:.4})",
             wall.kind, wall.plan.est_wall_s, costo.kind, costo.plan.est_cost_usd
+        );
+    }
+
+    // SOVEREIGN FEDERATION: the placement is FIXED (data stays put) — the planner can't repartition, only
+    // report the truth. Compare a balanced federation to a skewed one (a whale participant you can't move).
+    println!("\nSovereign federation (placement fixed — can't rebalance):");
+    let balanced: Vec<FederatedShard> = (0..8)
+        .map(|_| FederatedShard {
+            owned_edges: 100_000_000,
+            ghost_count: 2_000_000,
+            node_mem_gb: 32.0,
+        })
+        .collect();
+    let mut skewed: Vec<FederatedShard> = (0..7)
+        .map(|_| FederatedShard {
+            owned_edges: 40_000_000,
+            ghost_count: 1_000_000,
+            node_mem_gb: 32.0,
+        })
+        .collect();
+    skewed.push(FederatedShard {
+        owned_edges: 520_000_000,
+        ghost_count: 6_000_000,
+        node_mem_gb: 96.0,
+    });
+    for (label, shards) in [
+        ("balanced 8×100M", balanced),
+        ("skewed (1 whale 520M)", skewed),
+    ] {
+        let p = plan_federated(&shards, 25, cfg);
+        println!(
+            "  {label:22}: wall {:.2}s, sovereignty tax {:.1}×  — {}",
+            p.est_wall_s, p.sovereignty_tax, p.reason
         );
     }
 }
