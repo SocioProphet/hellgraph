@@ -1,0 +1,14 @@
+[package]
+name = "hg_gpu"
+version = "0.1.0"
+edition = "2021"
+
+# GPU-accelerated PageRank compute kernel — the per-node acceleration layer that goes UNDER the boundary-halo
+# distributed engine. Written in wgpu/WGSL (NOT CUDA) so the SAME kernel runs on Apple / NVIDIA / AMD / Intel:
+# no vendor lock, unlike cuGraph. Isolated crate so wgpu's heavy dep tree stays out of hg_analytics.
+
+[dependencies]
+hg_analytics = { path = "../hg_analytics" }   # Kronecker generator + CPU PageRank reference
+wgpu = "22"
+pollster = "0.3"     # block on wgpu's async device/queue setup
+bytemuck = { version = "1", features = ["derive"] }

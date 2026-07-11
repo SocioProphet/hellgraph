@@ -8,5 +8,6 @@ members = [
     "crates/hg_read_kernel",
     "crates/hg_analytics",
     "crates/hg_fiber",
+    "crates/hg_gpu",
 ]
 resolver = "2"
