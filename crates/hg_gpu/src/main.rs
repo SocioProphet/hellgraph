@@ -23,8 +23,25 @@ struct Params { n: u32, base: f32, damping: f32, num_wg: u32 };
 @group(0) @binding(6) var<storage, read_write> rank_out: array<f32>; // n
 @group(0) @binding(7) var<storage, read_write> partials: array<f32>; // one per workgroup (dangling partials)
 @group(0) @binding(8) var<storage, read_write> dsum: array<f32>;   // [0] = total dangling mass (GPU-resident)
+@group(0) @binding(9) var<storage, read_write> contrib: array<f32>; // rank_in[u]·inv_outdeg[u], fused so the
+                                                                    // SpMV does ONE random gather, not two
 
 var<workgroup> sdata: array<f32, 256>;
+
+// Precompute the per-vertex contribution in one COALESCED O(n) pass, so the SpMV's random gather reads a
+// single f32 per edge (contrib[u]) instead of two (rank_in[u] AND inv_outdeg[u]) — halving random traffic.
+@compute @workgroup_size(256)
+fn contrib_kernel(@builtin(local_invocation_id) lid: vec3<u32>,
+                  @builtin(workgroup_id) wid: vec3<u32>,
+                  @builtin(num_workgroups) ng: vec3<u32>) {
+  let stride = ng.x * 256u;
+  var v = wid.x * 256u + lid.x;
+  loop {
+    if (v >= P.n) { break; }
+    contrib[v] = rank_in[v] * inv_outdeg[v];
+    v = v + stride;
+  }
+}
 
 // L1 — GRID-STRIDE: each workgroup strides over the vertices, summing dangling rank, → one partial per wg.
 // (No barrier inside the strided accumulation, so threads may finish at different times — the reduction
@@ -81,8 +98,7 @@ fn spmv(@builtin(local_invocation_id) lid: vec3<u32>,
       let s = offsets[v];
       let e = offsets[v + 1u];
       for (var i = s + lane; i < e; i = i + 32u) {
-        let u = in_nbr[i];
-        acc = acc + rank_in[u] * inv_outdeg[u];
+        acc = acc + contrib[in_nbr[i]]; // ONE random gather per edge (fused rank·inv_outdeg)
       }
     }
     // Sub-warp reduction via shared memory (portable across all backends; subgroupAdd would replace this
@@ -208,6 +224,8 @@ fn main() {
                         .limits()
                         .max_storage_buffer_binding_size,
                     max_buffer_size: adapter.limits().max_buffer_size,
+                    // 9 storage buffers now (added `contrib`); default cap is 8.
+                    max_storage_buffers_per_shader_stage: 10,
                     ..wgpu::Limits::default()
                 },
                 memory_hints: wgpu::MemoryHints::Performance,
@@ -251,6 +269,12 @@ fn main() {
         label: None,
         size: 4, // one f32: total dangling mass, kept GPU-resident (no per-iter readback)
         usage: st | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let b_contrib = device.create_buffer(&wgpu::BufferDescriptor {
+        label: None,
+        size: (n as u64) * 4, // rank_in[u]·inv_outdeg[u], refreshed each iter → SpMV does ONE gather/edge
+        usage: st,
         mapped_at_creation: false,
     });
     let b_params = device.create_buffer(&wgpu::BufferDescriptor {
@@ -297,6 +321,7 @@ fn main() {
             bge(6, rw),
             bge(7, rw),
             bge(8, rw),
+            bge(9, rw),
         ],
     });
     let pipe_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -317,6 +342,7 @@ fn main() {
     let pipe_spmv = make_pipe("spmv");
     let pipe_dng = make_pipe("dangling");
     let pipe_reduce = make_pipe("reduce_final");
+    let pipe_contrib = make_pipe("contrib_kernel");
 
     // Two bind groups for ping-pong: dir 0 reads A→writes B; dir 1 reads B→writes A.
     let bind = |rin: &wgpu::Buffer, rout: &wgpu::Buffer| {
@@ -360,6 +386,10 @@ fn main() {
                     binding: 8,
                     resource: b_dsum.as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 9,
+                    resource: b_contrib.as_entire_binding(),
+                },
             ],
         })
     };
@@ -395,7 +425,8 @@ fn main() {
     for _ in 0..iters {
         pass(&mut enc, &pipe_dng, dir, grid); // L1: per-workgroup dangling partials
         pass(&mut enc, &pipe_reduce, dir, 1); // L2: partials → dsum (one workgroup)
-        pass(&mut enc, &pipe_spmv, dir, grid); // rank_out = add + damping·SpMV (warp-per-vertex)
+        pass(&mut enc, &pipe_contrib, dir, grid); // fuse rank_in·inv_outdeg → contrib (1 coalesced O(n) pass)
+        pass(&mut enc, &pipe_spmv, dir, grid); // rank_out = add + damping·SpMV (ONE gather/edge)
         dir ^= 1;
     }
     queue.submit([enc.finish()]);
