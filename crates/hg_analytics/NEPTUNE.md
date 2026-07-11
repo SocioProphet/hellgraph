@@ -32,7 +32,26 @@ published GTEPS, no reproducible receipt — a managed black box.
 projection would match it but is unverified — we don't claim it. Neptune publishes no GTEPS at all,
 so there is no throughput comparison to make against it.
 
-## Where Neptune is buried: COST for batch analytics
+## The knockout at 100B: Neptune physically cannot hold the graph
+
+Neptune Analytics is **in-memory**, capped at **4096 m-NCU = 4 TB in a single graph** (published
+ceiling). PageRank needs the whole graph resident. At our charitable 126 B/edge CSR floor that cap is
+~**16–32B edges** — and *less* with Neptune's real property-graph overhead. So:
+
+| edges | hellgraph | Neptune Analytics |
+|---|---|---|
+| 10B | DIST k=4, ~$0.00/run | $38/hr (1260 m-NCU) |
+| 32B | DIST k=12, ~$0.01/run | $121/hr (4032 m-NCU — at the ceiling) |
+| **100B** | **DIST k=36, ~$0.09/run** | **CANNOT FIT — needs 12,600 > 4096 m-NCU** |
+| 1T | DIST k=352, ~$8/run | CANNOT FIT — needs 126,000 m-NCU |
+
+**At 100B the burial is architectural, not a price argument: Neptune Analytics can't do it in one
+graph at all.** hellgraph runs it on ~36 ephemeral spot nodes and tears down (this requires distributed
+generation, task #12, so no node ever holds the whole graph — the hg cost at 10B+ is *projected*).
+cuGraph *can* reach 100B+ (a multi-trillion-edge GPU-cluster paper exists), but on a DGX/GPU pod at
+cluster prices. **At 100B the race is hellgraph-cheap vs cuGraph-expensive; Neptune is out of the race.**
+
+## Where Neptune is buried at 1B: COST for batch analytics
 
 PageRank is a **batch** job, not an always-on service. Neptune Analytics is **in-memory** and billed
 per **m-NCU-hour** (1 m-NCU = 1 GB memory + compute + net); minimum 128 m-NCU historically, up to
