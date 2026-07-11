@@ -414,6 +414,11 @@ fn run_worker(coord_addr: &str, id: usize) {
     }
     let seed_add = f64::from_le_bytes(read_vec(&mut ctrl, 8).unwrap().try_into().unwrap());
 
+    // f32 HALO (HG_F32_HALO): send ghost values as f32 (4 B) not f64 (8 B) — half the recurring halo wire.
+    // Uniform ~1e-7 low-bit noise (unlike the delta halo's threshold, which poisoned Anderson) — we measure
+    // whether it composes with Anderson. Compute stays f64; only the wire value is narrowed.
+    let f32_halo = std::env::var("HG_F32_HALO").is_ok();
+    let hb = if f32_halo { 4 } else { 8 };
     // Halo reader threads on the REUSED peer sockets (clean after the one-shot shuffle).
     let mut rx_map: HashMap<usize, std::sync::mpsc::Receiver<Vec<u8>>> = HashMap::new();
     let mut hwr: HashMap<usize, TcpStream> = HashMap::new();
@@ -429,7 +434,7 @@ fn run_worker(coord_addr: &str, id: usize) {
             let (tx, rx) = std::sync::mpsc::channel();
             std::thread::spawn(move || {
                 for _ in 0..iters {
-                    match read_vec(&mut rd, recv_n * 8) {
+                    match read_vec(&mut rd, recv_n * hb) {
                         Ok(b) => {
                             if tx.send(b).is_err() {
                                 break;
@@ -522,23 +527,24 @@ fn run_worker(coord_addr: &str, id: usize) {
             if d == id || send_local[d].is_empty() {
                 continue;
             }
-            let vals: Vec<f64> = send_local[d]
-                .iter()
-                .map(|&li| owned_rank[li as usize])
-                .collect();
-            hwr.get_mut(&d)
-                .unwrap()
-                .write_all(bytemuck::cast_slice(&vals))
-                .unwrap();
+            let w = hwr.get_mut(&d).unwrap();
+            if f32_halo {
+                let vals: Vec<f32> = send_local[d].iter().map(|&li| owned_rank[li as usize] as f32).collect();
+                write_robust(w, bytemuck::cast_slice(&vals));
+            } else {
+                let vals: Vec<f64> = send_local[d].iter().map(|&li| owned_rank[li as usize]).collect();
+                write_robust(w, bytemuck::cast_slice(&vals));
+            }
         }
         for (&d, rx) in &rx_map {
             let body = rx.recv().unwrap();
-            let vals: Vec<f64> = body
-                .chunks_exact(8)
-                .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
-                .collect();
             for (i, &gi) in recv_ghost[d].iter().enumerate() {
-                local_rank[owned + gi as usize] = vals[i];
+                let val = if f32_halo {
+                    f32::from_le_bytes(body[i * 4..i * 4 + 4].try_into().unwrap()) as f64
+                } else {
+                    f64::from_le_bytes(body[i * 8..i * 8 + 8].try_into().unwrap())
+                };
+                local_rank[owned + gi as usize] = val;
             }
         }
         ctrl.write_all(&dangling_partial.to_le_bytes()).unwrap();
