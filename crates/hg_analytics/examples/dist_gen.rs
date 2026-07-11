@@ -1,3 +1,4 @@
+#![allow(clippy::needless_range_loop, clippy::doc_lazy_continuation)]
 //! dist_gen — DISTRIBUTED generation + edge shuffle (#12): the coordinator-materialization killer.
 //!
 //! Every prior runtime made the coordinator generate the WHOLE graph in RAM before sharding, so a single
