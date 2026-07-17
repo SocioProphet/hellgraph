@@ -5,6 +5,7 @@ import { stimulate, spreadAttention } from './ecan'
 import { forwardChain } from './pln'
 import { syncToSidecar, pullFromSidecar, normalizeThroughSidecar } from './sidecar'
 import { recordEntityExtraction, assertDecisionLedgerEntry } from './acr'
+import { embedText } from './semantic'
 
 // ─── Async enrichment: embeddings + LLM entity extraction ────────────────────
 //
@@ -12,23 +13,14 @@ import { recordEntityExtraction, assertDecisionLedgerEntry } from './acr'
 // over time without blocking the response path.
 
 const OLLAMA_BASE = process.env['OLLAMA_HOST'] ?? 'http://127.0.0.1:11434'
-const EMBED_MODEL = 'nomic-embed-text'
 const LLM_EXTRACT_MODEL = 'llama3.2:3b'
 
+// Delegate to the canonical embedder so ingest speaks the SAME estate embeddings contract
+// (EMBEDDINGS_URL → OpenAI /v1/embeddings, else OLLAMA_HOST → Ollama /api/embeddings). One
+// embedder, one convention. Returns null on empty/failure to preserve the skip-on-miss path.
 async function _getEmbedding(text: string): Promise<number[] | null> {
-  try {
-    const res = await fetch(`${OLLAMA_BASE}/api/embeddings`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ model: EMBED_MODEL, prompt: text }),
-      signal: AbortSignal.timeout(8_000),
-    })
-    if (!res.ok) return null
-    const j = await res.json() as { embedding?: number[] }
-    return j.embedding ?? null
-  } catch {
-    return null
-  }
+  const v = await embedText(text)
+  return v.length ? v : null
 }
 
 function _cosine(a: number[], b: number[]): number {

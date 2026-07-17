@@ -4,7 +4,7 @@ import * as fs from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
 import {
-  cosineSim, encodeVec, decodeVec, chunkText,
+  cosineSim, encodeVec, decodeVec, chunkText, embedText,
   putChunk, semanticSearch, importBrainShard, vectorChunkCount,
 } from './semantic.js'
 
@@ -26,6 +26,36 @@ test('chunkText splits long text into overlapping windows', () => {
   const chunks = chunkText('x'.repeat(4000), 1500, 200)
   assert.ok(chunks.length >= 3)
   assert.ok(chunks.every((c) => c.length <= 1500))
+})
+
+test('embedText: estate /v1/embeddings contract, with Ollama /api/embeddings fallback', async () => {
+  const realFetch = globalThis.fetch
+  const calls: { url: string; body: Record<string, unknown> }[] = []
+  try {
+    // Estate contract: opts.url → OpenAI /v1/embeddings, body { model, input }, resp data[0].embedding
+    globalThis.fetch = (async (url: unknown, init: { body: string }) => {
+      calls.push({ url: String(url), body: JSON.parse(init.body) })
+      return { ok: true, json: async () => ({ data: [{ embedding: [0.1, 0.2, 0.3] }] }) }
+    }) as typeof fetch
+    let v = await embedText('hello', { url: 'http://embeddings/v1/embeddings', model: 'nomic-embed-text' })
+    assert.deepEqual(v, [0.1, 0.2, 0.3])
+    assert.equal(calls[0]!.url, 'http://embeddings/v1/embeddings')
+    assert.equal(calls[0]!.body['input'], 'hello')  // OpenAI shape uses `input`
+    assert.equal(calls[0]!.body['model'], 'nomic-embed-text')
+
+    // Fallback: opts.base → Ollama /api/embeddings, body { model, prompt }, resp embedding
+    calls.length = 0
+    globalThis.fetch = (async (url: unknown, init: { body: string }) => {
+      calls.push({ url: String(url), body: JSON.parse(init.body) })
+      return { ok: true, json: async () => ({ embedding: [1, 2] }) }
+    }) as typeof fetch
+    v = await embedText('world', { base: 'http://ollama:11434' })
+    assert.deepEqual(v, [1, 2])
+    assert.equal(calls[0]!.url, 'http://ollama:11434/api/embeddings')
+    assert.equal(calls[0]!.body['prompt'], 'world')  // Ollama shape uses `prompt`
+  } finally {
+    globalThis.fetch = realFetch
+  }
 })
 
 test('putChunk + semanticSearch returns the nearest chunk (injected embedder, no Ollama)', async () => {

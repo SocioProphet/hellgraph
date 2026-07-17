@@ -18,19 +18,41 @@ import { getHellGraph } from './store'
 
 export type EmbedFn = (text: string) => Promise<number[]>
 
+// Estate sovereign embeddings contract (memoryd + prophet-platform #799): an OpenAI-compatible
+// /v1/embeddings endpoint. If EMBEDDINGS_URL is set we speak that; otherwise we fall back to the
+// Ollama-native /api/embeddings under OLLAMA_HOST (unchanged default). The same Ollama pod serves
+// both, so setting EMBEDDINGS_URL makes hellgraph wire *identically* to memoryd. EMBEDDINGS_MODEL is
+// the estate-standard model var; HELLGRAPH_EMBED_MODEL is kept as a backward-compatible fallback.
+const EMBEDDINGS_URL = process.env['EMBEDDINGS_URL']
 const OLLAMA_BASE = process.env['OLLAMA_HOST'] ?? 'http://127.0.0.1:11434'
-const EMBED_MODEL = process.env['HELLGRAPH_EMBED_MODEL'] ?? 'nomic-embed-text'
+const EMBED_MODEL = process.env['EMBEDDINGS_MODEL'] ?? process.env['HELLGRAPH_EMBED_MODEL'] ?? 'nomic-embed-text'
 const CHUNK_LABEL = 'DocumentChunk'
 const CHUNK_SIZE = 1500
 const CHUNK_OVERLAP = 200
 
 /** Default embedder — local Ollama. Returns [] on failure so callers degrade gracefully. */
-export async function embedText(text: string, opts: { base?: string; model?: string } = {}): Promise<number[]> {
+export async function embedText(text: string, opts: { base?: string; model?: string; url?: string } = {}): Promise<number[]> {
+  const model = opts.model ?? EMBED_MODEL
+  const input = text.slice(0, 8000)
+  const url = opts.url ?? EMBEDDINGS_URL
   try {
+    if (url) {
+      // Estate contract — OpenAI-compatible /v1/embeddings: { model, input } → { data: [{ embedding }] }
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ model, input }),
+        signal: AbortSignal.timeout(15_000),
+      })
+      if (!res.ok) return []
+      const j = (await res.json()) as { data?: { embedding?: number[] }[] }
+      return j.data?.[0]?.embedding ?? []
+    }
+    // Fallback — Ollama-native /api/embeddings: { model, prompt } → { embedding }
     const res = await fetch(`${opts.base ?? OLLAMA_BASE}/api/embeddings`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ model: opts.model ?? EMBED_MODEL, prompt: text.slice(0, 8000) }),
+      body: JSON.stringify({ model, prompt: input }),
       signal: AbortSignal.timeout(15_000),
     })
     if (!res.ok) return []
