@@ -1,7 +1,7 @@
 {
   "name": "@socioprophet/hellgraph",
-  "version": "0.4.3",
-  "description": "HellGraph \u2014 TypeScript OpenCog-compatible AtomSpace metagraph engine (PLN, ECAN, pattern matcher, SPARQL/Gremlin, SHACL, Atomese, StorageNode federation). Polyglot sibling of the Rust hellgraph crate.",
+  "version": "0.4.5",
+  "description": "HellGraph — TypeScript OpenCog-compatible AtomSpace metagraph engine (PLN, ECAN, pattern matcher, SPARQL/Gremlin, SHACL, Atomese, StorageNode federation). Polyglot sibling of the Rust hellgraph crate.",
   "license": "UNLICENSED",
   "type": "commonjs",
   "main": "ts/dist/index.js",
