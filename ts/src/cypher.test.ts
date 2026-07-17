@@ -149,3 +149,32 @@ test('allowWrite opt-in lets a write parse without refusal', () => {
   // Not executing writes in v0.1, but the guard should not throw when opted in.
   assert.doesNotThrow(() => runCypher(as, 'MATCH (a)-[:IsA]->(b) SET a.x = "1" RETURN b LIMIT 1', {}, { allowWrite: true }))
 })
+
+// ─── Anti-silent-wrong: unsupported WHERE/clauses THROW rather than returning wrong results ───
+test('WHERE on a node property throws (was silently 0 rows)', () => {
+  const as = fixture()
+  // `a.foo > 1` is a node property predicate the read facade cannot evaluate — must throw, not return [].
+  assert.throws(
+    () => runCypher(as, 'MATCH (a)-[:IsA]->(b) WHERE a.foo > 1 RETURN b LIMIT 10'),
+    /unsupported: WHERE on node property/,
+  )
+})
+
+test('OR / NOT in WHERE throws (was silently dropped)', () => {
+  const as = fixture()
+  assert.throws(
+    () => runCypher(as, 'MATCH (a)-[:IsA]->(b) WHERE a.form = "rain" OR a.form = "snow" RETURN b LIMIT 10'),
+    /unsupported: OR in WHERE/,
+  )
+})
+
+test('WITH / UNWIND pipelines throw (were silent no-ops)', () => {
+  const as = fixture()
+  assert.throws(() => runCypher(as, 'MATCH (a) WITH a RETURN a LIMIT 10'), /unsupported: WITH/)
+})
+
+test('name/form pins and edge strength/confidence WHERE still work (no false rejection)', () => {
+  const as = fixture()
+  const r = runCypher(as, 'MATCH (a)-[:IsA]->(b) WHERE a.form = "rain" RETURN b LIMIT 10')
+  assert.deepEqual(r.rows, [{ b: 'weather_event' }])   // pins unaffected by the new guard
+})
