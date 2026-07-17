@@ -3,7 +3,12 @@ import { AtomSpace, nodeHandle, linkHandle, type Handle } from './atomspace'
 import { findMatches, V, N, L, type Pattern, type PatternTerm } from './patternMatcher'
 
 /**
- * Cypher Facade v0.1 — a human/agent-friendly query surface over the AtomSpace.
+ * Cypher Facade v0.1 — a human/agent-friendly READ query surface over the AtomSpace.
+ *
+ * Honest scope (NOT full Neo4j): MATCH/RETURN, name/form WHERE pins, edge strength/confidence filters,
+ * bounded variable-length paths, ORDER BY/LIMIT, and native `MATCH LINK` for n-ary hyperedges. It is
+ * read-only. Anti-silent-wrong: WHERE on arbitrary node properties, OR/NOT/XOR in WHERE, and WITH/UNWIND
+ * pipelines THROW an explicit "unsupported" error rather than silently returning a wrong/empty result.
  *
  * Conforms to docs/specs/04_Cypher_Facade_v0_1.md: a curated openCypher/GQL
  * subset lowered into the native hypergraph pattern IR (patternMatcher.Pattern),
@@ -131,7 +136,10 @@ class Parser {
       else if (kw === 'RETURN') { this.next(); ast.ret = this.parseReturn() }
       else if (kw === 'ORDER') { this.next(); this.expect('BY'); this.parseOrderBy(ast) }
       else if (kw === 'LIMIT') { this.next(); ast.limit = parseInt(this.next(), 10) }
-      else if (kw === 'WITH' || kw === 'UNWIND') { this.next() }
+      else if (kw === 'WITH' || kw === 'UNWIND') {
+        // Was a SILENT no-op (token consumed, pipeline ignored) → wrong results. Refuse loudly instead.
+        throw new Error(`Cypher unsupported: ${kw} pipelines are not implemented in this read facade`)
+      }
       else this.next()
     }
     return ast
@@ -211,6 +219,10 @@ class Parser {
       if (op === '=' && (prop === 'form' || prop === 'name') && typeof rhs === 'string') ast.pins.push({ var: v, value: rhs })
       else ast.filters.push({ lhs: { var: v, prop }, op, rhs })
       if (this.up() === 'AND') { this.next(); continue }
+      // OR was SILENTLY DROPPED (only AND continued the loop) → wrong results. Refuse loudly.
+      if (this.up() === 'OR' || this.up() === 'NOT' || this.up() === 'XOR') {
+        throw new Error(`Cypher unsupported: ${this.up()} in WHERE — only AND-chained comparisons are implemented`)
+      }
       break
     }
   }
@@ -365,6 +377,18 @@ export function runCypher(as: AtomSpace, query: string, params: Record<string, s
 
   // WHERE filters (comparisons over resolved values)
   const key = (c: ColRef) => (c.prop && c.prop !== 'form' && c.prop !== 'name' ? `${c.var}.${c.prop}` : c.var)
+  // Anti-silent-wrong: node property predicates (e.g. `a.age > 10`) are NOT projected into rows here — only
+  // name/form pins and edge strength/confidence are filterable. Filtering on an absent key silently dropped
+  // every row (0 results, correct answer non-empty). Detect that and THROW rather than return a wrong empty set.
+  if (resolved.length > 0) {
+    const projected = new Set(resolved.flatMap((r) => Object.keys(r)))
+    for (const f of ast.filters) {
+      if (!projected.has(key(f.lhs))) {
+        throw new Error(`Cypher unsupported: WHERE on node property '${f.lhs.var}.${f.lhs.prop}' — this read ` +
+          `facade filters only name/form and edge strength/confidence (refusing a silently-wrong empty result)`)
+      }
+    }
+  }
   let rows = resolved.filter((r) => ast.filters.every((f) => cmp(r[key(f.lhs)], f.op, f.rhs)))
 
   // ORDER BY
