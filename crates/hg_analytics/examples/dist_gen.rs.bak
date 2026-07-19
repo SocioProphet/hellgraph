@@ -319,6 +319,7 @@ fn run_worker(coord_addr: &str, id: usize) {
         for _ in 0..lower {
             let (mut s, _) = lis.accept().unwrap();
             s.set_nodelay(true).ok();
+            tune_socket(&s); // large SO_SNDBUF/RCVBUF — lift the ~26 MB/s window cap on the shuffle+halo
             let peer = rd_u64(&read_vec(&mut s, 8).unwrap(), &mut 0) as usize;
             got.push((peer, s));
         }
@@ -327,6 +328,7 @@ fn run_worker(coord_addr: &str, id: usize) {
     for d in (id + 1)..k {
         let mut s = connect_retry(&roster[d]);
         s.set_nodelay(true).ok();
+        tune_socket(&s);
         s.write_all(&(id as u64).to_le_bytes()).unwrap();
         peers[d] = Some(s);
     }
@@ -454,36 +456,27 @@ fn run_worker(coord_addr: &str, id: usize) {
     // ~m/k in-edges (over a BILLION per worker at 68B) was minutes on one core; par_sort_unstable uses every
     // core and is bit-identical (Edge's Ord is a total order, so the sorted result is unique).
     in_edges.par_sort_unstable();
-    // Precompute each sorted edge's (local_target, local_source) ONCE, in PARALLEL. The MEASUREMENT showed CSR
-    // build = 47% of setup: the culprit was `mix()` (balanced_local/owner) recomputed ~3× per edge across the
-    // histogram + scatter, single-threaded. Doing all the mixing here on every core turns the hist/scatter into
-    // cheap array ops. ghost_idx is read-only → safe to share. Order preserved ⇒ bit-identical CSR.
-    let locs: Vec<(u32, u32)> = in_edges
-        .par_iter()
-        .map(|e| {
-            let lt = balanced_local(e.v as usize, scale, k) as u32;
-            let ls = if balanced_owner(e.u as usize, scale, k) == id {
-                balanced_local(e.u as usize, scale, k) as u32
-            } else {
-                (owned + ghost_idx[&(e.u as usize)]) as u32
-            };
-            (lt, ls)
-        })
-        .collect();
     let mut off = vec![0u32; owned + 1];
-    for &(lt, _) in &locs {
-        off[lt as usize + 1] += 1;
+    for e in &in_edges {
+        off[balanced_local(e.v as usize, scale, k) + 1] += 1; // owned target local index = mix(v)/k
     }
     for v in 0..owned {
         off[v + 1] += off[v];
     }
-    // Scatter: per-target cursor (the sort is by GLOBAL (v,u) but off is indexed by LOCAL mix(v)/k, so a plain
-    // parallel map over sorted order would mis-place). Now just array reads — no mix() in the hot loop.
-    let mut nbr = vec![0u32; locs.len()];
+    // Scatter into CSR. NOTE: the sort is by GLOBAL (v,u) but the CSR is indexed by LOCAL target index
+    // (mix(v)/k) — the `mix` permutation reorders those, so this must place via a per-target cursor, not a
+    // parallel map over sorted order (which would mis-place). Linear O(m/k), far cheaper than the sort above.
+    let mut nbr = vec![0u32; in_edges.len()];
     let mut cur = off.clone();
-    for &(lt, ls) in &locs {
-        nbr[cur[lt as usize] as usize] = ls;
-        cur[lt as usize] += 1;
+    for e in &in_edges {
+        let li = if balanced_owner(e.u as usize, scale, k) == id {
+            balanced_local(e.u as usize, scale, k) as u32 // owned source: local index = mix(u)/k
+        } else {
+            (owned + ghost_idx[&(e.u as usize)]) as u32
+        };
+        let t = balanced_local(e.v as usize, scale, k);
+        nbr[cur[t] as usize] = li;
+        cur[t] += 1;
     }
     // Fingerprint the in-edge SET only when we'll actually cross-check (verify scale). At billion+ the fp is
     // never sent, so DON'T clone in_edges for it (that clone was ~1 GB/worker of pure waste at 1B).
@@ -513,28 +506,18 @@ fn run_worker(coord_addr: &str, id: usize) {
     for &gg in &ghosts {
         req[balanced_owner(gg, scale, k)].push(gg as u64); // ghosts sorted ⇒ req[d] sorted
     }
-    // BIT-PACK the ghost-id exchange (MEASURED: round-2 route = 35% of setup, and it was shipping full u64s
-    // while the main shuffle already packs to `width` bytes). Same width as the shuffle → ~½ the route wire.
     let req_from = all_to_all(
         &peers,
         id,
         k,
-        req.iter()
-            .map(|r| {
-                let mut buf = Vec::with_capacity(r.len() * width);
-                for &gg in r {
-                    pack_id(&mut buf, gg, width);
-                }
-                buf
-            })
-            .collect(),
+        req.iter().map(|r| bytemuck::cast_slice(r).to_vec()).collect(),
     );
     // send_local[e] = my owned local indices of what e requested (in the order e sent it).
     let mut send_local: Vec<Vec<u32>> = vec![Vec::new(); k];
     for e in 0..k {
-        for ch in req_from[e].chunks_exact(width) {
+        for ch in req_from[e].chunks_exact(8) {
             // Requested ghosts are vertices I own → local index = mix(global)/k.
-            let gg = unpack_id(ch, 0, width) as usize;
+            let gg = u64::from_le_bytes(ch.try_into().unwrap()) as usize;
             send_local[e].push(balanced_local(gg, scale, k) as u32);
         }
     }
@@ -646,7 +629,6 @@ fn run_worker(coord_addr: &str, id: usize) {
     let timing = std::env::var("HG_TIMING").is_ok();
     let (mut t_compute, mut t_andersync, mut t_halosend, mut t_halorecv, mut t_dangsync) =
         (0u128, 0u128, 0u128, 0u128, 0u128);
-    let mut t_pull = 0u128; // split "compute" into the PULL vs the Anderson MATH to see which dominates
     for _ in 0..iters {
         let mut seg = std::time::Instant::now();
         local_rank[..owned].copy_from_slice(&owned_rank);
@@ -672,23 +654,13 @@ fn run_worker(coord_addr: &str, id: usize) {
             }
             *slot = add + D * acc;
         });
-        if timing {
-            t_pull += seg.elapsed().as_micros();
-            seg = std::time::Instant::now();
-        }
         // Anderson mixing: γ from a GLOBAL least-squares the coordinator solves over per-worker Gram/rhs
         // partials (O(window²) traffic, no relay). x_new = g − Σ γ_j (Δx_j + Δf_j).
         if accel > 0 {
-            // All of the Anderson math below was SINGLE-THREADED — the f/diff maps (O(owned)) and especially
-            // the Gram assembly (O(window²·owned) dot products). That serial chunk is a big slice of "compute"
-            // I wrongly blamed on memory bandwidth. Parallelize: elementwise maps trivially; the Gram ACROSS
-            // its independent (i,j) pairs so each dot product's 0..owned sum order is untouched ⇒ bit-identical.
-            let f: Vec<f64> = gvec.par_iter().zip(owned_rank.par_iter()).map(|(a, b)| a - b).collect();
+            let f: Vec<f64> = gvec.iter().zip(&owned_rank).map(|(a, b)| a - b).collect();
             if !x_old.is_empty() {
-                let dx: Vec<f64> = owned_rank.par_iter().zip(x_old.par_iter()).map(|(a, b)| a - b).collect();
-                let df: Vec<f64> = f.par_iter().zip(f_old.par_iter()).map(|(a, b)| a - b).collect();
-                dxh.push(dx);
-                dfh.push(df);
+                dxh.push(owned_rank.iter().zip(&x_old).map(|(a, b)| a - b).collect());
+                dfh.push(f.iter().zip(&f_old).map(|(a, b)| a - b).collect());
                 if dxh.len() > accel {
                     dxh.remove(0);
                     dfh.remove(0);
@@ -697,32 +669,21 @@ fn run_worker(coord_addr: &str, id: usize) {
             let mk = dfh.len();
             let mut gram = vec![0.0f64; mk * mk];
             let mut rhs = vec![0.0f64; mk];
-            let pairs: Vec<(usize, usize)> = (0..mk).flat_map(|i| (i..mk).map(move |j| (i, j))).collect();
-            let gvals: Vec<((usize, usize), f64)> = pairs
-                .par_iter()
-                .map(|&(i, j)| {
+            for i in 0..mk {
+                for j in i..mk {
                     let mut dd = 0.0;
                     for v in 0..owned {
                         dd += dfh[i][v] * dfh[j][v];
                     }
-                    ((i, j), dd)
-                })
-                .collect();
-            for ((i, j), dd) in gvals {
-                gram[i * mk + j] = dd;
-                gram[j * mk + i] = dd;
+                    gram[i * mk + j] = dd;
+                    gram[j * mk + i] = dd;
+                }
+                let mut r = 0.0;
+                for v in 0..owned {
+                    r += dfh[i][v] * f[v];
+                }
+                rhs[i] = r;
             }
-            let rvals: Vec<f64> = (0..mk)
-                .into_par_iter()
-                .map(|i| {
-                    let mut r = 0.0;
-                    for v in 0..owned {
-                        r += dfh[i][v] * f[v];
-                    }
-                    r
-                })
-                .collect();
-            rhs.copy_from_slice(&rvals);
             if timing {
                 t_compute += seg.elapsed().as_micros();
                 seg = std::time::Instant::now();
@@ -807,12 +768,11 @@ fn run_worker(coord_addr: &str, id: usize) {
         h.join().ok();
     }
     if timing {
-        let tot = t_pull + t_compute + t_andersync + t_halosend + t_halorecv + t_dangsync;
+        let tot = t_compute + t_andersync + t_halosend + t_halorecv + t_dangsync;
         let pct = |x: u128| if tot > 0 { 100.0 * x as f64 / tot as f64 } else { 0.0 };
         // Per-shard file (concurrent workers byte-interleave stderr into mush otherwise).
         let line = format!(
-            "shard {id}: pull={:.0}ms ({:.1}%) anderMath={:.0}ms ({:.1}%) anderson-sync={:.0}ms ({:.1}%) halo-send={:.0}ms ({:.1}%) halo-recv={:.0}ms ({:.1}%) dangling-sync={:.0}ms ({:.1}%) total={:.0}ms\n",
-            t_pull as f64 / 1000.0, pct(t_pull),
+            "shard {id}: compute={:.0}ms ({:.1}%) anderson-sync={:.0}ms ({:.1}%) halo-send={:.0}ms ({:.1}%) halo-recv={:.0}ms ({:.1}%) dangling-sync={:.0}ms ({:.1}%) total={:.0}ms\n",
             t_compute as f64 / 1000.0, pct(t_compute),
             t_andersync as f64 / 1000.0, pct(t_andersync),
             t_halosend as f64 / 1000.0, pct(t_halosend),

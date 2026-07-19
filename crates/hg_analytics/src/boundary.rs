@@ -69,6 +69,113 @@ pub fn owner_of(v: usize, bounds: &[usize]) -> usize {
     }
 }
 
+// ---- Cyclic (round-robin) partition -------------------------------------------------------------
+// The contiguous range partition hands ALL the low-numbered vertices to shard 0. Under a power-law
+// (RMAT/Graph500) in-degree, those low ids ARE the hubs, so shard 0 inherits a ~⅓-of-all-edges spike —
+// the memory blow-up that walls a billion-plus run on commodity nodes. The cyclic partition instead
+// interleaves ownership (`v % k`), scattering the top-k hubs onto k different shards, so no shard
+// inherits the spike. Crucially it keeps owned-vertex ENUMERATION at O(n/k): a shard's owned vertices are
+// the arithmetic sequence `c, c+k, c+2k, …`, so local index `l` ↔ global `l*k + c` is a cheap bijection —
+// no O(n) scan and no global hashmap to know what you own.
+
+/// How many vertices shard `c` owns under the cyclic partition of `[0, n)` into `k` shards
+/// (i.e. `|{ c, c+k, c+2k, … } ∩ [0, n)|`). Also the owned count in the BALANCED partition below, because
+/// that one is cyclic in a bit-MIXED space of the same size.
+#[inline]
+pub fn cyclic_owned(n: usize, k: usize, c: usize) -> usize {
+    if c >= n {
+        0
+    } else {
+        (n - 1 - c) / k + 1
+    }
+}
+
+// ---- Balanced partition (bit-mix permutation, then cyclic) ---------------------------------------
+// A plain cyclic partition (`v % k`) does NOT fix RMAT skew: RMAT makes EVERY bit of the target id 0 with
+// probability a+b, so reading the low log2(k) bits (cyclic) is just as skewed as reading the high bits
+// (range) — one shard still gets (a+b)^log2(k) ≈ ⅓ of all edges at k=16. The fix is to MIX all the id bits
+// first (an invertible hash permutation `mix`), then partition cyclically in mixed space:
+//   owner(v)  = mix(v) % k       local(v) = mix(v) / k       global(l) = unmix(l*k + c)
+// Mixing decorrelates the shard bits from the per-bit skew → each shard gets ~m/k. Because `mix` is a
+// bijection on `[0, 2^bits)`, owned enumeration stays O(n/k) (no O(n) scan, no global hashmap) and the
+// owned count stays closed-form (`cyclic_owned`). `unmix` is only needed to reassemble at verify scale.
+
+const MIX_MULT: [u64; 2] = [0x2545_F491_4F6C_DD1D, 0x9E37_79B9_7F4A_7C15];
+
+#[inline]
+fn mask(bits: u32) -> u64 {
+    if bits >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << bits) - 1
+    }
+}
+#[inline]
+fn xsr(x: u64, s: u32, m: u64) -> u64 {
+    (x ^ (x >> s)) & m
+}
+// Invert y = x ^ (x >> s) by fixed-point iteration (each pass fixes the next `s` bits from the top).
+#[inline]
+fn inv_xsr(y: u64, s: u32, bits: u32, m: u64) -> u64 {
+    let mut x = y & m;
+    let iters = bits.div_ceil(s);
+    for _ in 0..iters {
+        x = (y ^ (x >> s)) & m;
+    }
+    x
+}
+// Modular inverse of odd `c` mod 2^bits (Newton doubling: 3→6→12→…→192 correct bits).
+#[inline]
+fn mul_inv(c: u64, m: u64) -> u64 {
+    let mut inv = c;
+    for _ in 0..6 {
+        inv = inv.wrapping_mul(2u64.wrapping_sub(c.wrapping_mul(inv)));
+    }
+    inv & m
+}
+
+/// Invertible bit-mix permutation on `[0, 2^bits)`. Decorrelates a vertex id from the RMAT per-bit skew.
+pub fn mix_bits(v: usize, bits: u32) -> usize {
+    let m = mask(bits);
+    let (s1, s2) = (bits / 2, bits / 3 + 1);
+    let mut x = v as u64 & m;
+    x = xsr(x, s1, m);
+    x = x.wrapping_mul(MIX_MULT[0]) & m;
+    x = xsr(x, s2, m);
+    x = x.wrapping_mul(MIX_MULT[1]) & m;
+    x = xsr(x, s1, m);
+    (x & m) as usize
+}
+
+/// Inverse of [`mix_bits`] — recovers the global vertex id from a mixed value.
+pub fn unmix_bits(w: usize, bits: u32) -> usize {
+    let m = mask(bits);
+    let (s1, s2) = (bits / 2, bits / 3 + 1);
+    let mut x = w as u64 & m;
+    x = inv_xsr(x, s1, bits, m);
+    x = x.wrapping_mul(mul_inv(MIX_MULT[1], m)) & m;
+    x = inv_xsr(x, s2, bits, m);
+    x = x.wrapping_mul(mul_inv(MIX_MULT[0], m)) & m;
+    x = inv_xsr(x, s1, bits, m);
+    (x & m) as usize
+}
+
+/// Balanced owner of vertex `v` (`n = 2^bits` vertices, `k` shards): `mix(v) % k`.
+#[inline]
+pub fn balanced_owner(v: usize, bits: u32, k: usize) -> usize {
+    mix_bits(v, bits) % k
+}
+/// Balanced local index of an owned vertex `v`: `mix(v) / k`.
+#[inline]
+pub fn balanced_local(v: usize, bits: u32, k: usize) -> usize {
+    mix_bits(v, bits) / k
+}
+/// Global vertex id of shard `c`'s balanced local index `l`: `unmix(l*k + c)`.
+#[inline]
+pub fn balanced_to_global(l: usize, bits: u32, k: usize, c: usize) -> usize {
+    unmix_bits(l * k + c, bits)
+}
+
 /// Range-partition into `k` boundary shards (each owns a contiguous node range) + the global out-degree
 /// vector (static setup metadata). Each shard's ghost set is discovered from the in-edges it owns.
 pub fn partition_edges_boundary(
@@ -888,6 +995,44 @@ pub fn distributed_lcc_boundary(n: usize, shards: &[BoundaryLccShard]) -> Vec<f6
 mod tests {
     use super::*;
     use crate::{connected_components, pagerank, Kronecker};
+
+    #[test]
+    fn balanced_partition_is_a_bijection() {
+        // mix must permute [0, 2^bits) exactly, and balanced_local/owner/to_global must round-trip — else
+        // ownership loses or duplicates vertices in the distributed shuffle.
+        for bits in [4u32, 8, 12, 16, 18] {
+            let n = 1usize << bits;
+            let k = 16;
+            let mut seen = vec![false; n];
+            for v in 0..n {
+                let w = mix_bits(v, bits);
+                assert!(w < n && !seen[w], "mix not a permutation at bits={bits}, v={v}");
+                seen[w] = true;
+                let c = balanced_owner(v, bits, k);
+                let l = balanced_local(v, bits, k);
+                assert_eq!(balanced_to_global(l, bits, k, c), v, "roundtrip failed bits={bits} v={v}");
+            }
+        }
+    }
+
+    #[test]
+    fn balanced_partition_flattens_rmat_skew() {
+        // The range partition hands shard 0 ~⅓ of a Graph500/RMAT graph's edges; the balanced partition
+        // must keep every shard within ~1.2× of the mean.
+        let (scale, ef, k) = (18u32, 16usize, 16usize);
+        let (n, m) = (Kronecker::vertices(scale), Kronecker::edges(scale, ef));
+        let bounds = range_bounds(n, k);
+        let (mut range, mut balanced) = (vec![0usize; k], vec![0usize; k]);
+        for (_u, v) in Kronecker::new(scale, ef, 0xB0A7) {
+            range[owner_of(v, &bounds)] += 1;
+            balanced[balanced_owner(v, scale, k)] += 1;
+        }
+        let mean = m as f64 / k as f64;
+        let range_max = *range.iter().max().unwrap() as f64 / mean;
+        let bal_max = *balanced.iter().max().unwrap() as f64 / mean;
+        assert!(range_max > 3.0, "expected range partition to be badly skewed, got {range_max:.2}×");
+        assert!(bal_max < 1.2, "balanced partition should be near-even, got {bal_max:.2}×");
+    }
 
     /// Serial reference BFS (hop distance) for verification.
     fn serial_bfs(n: usize, edges: &[(usize, usize)], source: usize) -> Vec<u32> {

@@ -1,0 +1,17 @@
+[package]
+name = "hg_analytics"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+hg_core = { path = "../hg_core" }
+rayon = "1.10"
+memmap2 = "0.9"
+bytemuck = "1"
+socket2 = "0.5"   # set large SO_SNDBUF/SO_RCVBUF on the mesh sockets — a 64KB default over ~2.5ms RTT caps
+                  # TCP throughput at ~26 MB/s, the exact shuffle-wall we measured at 68B.
+
+[dev-dependencies]
+# TCP keepalive for the distributed examples: keeps sockets alive through long idle periods (setup) so a
+# quiet connection isn't reaped by the cluster's conntrack. std::net::TcpStream can't set this itself.
+socket2 = "0.5"

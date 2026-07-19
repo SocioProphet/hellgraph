@@ -18,7 +18,7 @@ import numpy as np
 OUT = os.environ.get("HG_OUT", "/tmp/hg_vs")
 
 with open(f"{OUT}/meta.txt") as f:
-    n, m, iters, damping, rust_serial_s, rust_parallel_s = f.read().split()
+    n, m, iters, damping, rust_serial_s, rust_parallel_s = f.read().split()[:6]
 n, m, iters = int(n), int(m), int(iters)
 damping, rust_serial_s, rust_parallel_s = float(damping), float(rust_serial_s), float(rust_parallel_s)
 tol = 1e-6
@@ -39,7 +39,8 @@ def agreement(order):
 # ── scipy sparse power iteration (the optimized baseline) ────────────────────────────────────────────
 from scipy.sparse import csr_matrix
 
-t = time.perf_counter()
+# Build the CSR sparse matrix first — this is graph construction (scipy's equivalent of hg's PreparedGraph
+# build), EXCLUDED from the compute timer so it's apples-to-apples with hg's compute-only number.
 u, v = edges[:, 0].astype(np.int64), edges[:, 1].astype(np.int64)
 outdeg = np.bincount(u, minlength=n).astype(np.float64)
 # Column-stochastic transport: M[v,u] = 1/outdeg[u]; dangling handled explicitly each iter.
@@ -50,6 +51,7 @@ M = csr_matrix((inv[u], (v, u)), shape=(n, n))
 dangling = ~nz
 r = np.full(n, 1.0 / n)
 base = (1 - damping) / n
+t = time.perf_counter()  # compute-only: power iteration on the already-built matrix
 for _ in range(iters):
     dmass = r[dangling].sum()
     nxt = base + damping * (M.dot(r) + dmass / n)

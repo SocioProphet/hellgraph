@@ -60,9 +60,12 @@ echo "▸ apply configmap + coordinator + workers"
 kubectl apply -f "$K8S/configmap.yaml"
 # Substitute the image and keep worker completions/parallelism == HG_SHARDS.
 sed "s#IMAGE_PLACEHOLDER#$IMAGE#g" "$K8S/coordinator.yaml" | kubectl apply -f -
+# NOTE: use [[:space:]] not \s — BSD/macOS sed does not understand \s, so \s* silently matches nothing and
+# the fan-out stays at the file's default (an 8-vs-16 shard mismatch hangs the coordinator). POSIX class works
+# on both GNU and BSD sed.
 sed -e "s#IMAGE_PLACEHOLDER#$IMAGE#g" \
-    -e "s/^\(\s*completions:\).*/\1 $SHARDS/" \
-    -e "s/^\(\s*parallelism:\).*/\1 $SHARDS/" \
+    -e "s/^\([[:space:]]*completions:\).*/\1 $SHARDS/" \
+    -e "s/^\([[:space:]]*parallelism:\).*/\1 $SHARDS/" \
     "$K8S/workers.yaml" | kubectl apply -f -
 
 echo "▸ waiting for the run to finish (coordinator prints the verified result) ..."

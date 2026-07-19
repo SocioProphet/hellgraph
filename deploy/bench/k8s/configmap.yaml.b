@@ -7,13 +7,13 @@ metadata:
   name: hg-bench-params
   labels: { app: hg-bench }
 data:
-  HG_SHARDS: "61"
-  RAYON_NUM_THREADS: "16"
+  HG_SHARDS: "1"
+  RAYON_NUM_THREADS: "8"
   # NOTE: the coordinator MATERIALIZES the whole graph in RAM before sharding, so single-run scale is
   # capped by the COORDINATOR node's memory, not the aggregate cluster. On 16 GB nodes, scale 23 (~134M
   # edges, ~9 GB peak on the coordinator) is the safe ceiling. Hitting 1B needs a big coordinator node
   # (e.g. t2a-standard-32) or streaming generation — tracked as follow-up.
-  HG_SCALE: "32"        # 2^26 ≈ 67M vertices → ~1.07B edges (the billion, on the big-RAM coordinator)
+  HG_SCALE: "25"        # 2^26 ≈ 67M vertices → ~1.07B edges (the billion, on the big-RAM coordinator)
   HG_EDGEFACTOR: "16"
   HG_ITERS: "25"
   # FAST PATH (dist_p2p): the coordinator is out of the recurring hot path (O(k) scalar all-reduce only),

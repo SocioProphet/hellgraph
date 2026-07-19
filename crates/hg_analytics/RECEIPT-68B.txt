@@ -1,0 +1,32 @@
+68B BURIAL — hellgraph dist_gen opt8 (2026-07-12)
+=================================================
+68,719,476,736 edges / 4,294,967,296 nodes / 61 workers (scale-32, ef16)
+cluster: 62x n2d-standard-16 on-demand, us-central1-a, TORN DOWN
+gen+shuffle+route: 1030.36s · PageRank(25): 498.28s · Σrank=1.0000
+coordinator O(k), zero materialization. 2.1x past Neptune 32B ceiling.
+PERF: network-bound ~26MB/s/node BOTH phases — shuffle path is next target.
+
+10B MEASUREMENT (opt10, 47x n2d-standard-4, 2026-07-12) — THE reframe
+=====================================================================
+gen+shuffle+route 162.7s / PageRank 60.3s / Sigma=1.0
+SETUP SPLIT: gen 16.9s(11%) SHUFFLE 10.3s(7%) CSR 71.2s(47%) ROUTE 53.3s(35%)
+PAGERANK: compute 29.3s(48%) anderson-sync 16s(27%) halo-send 9.8s(16%) halo-recv 5.4s(9%)
+FINDING: edge shuffle was NEVER the bottleneck (10s). Real costs = CSR build
+(single-thread histogram+scatter+mix) + round-2 route (unpacked/unwindowed ghost
+exchange). socket2 HURT PageRank (autotuning conflict) - remove it. LZ4 moot.
+
+opt11 10B (2026-07-12) — MEASURED fixes CONFIRMED, 47x n2d-standard-4
+---------------------------------------------------------------------
+setup 163s->74.8s (2.2x): CSR 71->27s (par mix-precompute), route 53->18s (bit-pack)
+PageRank 60->52.5s (socket2 removed). whole run 223->127.5s (1.75x). Sigma=1.0
+remaining biggest: CSR 38% (sort+single-thread hist/scatter) + PR compute 55% (mem-bw bound)
+
+68B on opt12/highmem (2026-07-13) — 2.4x faster, throughput projection CORRECTED DOWN
+----------------------------------------------------------------------------------
+61 workers n2d-highmem-16, Sigma=1.0, no OOM. gen+shuffle+route 375s (opt8 1030 = 2.75x),
+PageRank 268.6s (opt8 498 = 1.85x), total ~10.7min (opt8 ~25min = 2.4x).
+SETUP split: gen 42 shuffle 55 CSR 110 ROUTE 137(40%). PR split: pull 42 anderMath 29
+ANDERSON-SYNC 102(38%, straggler barrier) HALO 97(36%). compute only 26% of PR.
+EFFECTIVE ~6.4 GTEPS (NOT the projected 25-35) — barrier/halo derate is ~6x not 1.5-2x.
+BURIAL (scale) unchanged & solid; THROUGHPUT projection was too rosy. Real wall = sync-BSP
+barrier + halo = task #14 async redesign. opt12 needs highmem nodes (parallelism = more RAM).

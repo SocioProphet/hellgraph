@@ -1,0 +1,24 @@
+hellgraph dist_gen — the billion, on the no-cap runtime (GKE, spot, torn down)
+=============================================================================
+date:        2026-07-11
+cluster:     GKE hg-bench, us-central1-a, 17× t2a-standard-4 (arm64, spot), TORN DOWN after run
+runtime:     dist_gen (distributed generation + all-to-all shuffle; NO node holds O(m) or O(n))
+image:       hellgraph-bench:memfix (native arm64, podman)
+params:      scale-26, edgefactor 16, 16 workers, HG_VERIFY=0, HG_ACCEL=5 (Anderson w5), HG_F32_HALO=1
+
+graph:       67,108,864 nodes  /  1,073,741,824 edges
+
+  distributed gen+shuffle+route:        233.18 s
+  distributed PageRank (25 supersteps): 102.47 s
+  Σrank = 1.0000  (mass conserved)
+  coordinator: O(k) — materialized ZERO edges, no O(n) out_deg, no routing tables
+  workers:     16/16 Completed, ZERO OOM, ZERO restarts (RMAT hub-shard held ~⅓ of all edges and survived)
+
+what made 1B fit (this session's memory fix to dist_gen.rs):
+  - fingerprint clone gated on HG_VERIFY (was cloning the hub-shard's ~5.7GB in-edges for an unsent fp)
+  - in_edges freed after the in-CSR is built (billion path)
+  - shuffle receive drains peers SEQUENTIALLY on the main thread (writers already threaded → deadlock-free),
+    capping the transient to one peer body instead of buffering all k ahead of the drain
+
+100B: design-ready (u64 ids, no O(m)/O(n), coord O(k)) but blocked on RMAT hub-skew under range partitioning.
+      unlock = balanced/hash owner-function. NOT button-ready until that lands. (see PEERS.md)

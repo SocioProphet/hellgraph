@@ -9,7 +9,7 @@ billion-to-100B scale. No spin — where a peer beats us, it says so.
 |---|---|---|---|---|---|---|
 | **cuGraph** (NVIDIA) | multi-trillion edges (GPU cluster) | yes (multi-GPU) | **38 GTEPS** DGX-2 / 8.7 single-V100 — the leader | DGX / GPU-pod ($$$$) | open lib, NVIDIA-only HW | yes (published) |
 | **TigerGraph** | billions verts / **trillions edges** | yes (near-linear, 6.7× on 8) | not GTEPS-published | proprietary license + cluster | closed, licensed | vendor benchmark |
-| **hellgraph** (us) | **100B–1T** (aggregate-memory, no single-node cap) | yes (dist_gen, no coordinator materialization) | 2.8 GTEPS CPU / 3.2 M2-iGPU measured; ~20–40 A100 *projected* | **ephemeral spot, teardown** | **open + sovereign** | **verified bit-exact; 1B on cluster** |
+| **hellgraph** (us) | **1B proven; 100B design-ready** (no single-node cap; needs balanced partition — see below) | yes (dist_gen, no coordinator materialization) | 2.8 GTEPS CPU / 3.2 M2-iGPU measured; ~20–40 A100 *projected* | **ephemeral spot, teardown** | **open + sovereign** | **verified bit-exact; 1B on GKE, Σrank=1** |
 | **Neo4j GDS** | **~18B ceiling** (1 machine — *cannot partition*) | **NO** | 3× Spark GraphX | managed / self-host, one big box | closed core | yes (18B in 1h45m) |
 | **Amazon Neptune Analytics** | **~16–32B ceiling** (4096 m-NCU = 4 TB, *cannot partition*) | **NO** | **not published** | hourly m-NCU, always-on | managed black box | "tens of billions in seconds" (marketing) |
 | **Ligra / PowerGraph / SNAP** | ~single-node (billions) | no | 0.52 / 0.42 / 0.25 GTEPS | research / self-host | open | published (Twitter-1.5B) |
@@ -17,8 +17,10 @@ billion-to-100B scale. No spin — where a peer beats us, it says so.
 
 ## The honest three tiers
 
-**Tier 1 — can actually do 100B+ (uncapped / distributed):** cuGraph, TigerGraph, hellgraph.
-Everyone else has a single-node wall.
+**Tier 1 — no single-node wall (uncapped / distributed):** cuGraph, TigerGraph, hellgraph. cuGraph and
+TigerGraph have *shipped* 100B+/trillion runs; hellgraph has *shipped a verified 1B* and is architecturally
+uncapped (no node holds O(m)/O(n)) but needs the balanced-partition fix before a 100B button-press (below).
+Everyone below has a single-node wall no fix removes.
 
 **Tier 2 — single-machine ceiling (the wall we're past):** Neo4j GDS (~18B, "cannot partition across
 machines"), Neptune Analytics (4 TB / ~16–32B, "cannot partition"). At 100B these **physically can't hold
@@ -38,12 +40,32 @@ the graph.** This is the architectural burial — not a price argument.
 
 ## The receipts (measured, this project — not marketing)
 
-- **1,073,741,824-edge PageRank, bit-exact** (max|Δ| 1.86e-14) on 8 spot nodes, torn down (the first billion).
-- **dist_gen no-cap runtime**: distributed generation + shuffle, NO node holds O(m) or O(n); verified
-  bit-exact at scale-18/20 (5.8e-16 … 4.6e-15), end-to-end at 268M; **100B-safe (u64 vertex ids)**.
+- **1,073,741,824-edge PageRank on the NO-CAP runtime** (dist_gen), 16 spot workers on GKE, torn down:
+  gen+shuffle+route **233.18s**, PageRank 25 supersteps **102.47s**, **Σrank = 1.0000** (mass conserved).
+  The coordinator materialized **ZERO edges** and held **O(k)** — no node ever held O(m) or O(n). This is the
+  billion done coordinator-free; it replaces the earlier relay-bound run that 404'd under coordinator load.
+- **Bit-exact provenance**: same runtime verified vs single-graph PageRank at scale-16/18/20 (max|Δ|
+  5.8e-16 … 4.6e-15) and end-to-end at 268M; **u64 vertex ids** (no truncation past 4.29B vertices).
 - **Fast path**: Anderson (~2× fewer supersteps) × f32 halo (½ wire) = ~4× less halo network, verified to compose.
-- **In progress**: the optimized-runtime 1B rerun on the cluster (this session) → the receipt that replaces
-  the relay-bound 404s first run.
+
+## 100B readiness — the code wall is removed (measured)
+
+The old blocker was the **range partitioner + RMAT hub-skew**: RMAT makes every target-id bit 0 with prob
+a+b=0.76, so ANY partition reading a fixed bit-slice (range = high bits, cyclic = low bits) hands one shard
+≈0.76^log2(k) of ALL edges — ~⅓ at k=16. At 100B that's tens of billions of edges on one worker → OOM no
+matter how many workers you add. **(Verified false start this session: cyclic `v%k` measured *identical* 33.4%
+skew — proof that mixing is required, not just a different bit-slice.)**
+
+**Fixed** with a BALANCED partition: `owner(v) = mix(v) % k` where `mix` is an invertible bit-permutation that
+decorrelates shard assignment from the per-bit skew. Because `mix` is a bijection on `[0, 2^scale)`, owned
+enumeration stays O(n/k) (no O(n) scan, no global hashmap) and the owned count stays closed-form.
+Measured: imbalance **5.34× → 1.05×** (analytic, scale-24) and **1.09× on a live distributed run** (scale-22,
+per-shard 8.08–8.79M edges); bijection + bit-exact PageRank (max|Δ| 4.79e-15) both verified; 2 lib
+regression tests. Tooling: `examples/skew_check.rs`.
+
+**So the engineering wall is down and proven.** What remains before a 100B *run* is infrastructure, not code:
+~128 × 16-vCPU spot nodes (≈2048 vCPUs, a GKE quota increase over the 68-vCPU 1B cluster) and ~$15–25 of
+ephemeral spot compute. That's an operational go/quota decision, no longer a missing capability.
 
 ## Sources
 - [Amazon Neptune pricing](https://aws.amazon.com/neptune/pricing/) — m-NCU model / 4096 cap

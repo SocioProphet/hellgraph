@@ -12,14 +12,29 @@ use std::collections::HashMap;
 
 mod boundary;
 mod cc;
+mod cypher;
+mod fasthash;
 mod graph500;
+mod graphdb;
+mod hash;
+mod index;
+mod interner;
 mod ooc;
 mod partitioner;
+mod probabilistic;
 mod topology;
+pub use cypher::{parse as parse_cypher, Query};
+pub use fasthash::{FxHashMap, FxHashSet};
+pub use hash::{sha256, sha256_hex};
+pub use index::{GraphCore, GraphIndex, MmapGraphIndex, PropKey};
+pub use interner::Interner;
+pub use probabilistic::{Bloom, HyperLogLog};
+pub use graphdb::{NodeId, Op, OpSpec, Prop, Receipt, Record, ShardedGraph, Step, Store, View};
 pub use boundary::{
     distributed_bfs_boundary, distributed_cc_boundary, distributed_cdlp_boundary,
     distributed_lcc_boundary, distributed_pagerank_boundary, distributed_pagerank_boundary_delta,
-    distributed_sssp_boundary, owner_of, partition_cc_boundary, partition_cc_boundary_at,
+    balanced_local, balanced_owner, balanced_to_global, cyclic_owned, distributed_sssp_boundary,
+    mix_bits, owner_of, partition_cc_boundary, partition_cc_boundary_at,
     partition_edges_boundary, partition_edges_boundary_at, partition_lcc_boundary,
     partition_wsssp_boundary, partition_wsssp_boundary_at, range_bounds, total_cc_halo_bytes,
     total_halo_bytes, total_w_halo_bytes, BoundaryCcShard, BoundaryLccShard, BoundaryShard,
@@ -720,6 +735,305 @@ pub fn connected_components_uf(n: usize, edges: &[(usize, usize)]) -> Vec<u32> {
     parent
 }
 
+// ── Connected components (LOCK-FREE PARALLEL union-find — the scale path) ─────────────────────────────────────
+/// Parallel connected components via a lock-free concurrent union-find (atomic parent array, path-halving
+/// finds, monotone linking). Processes every edge across all cores with rayon. Correctness rests on ONE
+/// value-invariant that holds regardless of memory ordering: a union always attaches the HIGHER-id root under
+/// the LOWER-id root, so `parent[x] <= x` forever and a node's root id only ever DECREASES — no cycle can form,
+/// `find` strictly descends (so it always terminates), and the surviving root of each component is
+/// deterministically its MIN id. The result is therefore bit-identical to the canonical min-label
+/// `connected_components`, computed in parallel. This beats single-threaded `connected_components_uf` once the
+/// graph is large enough to amortize the atomic overhead (measured LiveJournal-scale crossover: sequential
+/// wins at ~5M edges, parallel wins at ~69M). Relaxed ordering suffices — rayon's join after `for_each`
+/// publishes all writes before the flatten reads them.
+pub fn connected_components_parallel(n: usize, edges: &[(usize, usize)]) -> Vec<u32> {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    if n == 0 {
+        return Vec::new();
+    }
+    let parent: Vec<AtomicU32> = (0..n as u32).map(AtomicU32::new).collect();
+    // find with path halving — best-effort CAS: a lost race only skips one shortcut, never corrupts.
+    fn find(parent: &[AtomicU32], mut x: u32) -> u32 {
+        loop {
+            let p = parent[x as usize].load(Ordering::Relaxed);
+            if p == x {
+                return x;
+            }
+            let gp = parent[p as usize].load(Ordering::Relaxed);
+            if p != gp {
+                let _ =
+                    parent[x as usize].compare_exchange(p, gp, Ordering::Relaxed, Ordering::Relaxed);
+            }
+            x = gp;
+        }
+    }
+    edges.par_iter().for_each(|&(a, b)| {
+        if a >= n || b >= n || a == b {
+            return;
+        }
+        let (mut u, mut v) = (a as u32, b as u32);
+        loop {
+            u = find(&parent, u);
+            v = find(&parent, v);
+            if u == v {
+                break;
+            }
+            // monotone link: attach the higher root under the lower → root id can only decrease.
+            let (hi, lo) = if u > v { (u, v) } else { (v, u) };
+            if parent[hi as usize]
+                .compare_exchange(hi, lo, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                break;
+            }
+            // lost the race (hi was re-parented) → re-resolve roots and retry.
+        }
+    });
+    // flatten every node to its (min-id) root, in parallel.
+    (0..n).into_par_iter().map(|i| find(&parent, i as u32)).collect()
+}
+
+// ── CDLP — Community Detection by Label Propagation (LDBC Graphalytics-CONFORMANT) ───────────────────────────
+/// Build the CDLP neighbour CSR: the in∪out MULTISET, self-loops skipped. Per the LDBC Graphalytics spec, a
+/// vertex counts the labels of BOTH its incoming and outgoing neighbours, so for a directed edge (u,v), u
+/// gains v as a neighbour AND v gains u — a reciprocal pair (u,v)+(v,u) therefore contributes a neighbour's
+/// label TWICE (NOT deduplicated; this is what distinguishes CDLP from the simple-graph LCC adjacency).
+pub fn cdlp_csr(n: usize, edges: &[(usize, usize)]) -> (Vec<u32>, Vec<u32>) {
+    let mut off = vec![0u32; n + 1];
+    for &(u, v) in edges {
+        if u < n && v < n && u != v {
+            off[u + 1] += 1;
+            off[v + 1] += 1;
+        }
+    }
+    for i in 0..n {
+        off[i + 1] += off[i];
+    }
+    let mut cur = off.clone();
+    let mut nbr = vec![0u32; off[n] as usize];
+    for &(u, v) in edges {
+        if u < n && v < n && u != v {
+            nbr[cur[u] as usize] = v as u32;
+            cur[u] += 1;
+            nbr[cur[v] as usize] = u as u32;
+            cur[v] += 1;
+        }
+    }
+    (off, nbr)
+}
+
+/// Run `iters` synchronous CDLP sweeps on a prebuilt CDLP CSR (see `cdlp_csr`). Deterministic: every vertex
+/// adopts the MOST FREQUENT neighbour label, ties broken to the SMALLEST label; labels start at the vertex id.
+/// Parallel (rayon map_init: per-thread reused count array + dirty list), bit-identical to a serial sweep.
+/// Kept separate from the CSR build so a benchmark can time the kernel alone (matching GDS computeMillis).
+pub fn cdlp_on_csr(n: usize, off: &[u32], nbr: &[u32], iters: usize) -> Vec<u32> {
+    if n == 0 {
+        return Vec::new();
+    }
+    let mut label: Vec<u32> = (0..n as u32).collect();
+    for _ in 0..iters {
+        let label_ref = &label;
+        let next: Vec<u32> = (0..n)
+            .into_par_iter()
+            .map_init(
+                || (vec![0u32; n], Vec::<u32>::new()),
+                |(cnt, touched), i| {
+                    let row = &nbr[off[i] as usize..off[i + 1] as usize];
+                    if row.is_empty() {
+                        return label_ref[i];
+                    }
+                    touched.clear();
+                    for &v in row {
+                        let l = label_ref[v as usize];
+                        if cnt[l as usize] == 0 {
+                            touched.push(l);
+                        }
+                        cnt[l as usize] += 1;
+                    }
+                    let mut best = label_ref[i];
+                    let mut bc = 0u32;
+                    for &l in touched.iter() {
+                        let c = cnt[l as usize];
+                        if c > bc || (c == bc && l < best) {
+                            bc = c;
+                            best = l;
+                        }
+                    }
+                    for &l in touched.iter() {
+                        cnt[l as usize] = 0;
+                    }
+                    best
+                },
+            )
+            .collect();
+        label = next;
+    }
+    label
+}
+
+/// LDBC Graphalytics-conformant CDLP end-to-end (build the in∪out multiset CSR, then run `iters` sweeps).
+/// NOTE: Neo4j GDS `labelPropagation` is a DIFFERENT algorithm (asynchronous, weight-aware, randomised
+/// tie-breaking) — it will NOT reproduce this community structure, so a community-count match with GDS is not
+/// expected and not a conformance signal. Validate against the LDBC definition (see tests), not against GDS.
+pub fn cdlp_parallel(n: usize, edges: &[(usize, usize)], iters: usize) -> Vec<u32> {
+    let (off, nbr) = cdlp_csr(n, edges);
+    cdlp_on_csr(n, &off, &nbr, iters)
+}
+
+// ── SSSP — parallel label-correcting single-source shortest paths (the WCC recipe, applied to Dijkstra) ───────
+/// Build the weighted directed out-CSR for SSSP. Returns (row offsets, targets, edge weights) parallel to `nbr`.
+pub fn sssp_csr(n: usize, edges: &[(usize, usize)], weights: &[f64]) -> (Vec<u32>, Vec<u32>, Vec<f64>) {
+    let mut off = vec![0u32; n + 1];
+    for &(u, _) in edges {
+        if u < n {
+            off[u + 1] += 1;
+        }
+    }
+    for i in 0..n {
+        off[i + 1] += off[i];
+    }
+    let mut cur = off.clone();
+    let m = off[n] as usize;
+    let mut nbr = vec![0u32; m];
+    let mut wgt = vec![0.0f64; m];
+    for (i, &(u, v)) in edges.iter().enumerate() {
+        if u < n && v < n {
+            let p = cur[u] as usize;
+            nbr[p] = v as u32;
+            wgt[p] = weights[i];
+            cur[u] += 1;
+        }
+    }
+    (off, nbr, wgt)
+}
+
+/// Atomic min on an f64 stored as u64 bits. Returns true iff it lowered the slot (a CAS-loop; monotone
+/// decreasing → always terminates). Relaxed ordering suffices: rayon's join between frontiers publishes writes.
+fn atomic_min_f64(slot: &std::sync::atomic::AtomicU64, val: f64) -> bool {
+    use std::sync::atomic::Ordering;
+    let mut cur = slot.load(Ordering::Relaxed);
+    loop {
+        if f64::from_bits(cur) <= val {
+            return false;
+        }
+        match slot.compare_exchange_weak(cur, val.to_bits(), Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return true,
+            Err(c) => cur = c,
+        }
+    }
+}
+
+/// Parallel single-source shortest paths on a prebuilt weighted CSR (non-negative weights). Frontier-based
+/// label-correcting relaxation with atomic-min on the distance array: every frontier is relaxed across all
+/// cores, and any vertex whose distance drops joins the next frontier. Produces the SAME distance vector as
+/// sequential Dijkstra — shortest-path distances are unique in value, so the result is deterministic regardless
+/// of relaxation order. Fast on low-diameter graphs (few frontier rounds). `dist[i] = INFINITY` if unreachable.
+pub fn sssp_on_csr(n: usize, off: &[u32], nbr: &[u32], wgt: &[f64], src: usize) -> Vec<f64> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    if n == 0 {
+        return Vec::new();
+    }
+    let dist: Vec<AtomicU64> =
+        (0..n).map(|_| AtomicU64::new(f64::INFINITY.to_bits())).collect();
+    if src < n {
+        dist[src].store(0.0f64.to_bits(), Ordering::Relaxed);
+    }
+    let mut frontier: Vec<u32> = if src < n { vec![src as u32] } else { Vec::new() };
+    while !frontier.is_empty() {
+        let mut next: Vec<u32> = frontier
+            .par_iter()
+            .flat_map_iter(|&u| {
+                let du = f64::from_bits(dist[u as usize].load(Ordering::Relaxed));
+                let mut local: Vec<u32> = Vec::new();
+                for k in off[u as usize] as usize..off[u as usize + 1] as usize {
+                    let v = nbr[k];
+                    if atomic_min_f64(&dist[v as usize], du + wgt[k]) {
+                        local.push(v);
+                    }
+                }
+                local.into_iter()
+            })
+            .collect();
+        next.par_sort_unstable();
+        next.dedup();
+        frontier = next;
+    }
+    (0..n).map(|i| f64::from_bits(dist[i].load(Ordering::Relaxed))).collect()
+}
+
+/// Parallel SSSP end-to-end (build the weighted CSR, then relax). See `sssp_on_csr`.
+pub fn sssp_parallel(n: usize, edges: &[(usize, usize)], weights: &[f64], src: usize) -> Vec<f64> {
+    let (off, nbr, wgt) = sssp_csr(n, edges, weights);
+    sssp_on_csr(n, &off, &nbr, &wgt, src)
+}
+
+// ── BFS — parallel level-synchronous breadth-first search (the WCC/SSSP recipe, unweighted) ──────────────────
+/// Directed out-CSR for BFS. Returns (row offsets, targets).
+pub fn bfs_csr(n: usize, edges: &[(usize, usize)]) -> (Vec<u32>, Vec<u32>) {
+    let mut off = vec![0u32; n + 1];
+    for &(u, _) in edges {
+        if u < n {
+            off[u + 1] += 1;
+        }
+    }
+    for i in 0..n {
+        off[i + 1] += off[i];
+    }
+    let mut cur = off.clone();
+    let mut nbr = vec![0u32; off[n] as usize];
+    for &(u, v) in edges {
+        if u < n && v < n {
+            nbr[cur[u] as usize] = v as u32;
+            cur[u] += 1;
+        }
+    }
+    (off, nbr)
+}
+
+/// Parallel level-synchronous BFS on a prebuilt out-CSR. Each level's frontier is expanded across all cores;
+/// a neighbour joins the next frontier exactly once, decided by an atomic CAS that claims its (unique, shortest)
+/// BFS level — so there are NO duplicates to dedup and the level assignment is deterministic (== sequential
+/// BFS hop-distances). `dist[i] = u32::MAX` if unreachable from `src`.
+pub fn bfs_on_csr(n: usize, off: &[u32], nbr: &[u32], src: usize) -> Vec<u32> {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    if n == 0 {
+        return Vec::new();
+    }
+    let dist: Vec<AtomicU32> = (0..n).map(|_| AtomicU32::new(u32::MAX)).collect();
+    if src < n {
+        dist[src].store(0, Ordering::Relaxed);
+    }
+    let mut frontier: Vec<u32> = if src < n { vec![src as u32] } else { Vec::new() };
+    let mut level = 0u32;
+    while !frontier.is_empty() {
+        level += 1;
+        let lv = level;
+        frontier = frontier
+            .par_iter()
+            .flat_map_iter(|&u| {
+                let mut local: Vec<u32> = Vec::new();
+                for k in off[u as usize] as usize..off[u as usize + 1] as usize {
+                    let v = nbr[k];
+                    if dist[v as usize]
+                        .compare_exchange(u32::MAX, lv, Ordering::Relaxed, Ordering::Relaxed)
+                        .is_ok()
+                    {
+                        local.push(v);
+                    }
+                }
+                local.into_iter()
+            })
+            .collect();
+    }
+    (0..n).map(|i| dist[i].load(Ordering::Relaxed)).collect()
+}
+
+/// Parallel BFS end-to-end (build the out-CSR, then traverse). See `bfs_on_csr`.
+pub fn bfs_parallel(n: usize, edges: &[(usize, usize)], src: usize) -> Vec<u32> {
+    let (off, nbr) = bfs_csr(n, edges);
+    bfs_on_csr(n, &off, &nbr, src)
+}
+
 // ── Betweenness centrality (Brandes, unweighted, undirected) ─────────────────────────────────────────────────
 /// Exact Brandes betweenness over an undirected graph. Deterministic (BFS in index order). Each shortest-path pair
 /// is counted once (undirected → halved). Identifies "bridge" nodes — the structural connectors.
@@ -805,6 +1119,52 @@ fn brandes_source(s: usize, adj: &[Vec<usize>], n: usize, bc: &mut [f64]) {
             bc[w] += delta[w];
         }
     }
+}
+
+/// LCC — local clustering coefficient per node, on the SIMPLE undirected graph (parallel edges deduped,
+/// self-loops dropped). Per node: triangles among its neighbours / (d·(d−1)). Neighbour rows are sorted
+/// so each triangle count is a linear merge-intersection; the per-node loop is rayon-parallel. `tri` counts
+/// each triangle from both endpoints, so the d·(d−1) denominator (not d·(d−1)/2) yields the standard value.
+pub fn lcc_parallel(n: usize, edges: &[(usize, usize)]) -> Vec<f64> {
+    let mut adj: Vec<Vec<u32>> = vec![Vec::new(); n];
+    for &(u, v) in edges {
+        if u < n && v < n && u != v {
+            adj[u].push(v as u32);
+            adj[v].push(u as u32);
+        }
+    }
+    adj.par_iter_mut().for_each(|row| {
+        row.sort_unstable();
+        row.dedup();
+    });
+    let adj_ref = &adj;
+    (0..n)
+        .into_par_iter()
+        .map(|v| {
+            let nb = &adj_ref[v];
+            let d = nb.len();
+            if d < 2 {
+                return 0.0;
+            }
+            let mut tri = 0usize;
+            for &a in nb {
+                let na = &adj_ref[a as usize];
+                let (mut i, mut j) = (0usize, 0usize);
+                while i < nb.len() && j < na.len() {
+                    match nb[i].cmp(&na[j]) {
+                        std::cmp::Ordering::Less => i += 1,
+                        std::cmp::Ordering::Greater => j += 1,
+                        std::cmp::Ordering::Equal => {
+                            tri += 1;
+                            i += 1;
+                            j += 1;
+                        }
+                    }
+                }
+            }
+            tri as f64 / (d as f64 * (d as f64 - 1.0))
+        })
+        .collect()
 }
 
 /// Parallel (rayon) Brandes betweenness — the source loop is embarrassingly parallel and
@@ -956,12 +1316,14 @@ pub fn distributed_pagerank(
 // ── Louvain community detection (full: local-moving + aggregation, deterministic) ─────────────────────────────
 /// Modularity-optimizing community detection. Deterministic (nodes visited in index order, ties broken by lowest
 /// community id). Unweighted, undirected, resolution 1.0. Returns a flat community id per original node.
+/// Adjacency is FROZEN into a sorted CSR-style `Vec<Vec<(u32,f64)>>` so the many local-moving sweeps iterate
+/// cache-friendly arrays, not hash maps — same result, far less time. Degree computed in parallel (rayon).
 pub fn louvain(n: usize, edges: &[(usize, usize)]) -> Vec<usize> {
     if n == 0 {
         return Vec::new();
     }
-    // Build a weighted undirected super-graph as adjacency maps; start with the input graph (weight 1 per edge).
-    let mut adj: Vec<HashMap<usize, f64>> = vec![HashMap::new(); n];
+    // Build first-level weighted adjacency (accumulate parallel edges), then freeze to sorted CSR.
+    let mut amap: Vec<FxHashMap<u32, f64>> = vec![FxHashMap::default(); n];
     let mut self_loop = vec![0.0f64; n];
     for &(u, v) in edges {
         if u >= n || v >= n {
@@ -970,49 +1332,56 @@ pub fn louvain(n: usize, edges: &[(usize, usize)]) -> Vec<usize> {
         if u == v {
             self_loop[u] += 2.0;
         } else {
-            *adj[u].entry(v).or_insert(0.0) += 1.0;
-            *adj[v].entry(u).or_insert(0.0) += 1.0;
+            *amap[u].entry(v as u32).or_insert(0.0) += 1.0;
+            *amap[v].entry(u as u32).or_insert(0.0) += 1.0;
         }
     }
-    // partition[orig] tracks each original node's current top-level community as we coarsen.
+    let freeze = |m: Vec<FxHashMap<u32, f64>>| -> Vec<Vec<(u32, f64)>> {
+        m.into_iter()
+            .map(|h| {
+                let mut a: Vec<(u32, f64)> = h.into_iter().collect();
+                a.sort_unstable_by_key(|&(j, _)| j);
+                a
+            })
+            .collect()
+    };
+    let mut adj: Vec<Vec<(u32, f64)>> = freeze(amap);
+
     let mut partition: Vec<usize> = (0..n).collect();
     loop {
         let (comm, moved) = local_moving(&adj, &self_loop);
-        // relabel comm to dense 0..k
-        let mut remap: HashMap<usize, usize> = HashMap::new();
+        let mut remap: FxHashMap<usize, usize> = FxHashMap::default();
         for &c in &comm {
             let next = remap.len();
             remap.entry(c).or_insert(next);
         }
         let dense: Vec<usize> = comm.iter().map(|c| remap[c]).collect();
-        // push down to original nodes
         for p in partition.iter_mut() {
             *p = dense[*p];
         }
         if !moved || remap.len() == adj.len() {
-            break; // converged: no node moved, or every node is its own community
+            break;
         }
-        // aggregate into the super-graph for the next level
+        // aggregate into the next-level super-graph.
         let k = remap.len();
-        let mut nadj: Vec<HashMap<usize, f64>> = vec![HashMap::new(); k];
+        let mut nmap: Vec<FxHashMap<u32, f64>> = vec![FxHashMap::default(); k];
         let mut nself = vec![0.0f64; k];
         for u in 0..adj.len() {
             let cu = dense[u];
             nself[cu] += self_loop[u];
-            for (&v, &w) in &adj[u] {
-                let cv = dense[v];
+            for &(v, w) in &adj[u] {
+                let cv = dense[v as usize];
                 if cu == cv {
-                    nself[cu] += w; // each intra edge seen twice across u,v → sums to 2*w (matches self_loop convention)
+                    nself[cu] += w;
                 } else {
-                    *nadj[cu].entry(cv).or_insert(0.0) += w;
+                    *nmap[cu].entry(cv as u32).or_insert(0.0) += w;
                 }
             }
         }
-        adj = nadj;
+        adj = freeze(nmap);
         self_loop = nself;
     }
-    // relabel final partition to dense ids
-    let mut remap: HashMap<usize, usize> = HashMap::new();
+    let mut remap: FxHashMap<usize, usize> = FxHashMap::default();
     partition
         .iter()
         .map(|&c| {
@@ -1022,36 +1391,43 @@ pub fn louvain(n: usize, edges: &[(usize, usize)]) -> Vec<usize> {
         .collect()
 }
 
-/// One level of Louvain local-moving. Returns (community per node, whether any node moved).
-fn local_moving(adj: &[HashMap<usize, f64>], self_loop: &[f64]) -> (Vec<usize>, bool) {
+/// One level of Louvain local-moving. Returns (community per node, whether any node moved). Neighbour-
+/// community weights use a REUSED `Vec<f64>` (indexed by community) + a dirty list, not a hash map: pure
+/// array indexing, zero per-node allocation, zero hashing. Same deterministic result, far less time.
+fn local_moving(adj: &[Vec<(u32, f64)>], self_loop: &[f64]) -> (Vec<usize>, bool) {
     let n = adj.len();
     let deg: Vec<f64> = (0..n)
-        .map(|i| adj[i].values().sum::<f64>() + self_loop[i])
+        .into_par_iter()
+        .map(|i| adj[i].iter().map(|&(_, w)| w).sum::<f64>() + self_loop[i])
         .collect();
     let m2: f64 = deg.iter().sum::<f64>(); // 2m
     if m2 == 0.0 {
         return ((0..n).collect(), false);
     }
     let mut comm: Vec<usize> = (0..n).collect();
-    let mut tot: Vec<f64> = deg.clone(); // sum of degrees in each community
+    let mut tot: Vec<f64> = deg.clone();
     let mut any_moved = false;
     let mut improved = true;
+    let mut wt = vec![0.0f64; n]; // wt[c] = edge weight from node i to community c (reused; always reset)
+    let mut touched: Vec<usize> = Vec::new();
     while improved {
         improved = false;
         for i in 0..n {
-            let ci = comm[i];
-            // weight from i to each neighbor community
-            let mut to_comm: HashMap<usize, f64> = HashMap::new();
-            for (&j, &w) in &adj[i] {
-                *to_comm.entry(comm[j]).or_insert(0.0) += w;
+            touched.clear();
+            for &(j, w) in &adj[i] {
+                let c = comm[j as usize];
+                if wt[c] == 0.0 {
+                    touched.push(c);
+                }
+                wt[c] += w;
             }
-            // remove i from its community
+            let ci = comm[i];
+            let ki_ci = wt[ci];
             tot[ci] -= deg[i];
-            // best gain (staying-removed baseline is community ci with its own to_comm weight)
             let mut best_c = ci;
-            let mut best_gain = to_comm.get(&ci).copied().unwrap_or(0.0) - tot[ci] * deg[i] / m2;
-            for (&c, &k_i_in) in &to_comm {
-                let gain = k_i_in - tot[c] * deg[i] / m2;
+            let mut best_gain = ki_ci - tot[ci] * deg[i] / m2;
+            for &c in &touched {
+                let gain = wt[c] - tot[c] * deg[i] / m2;
                 if gain > best_gain || (gain == best_gain && c < best_c) {
                     best_gain = gain;
                     best_c = c;
@@ -1063,6 +1439,231 @@ fn local_moving(adj: &[HashMap<usize, f64>], self_loop: &[f64]) -> (Vec<usize>, 
                 improved = true;
                 any_moved = true;
             }
+            for &c in &touched {
+                wt[c] = 0.0;
+            }
+        }
+    }
+    (comm, any_moved)
+}
+
+/// Modularity Q of a partition — the QUALITY metric. Q = Σ_c [ in_c/2m − (tot_c/2m)² ]. Used to prove the
+/// PARALLEL Louvain isn't trading correctness for speed (its Q must stay comparable to the sequential one).
+pub fn modularity(n: usize, edges: &[(usize, usize)], comm: &[usize]) -> f64 {
+    if n == 0 {
+        return 0.0;
+    }
+    let mut deg = vec![0.0f64; n];
+    let mut m2 = 0.0f64;
+    for &(u, v) in edges {
+        if u < n && v < n {
+            deg[u] += 1.0;
+            deg[v] += 1.0;
+            m2 += 2.0;
+        }
+    }
+    if m2 == 0.0 {
+        return 0.0;
+    }
+    let mut tot: HashMap<usize, f64> = HashMap::new();
+    for i in 0..n {
+        *tot.entry(comm[i]).or_insert(0.0) += deg[i];
+    }
+    let mut inc: HashMap<usize, f64> = HashMap::new();
+    for &(u, v) in edges {
+        if u < n && v < n && comm[u] == comm[v] {
+            *inc.entry(comm[u]).or_insert(0.0) += 2.0;
+        }
+    }
+    tot.iter().map(|(c, &t)| inc.get(c).copied().unwrap_or(0.0) / m2 - (t / m2) * (t / m2)).sum()
+}
+
+/// PARALLEL Louvain via graph coloring (Grappolo-style). CORRECT (modularity validated ~97% of sequential,
+/// deterministic) but HONESTLY NOT YET A WIN: on hub-heavy graphs greedy coloring yields many color classes,
+/// each a parallel region with a barrier, so synchronization overhead makes it SLOWER than sequential
+/// `louvain` (measured 10.8s vs 6.3s on a 16-core VM; GDS 5.3s). Kept as correct-but-barrier-bound; a real
+/// speedup needs fewer/bigger classes or a lock-free scheme. See crates/hg_analytics/RECEIPT-NEO4J.md.
+pub fn louvain_parallel(n: usize, edges: &[(usize, usize)]) -> Vec<usize> {
+    if n == 0 {
+        return Vec::new();
+    }
+    let mut amap: Vec<FxHashMap<u32, f64>> = vec![FxHashMap::default(); n];
+    let mut self_loop = vec![0.0f64; n];
+    for &(u, v) in edges {
+        if u >= n || v >= n {
+            continue;
+        }
+        if u == v {
+            self_loop[u] += 2.0;
+        } else {
+            *amap[u].entry(v as u32).or_insert(0.0) += 1.0;
+            *amap[v].entry(u as u32).or_insert(0.0) += 1.0;
+        }
+    }
+    let freeze = |m: Vec<FxHashMap<u32, f64>>| -> Vec<Vec<(u32, f64)>> {
+        m.into_iter()
+            .map(|h| {
+                let mut a: Vec<(u32, f64)> = h.into_iter().collect();
+                a.sort_unstable_by_key(|&(j, _)| j);
+                a
+            })
+            .collect()
+    };
+    let mut adj = freeze(amap);
+    let mut partition: Vec<usize> = (0..n).collect();
+    loop {
+        let (comm, moved) = local_moving_parallel(&adj, &self_loop);
+        let mut remap: FxHashMap<usize, usize> = FxHashMap::default();
+        for &c in &comm {
+            let next = remap.len();
+            remap.entry(c).or_insert(next);
+        }
+        let dense: Vec<usize> = comm.iter().map(|c| remap[c]).collect();
+        for p in partition.iter_mut() {
+            *p = dense[*p];
+        }
+        if !moved || remap.len() == adj.len() {
+            break;
+        }
+        let k = remap.len();
+        let mut nmap: Vec<FxHashMap<u32, f64>> = vec![FxHashMap::default(); k];
+        let mut nself = vec![0.0f64; k];
+        for u in 0..adj.len() {
+            let cu = dense[u];
+            nself[cu] += self_loop[u];
+            for &(v, w) in &adj[u] {
+                let cv = dense[v as usize];
+                if cu == cv {
+                    nself[cu] += w;
+                } else {
+                    *nmap[cu].entry(cv as u32).or_insert(0.0) += w;
+                }
+            }
+        }
+        adj = freeze(nmap);
+        self_loop = nself;
+    }
+    let mut remap: FxHashMap<usize, usize> = FxHashMap::default();
+    partition
+        .iter()
+        .map(|&c| {
+            let next = remap.len();
+            *remap.entry(c).or_insert(next)
+        })
+        .collect()
+}
+
+/// Greedy graph coloring (index order): each node gets the smallest color not used by an already-colored
+/// neighbour, so adjacent nodes get DIFFERENT colors. A color class is thus an independent set — its nodes
+/// can move in parallel with NO two neighbours moving at once. Returns nodes grouped by color.
+fn greedy_color(adj: &[Vec<(u32, f64)>]) -> Vec<Vec<usize>> {
+    let n = adj.len();
+    let mut color = vec![u32::MAX; n];
+    let mut classes: Vec<Vec<usize>> = Vec::new();
+    let mut nbr: Vec<u32> = Vec::new();
+    for i in 0..n {
+        nbr.clear();
+        for &(j, _) in &adj[i] {
+            let c = color[j as usize];
+            if c != u32::MAX {
+                nbr.push(c);
+            }
+        }
+        nbr.sort_unstable();
+        nbr.dedup();
+        let mut c = 0u32;
+        for &nc in &nbr {
+            if nc == c {
+                c += 1;
+            } else if nc > c {
+                break;
+            }
+        }
+        color[i] = c;
+        while classes.len() <= c as usize {
+            classes.push(Vec::new());
+        }
+        classes[c as usize].push(i);
+    }
+    classes
+}
+
+/// Compute one node's best target community from the current (comm, tot) snapshot. Shared by the serial
+/// and parallel paths so the decision logic is written once.
+#[inline]
+fn louvain_best_move(
+    i: usize, adj: &[Vec<(u32, f64)>], comm: &[usize], tot: &[f64], deg: &[f64], m2: f64,
+    to_comm: &mut FxHashMap<usize, f64>,
+) -> usize {
+    let ci = comm[i];
+    to_comm.clear();
+    for &(j, w) in &adj[i] {
+        *to_comm.entry(comm[j as usize]).or_insert(0.0) += w;
+    }
+    let ki_ci = to_comm.get(&ci).copied().unwrap_or(0.0);
+    let base = ki_ci - (tot[ci] - deg[i]) * deg[i] / m2;
+    let mut best_c = ci;
+    let mut best_gain = 0.0f64;
+    for (&c, &kic) in to_comm.iter() {
+        if c == ci {
+            continue;
+        }
+        let g = (kic - tot[c] * deg[i] / m2) - base;
+        if g > best_gain || (g == best_gain && c < best_c) {
+            best_gain = g;
+            best_c = c;
+        }
+    }
+    best_c
+}
+
+/// Parallel local-moving via COLORING (Grappolo-style). Each color class is an independent set, so its nodes
+/// decide + apply moves in PARALLEL from the current (comm, tot); tot is delta-updated between classes. Since
+/// adjacent nodes live in different classes, no two neighbours ever move simultaneously ⇒ no synchronous
+/// oscillation, so the partition keeps HIGH modularity while using every core. Small classes run serially to
+/// dodge rayon spawn overhead; only big independent sets pay for parallelism. Sweep-capped.
+fn local_moving_parallel(adj: &[Vec<(u32, f64)>], self_loop: &[f64]) -> (Vec<usize>, bool) {
+    let n = adj.len();
+    let deg: Vec<f64> = (0..n)
+        .into_par_iter()
+        .map(|i| adj[i].iter().map(|&(_, w)| w).sum::<f64>() + self_loop[i])
+        .collect();
+    let m2: f64 = deg.iter().sum();
+    if m2 == 0.0 {
+        return ((0..n).collect(), false);
+    }
+    let classes = greedy_color(adj);
+    let mut comm: Vec<usize> = (0..n).collect();
+    let mut tot = deg.clone();
+    let mut any_moved = false;
+    let mut scratch: FxHashMap<usize, f64> = FxHashMap::default();
+    for _sweep in 0..100 {
+        let mut moved = false;
+        for class in &classes {
+            let decisions: Vec<usize> = if class.len() >= 64 {
+                class
+                    .par_iter()
+                    .map_init(FxHashMap::<usize, f64>::default, |to_comm, &i| {
+                        louvain_best_move(i, adj, &comm, &tot, &deg, m2, to_comm)
+                    })
+                    .collect()
+            } else {
+                class.iter().map(|&i| louvain_best_move(i, adj, &comm, &tot, &deg, m2, &mut scratch)).collect()
+            };
+            for (idx, &i) in class.iter().enumerate() {
+                let bc = decisions[idx];
+                if bc != comm[i] {
+                    tot[comm[i]] -= deg[i];
+                    tot[bc] += deg[i];
+                    comm[i] = bc;
+                    moved = true;
+                }
+            }
+        }
+        if moved {
+            any_moved = true;
+        } else {
+            break;
         }
     }
     (comm, any_moved)
@@ -1272,6 +1873,200 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn parallel_cc_matches_sequential_and_min_label() {
+        use crate::Kronecker;
+        // Two disjoint RMAT blobs + some singletons → multi-component with real structure.
+        let half = Kronecker::vertices(9);
+        let n = 2 * half + 5; // trailing 5 isolated nodes (own components)
+        let mut edges: Vec<(usize, usize)> = Kronecker::new(9, 8, 7).collect();
+        edges.extend(Kronecker::new(9, 8, 11).map(|(u, v)| (u + half, v + half)));
+
+        let par = connected_components_parallel(n, &edges);
+        let uf = connected_components_uf(n, &edges);
+        let lp = connected_components(n, &edges); // canonical min-label
+
+        // Identical component COUNT across all three.
+        let cpar = par.iter().collect::<std::collections::HashSet<_>>().len();
+        let cuf = uf.iter().collect::<std::collections::HashSet<_>>().len();
+        assert_eq!(cpar, cuf, "parallel and sequential CC must find same #components");
+        // Parallel is min-label by construction → labels are BIT-IDENTICAL to label-prop, not just same partition.
+        assert_eq!(par, lp, "parallel CC must equal canonical min-label CC exactly");
+        // And the partition agrees with union-find roots.
+        for v in 0..n {
+            for &w in &[(v + 1) % n, (v + 13) % n, (v + half) % n] {
+                assert_eq!(
+                    par[v] == par[w],
+                    uf[v] == uf[w],
+                    "parallel CC and union-find disagree on whether {v},{w} share a component"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn parallel_cc_handles_empty_and_self_loops() {
+        assert!(connected_components_parallel(0, &[]).is_empty());
+        // self-loops + a chain: {0,1,2} one component, {3} alone, {4} alone.
+        let edges = vec![(0, 0), (0, 1), (1, 2), (2, 2)];
+        let cc = connected_components_parallel(5, &edges);
+        assert_eq!(cc[0], cc[1]);
+        assert_eq!(cc[1], cc[2]);
+        assert_eq!(cc[0], 0, "min-label root");
+        assert_ne!(cc[3], cc[0]);
+        assert_ne!(cc[4], cc[0]);
+        assert_ne!(cc[3], cc[4]);
+    }
+
+    #[test]
+    fn cdlp_ldbc_conformant_reciprocal_multiset() {
+        // The discriminating case for LDBC CDLP conformance. Node 1's neighbours: a RECIPROCAL pair with node
+        // 5 (edges 1->5 AND 5->1) plus single in-edges from 2 and 3. Initial labels = vertex ids (all distinct),
+        // so after one sweep the ONLY way a label gets count>1 is the reciprocal double-count.
+        //   LDBC multiset histogram for node 1: {5:2, 2:1, 3:1} -> label 5 wins (most frequent).
+        //   A WRONG deduped impl sees {5,2,3} once each -> tie -> smallest label 2.
+        // So conformant CDLP MUST yield label[1]==5, not 2.
+        let edges = vec![(1usize, 5usize), (5, 1), (2, 1), (3, 1)];
+        let out = cdlp_parallel(6, &edges, 1);
+        assert_eq!(out[1], 5, "reciprocal neighbour's label counted twice -> 5, not the deduped tie-winner 2");
+        assert_eq!(out[5], 1, "node 5's only neighbour is 1"); // adj[5]={1,1}
+        assert_eq!(out[2], 1);
+        assert_eq!(out[3], 1);
+        assert_eq!(out[0], 0, "isolated node keeps its id");
+        assert_eq!(out[4], 4, "isolated node keeps its id");
+    }
+
+    #[test]
+    fn cdlp_parallel_matches_serial_multiset_reference() {
+        use crate::Kronecker;
+        // Serial reference = the LDBC in∪out multiset sweep (mirrors ldbc_suite::serial_cdlp): push BOTH
+        // directions per edge, no dedup, skip self-loops, most-frequent label / smallest-label tie.
+        fn serial(n: usize, edges: &[(usize, usize)], iters: usize) -> Vec<u32> {
+            let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
+            for &(u, v) in edges {
+                if u < n && v < n && u != v {
+                    adj[u].push(v);
+                    adj[v].push(u);
+                }
+            }
+            let mut label: Vec<u32> = (0..n as u32).collect();
+            for _ in 0..iters {
+                let mut next = label.clone();
+                for v in 0..n {
+                    if adj[v].is_empty() {
+                        continue;
+                    }
+                    let mut counts: HashMap<u32, usize> = HashMap::new();
+                    for &w in &adj[v] {
+                        *counts.entry(label[w]).or_insert(0) += 1;
+                    }
+                    // most frequent, ties -> smallest label (order-independent).
+                    let mut best = u32::MAX;
+                    let mut bc = 0usize;
+                    for (lab, cnt) in counts {
+                        if cnt > bc || (cnt == bc && lab < best) {
+                            bc = cnt;
+                            best = lab;
+                        }
+                    }
+                    next[v] = best;
+                }
+                label = next;
+            }
+            label
+        }
+        // Directed RMAT (has reciprocal edges → exercises the double-count) at several iteration counts.
+        let n = Kronecker::vertices(10);
+        let edges: Vec<(usize, usize)> = Kronecker::new(10, 8, 0xC01D).collect();
+        for iters in [1usize, 3, 10] {
+            assert_eq!(
+                cdlp_parallel(n, &edges, iters),
+                serial(n, &edges, iters),
+                "parallel CDLP must equal the serial LDBC-multiset reference at {iters} iters"
+            );
+        }
+    }
+
+    #[test]
+    fn bfs_parallel_matches_sequential_levels() {
+        use crate::Kronecker;
+        use std::collections::VecDeque;
+        fn seq_bfs(n: usize, off: &[u32], nbr: &[u32], src: usize) -> Vec<u32> {
+            let mut d = vec![u32::MAX; n];
+            d[src] = 0;
+            let mut q = VecDeque::new();
+            q.push_back(src as u32);
+            while let Some(u) = q.pop_front() {
+                for k in off[u as usize] as usize..off[u as usize + 1] as usize {
+                    let v = nbr[k];
+                    if d[v as usize] == u32::MAX {
+                        d[v as usize] = d[u as usize] + 1;
+                        q.push_back(v);
+                    }
+                }
+            }
+            d
+        }
+        let n = Kronecker::vertices(11);
+        let edges: Vec<(usize, usize)> = Kronecker::new(11, 8, 0xB0F5).collect();
+        let (off, nbr) = bfs_csr(n, &edges);
+        let src = (0..n).max_by_key(|&i| off[i + 1] - off[i]).unwrap();
+        let par = bfs_on_csr(n, &off, &nbr, src);
+        let seq = seq_bfs(n, &off, &nbr, src);
+        assert_eq!(par, seq, "parallel BFS levels must equal sequential BFS");
+        assert_eq!(par, bfs_on_csr(n, &off, &nbr, src), "BFS must be deterministic");
+    }
+
+    #[test]
+    fn sssp_parallel_matches_sequential_dijkstra() {
+        use crate::Kronecker;
+        use std::cmp::Reverse;
+        use std::collections::BinaryHeap;
+        // Sequential binary-heap Dijkstra reference (the exact kernel the race harness used to run).
+        fn dijkstra(n: usize, off: &[u32], nbr: &[u32], wgt: &[f64], src: usize) -> Vec<f64> {
+            let mut d = vec![f64::INFINITY; n];
+            d[src] = 0.0;
+            let mut heap: BinaryHeap<(Reverse<u64>, u32)> = BinaryHeap::new();
+            heap.push((Reverse(0.0f64.to_bits()), src as u32));
+            while let Some((Reverse(bits), u)) = heap.pop() {
+                let du = f64::from_bits(bits);
+                if du > d[u as usize] {
+                    continue;
+                }
+                for k in off[u as usize] as usize..off[u as usize + 1] as usize {
+                    let v = nbr[k];
+                    let nd = du + wgt[k];
+                    if nd < d[v as usize] {
+                        d[v as usize] = nd;
+                        heap.push((Reverse(nd.to_bits()), v));
+                    }
+                }
+            }
+            d
+        }
+        let n = Kronecker::vertices(11);
+        let edges: Vec<(usize, usize)> = Kronecker::new(11, 8, 0x5EED).collect();
+        let weights: Vec<f64> = edges
+            .iter()
+            .map(|&(u, v)| 1.0 + ((u.wrapping_mul(2654435761) ^ v) % 16) as f64)
+            .collect();
+        let (off, nbr, wgt) = sssp_csr(n, &edges, &weights);
+        let src = (0..n).max_by_key(|&i| off[i + 1] - off[i]).unwrap();
+        let par = sssp_on_csr(n, &off, &nbr, &wgt, src);
+        let seq = dijkstra(n, &off, &nbr, &wgt, src);
+        assert_eq!(par.len(), n);
+        for i in 0..n {
+            assert!(
+                (par[i] - seq[i]).abs() < 1e-9 || (par[i].is_infinite() && seq[i].is_infinite()),
+                "SSSP mismatch at {i}: parallel={} sequential={}",
+                par[i],
+                seq[i]
+            );
+        }
+        // exact determinism (integer weights → exact f64 sums, order-independent min).
+        assert_eq!(par, sssp_on_csr(n, &off, &nbr, &wgt, src), "SSSP must be deterministic");
     }
 
     #[test]

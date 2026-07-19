@@ -1,0 +1,30 @@
+# In-cluster image build (bypasses the walled Cloud Build). Kaniko pulls the source tarball from GCS,
+# builds deploy/bench/Dockerfile natively on an x86 node, and pushes to Artifact Registry using the node
+# service account (needs artifactregistry.writer + storage.objectViewer, granted to gke-prophet-nodes).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: hg-kaniko
+  labels: { app: hg-bench, role: kaniko }
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 2400
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels: { app: hg-bench, role: kaniko }
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: kaniko
+          image: gcr.io/kaniko-project/executor:latest
+          args:
+            - --context=gs://socioprophet-platform_cloudbuild/hg-src-opt3.tar.gz
+            - --context-sub-path=.
+            - --dockerfile=deploy/bench/Dockerfile
+            - --destination=us-central1-docker.pkg.dev/socioprophet-platform/hellgraph/hellgraph-bench:opt3x86
+            - --cache=false
+            - --verbosity=info
+          resources:
+            requests: { cpu: "3", memory: "8Gi" }
+            limits: { cpu: "4", memory: "12Gi" }
