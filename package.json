@@ -1,6 +1,6 @@
 {
   "name": "@socioprophet/hellgraph",
-  "version": "0.4.26",
+  "version": "0.4.27",
   "description": "HellGraph \u2014 TypeScript OpenCog-compatible AtomSpace metagraph engine (PLN, ECAN, pattern matcher, SPARQL/Gremlin, SHACL, Atomese, StorageNode federation). Polyglot sibling of the Rust hellgraph crate.",
   "license": "UNLICENSED",
   "type": "commonjs",
@@ -22,7 +22,8 @@
     "build": "tsup",
     "prepare": "tsup",
     "typecheck": "tsc -p ts/tsconfig.json --noEmit",
-    "test": "node --import tsx --test ts/src/*.test.ts"
+    "test": "node --import tsx --test ts/src/*.test.ts",
+    "check:dist": "tsup && git diff --quiet -- ts/dist || (echo 'ERROR: ts/dist is stale vs ts/src — run: npm run build, then commit ts/dist' && exit 1)"
   },
   "optionalDependencies": {
     "autobase": "7.28.1",
