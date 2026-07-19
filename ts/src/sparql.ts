@@ -28,7 +28,7 @@ type Term =
   | { kind: 'iri'; value: string }
   | { kind: 'literal'; value: PropertyValue }
 
-interface TriplePattern { s: Term; p: Term; o: Term }
+interface TriplePattern { s: Term; p: Term; o: Term; pathMod?: '+' | '*' | '?' }
 
 type FilterExpr =
   | { kind: 'compare'; op: '=' | '!=' | '<' | '>' | '<=' | '>='; left: ValueExpr; right: ValueExpr }
@@ -314,9 +314,14 @@ class Parser {
   private parseTriplePattern(): TriplePattern {
     const s = this.parseTerm()
     const p = this.parseTerm()
+    // SPARQL 1.1 property-path modifier on the predicate: p+ (1+ hops), p* (0+ hops), p? (0 or 1).
+    // Transitive reachability — the graph-native query the old engine threw "unsupported" on.
+    let pathMod: '+' | '*' | '?' | undefined
+    const nx = this.peek()
+    if (nx === '+' || nx === '*' || nx === '?') { pathMod = nx; this.next() }
     const o = this.parseTerm()
     if (this.peek() === '.') this.next()
-    return { s, p, o }
+    return { s, p, o, pathMod }
   }
 
   private parseTerm(): Term {
@@ -471,11 +476,56 @@ function candidateTriples(pattern: TriplePattern, binding: Binding, triples: Tri
   return best ?? triples
 }
 
+// SPARQL 1.1 transitive property paths on a concrete predicate: p+ (1+ hops), p* (0+ incl. the node
+// itself), p? (0 or 1). Reachability is computed over the p-edges (from the POS index). Extends the
+// current binding with whichever of s/o are variables. Deterministic (sorted) so output is stable; a
+// path over an UNBOUND predicate yields nothing rather than a silently-wrong result.
+function evalPath(pattern: TriplePattern, binding: Binding, triples: Triple[]): Binding[] {
+  const mod = pattern.pathMod as '+' | '*' | '?'
+  const pv = boundValue(pattern.p, binding)
+  if (pv === null) return []
+
+  const adj = new Map<string, Set<string>>()
+  const nodes = new Set<string>()
+  for (const t of tripleIndex(triples).p.get(pv) ?? []) {
+    const su = String(t.subject), ob = String(t.object)
+    let set = adj.get(su); if (!set) adj.set(su, (set = new Set())); set.add(ob)
+    nodes.add(su); nodes.add(ob)
+  }
+
+  const reachFrom = (from: string): Set<string> => {
+    const out = new Set<string>()
+    if (mod === '*') out.add(from)                                        // zero-length hop → itself
+    if (mod === '?') { out.add(from); for (const o of adj.get(from) ?? []) out.add(o); return out }
+    const seen = new Set<string>(); const stack = [...(adj.get(from) ?? [])]
+    while (stack.length) { const n = stack.pop() as string; if (seen.has(n)) continue; seen.add(n); out.add(n); for (const nn of adj.get(n) ?? []) if (!seen.has(nn)) stack.push(nn) }
+    return out                                                            // '+' → 1+ hops
+  }
+
+  const sVar = pattern.s.kind === 'var' ? pattern.s.name : null
+  const oVar = pattern.o.kind === 'var' ? pattern.o.name : null
+  const sv = boundValue(pattern.s, binding)
+  const ov = boundValue(pattern.o, binding)
+  const froms = sv !== null ? [sv] : [...nodes].sort()
+  const results: Binding[] = []
+  for (const from of froms) {
+    for (const to of [...reachFrom(from)].sort()) {
+      if (ov !== null && to !== ov) continue                             // object bound → must equal
+      const b: Binding = { ...binding }
+      if (sVar) b[sVar] = from
+      if (oVar) b[oVar] = to
+      results.push(b)
+    }
+  }
+  return results
+}
+
 function evalBGP(patterns: TriplePattern[], triples: Triple[], seed: Binding[]): Binding[] {
   let solutions = seed
   for (const pattern of patterns) {
     const nextSolutions: Binding[] = []
     for (const sol of solutions) {
+      if (pattern.pathMod) { for (const b of evalPath(pattern, sol, triples)) nextSolutions.push(b); continue }
       for (const triple of candidateTriples(pattern, sol, triples)) {
         const merged = matchTriple(pattern, triple, sol)
         if (merged) nextSolutions.push(merged)

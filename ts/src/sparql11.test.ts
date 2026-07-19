@@ -76,3 +76,26 @@ test('existing BGP/FILTER/OPTIONAL still work (no regression)', () => {
   assert.equal(rows('SELECT ?s ?o WHERE { ?s ?p ?o } LIMIT 2').length, 2)
   assert.ok(rows('SELECT ?s WHERE { ?s ?p ?o FILTER(?o = "Ada") }').length >= 1)
 })
+
+// ─── SPARQL 1.1 property paths (transitive) — WO-4 ───────────────────────────────
+// edges only: addEdge auto-creates the endpoint nodes WITHOUT an rdf:type label, so this corpus
+// doesn't pollute the `?s a ?t` COUNT/MINUS tests above (pa/pb/pc have no type triple).
+g.addEdge('links', 'pa', 'pb')
+g.addEdge('links', 'pb', 'pc')
+
+test('property path p+ : transitive 1+ hops', () => {
+  assert.deepEqual(new Set(rows('SELECT ?x WHERE { <pa> links+ ?x }').map((b) => b['x'])), new Set(['pb', 'pc']))
+})
+test('property path p* : 0+ hops includes the start node', () => {
+  assert.deepEqual(new Set(rows('SELECT ?x WHERE { <pa> links* ?x }').map((b) => b['x'])), new Set(['pa', 'pb', 'pc']))
+})
+test('property path p? : 0 or 1 hop', () => {
+  assert.deepEqual(new Set(rows('SELECT ?x WHERE { <pa> links? ?x }').map((b) => b['x'])), new Set(['pa', 'pb']))
+})
+test('property path both variables ?x p+ ?y : all transitive pairs', () => {
+  assert.deepEqual(new Set(rows('SELECT ?x ?y WHERE { ?x links+ ?y }').map((b) => `${b['x']}->${b['y']}`)),
+    new Set(['pa->pb', 'pa->pc', 'pb->pc']))
+})
+test('property path object-bound ?x p+ <pc> : reverse reachability', () => {
+  assert.deepEqual(new Set(rows('SELECT ?x WHERE { ?x links+ <pc> }').map((b) => b['x'])), new Set(['pa', 'pb']))
+})
