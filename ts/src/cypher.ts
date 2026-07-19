@@ -5,10 +5,11 @@ import { findMatches, V, N, L, type Pattern, type PatternTerm } from './patternM
 /**
  * Cypher Facade v0.1 — a human/agent-friendly READ query surface over the AtomSpace.
  *
- * Honest scope (NOT full Neo4j): MATCH/RETURN, name/form WHERE pins, edge strength/confidence filters,
- * bounded variable-length paths, ORDER BY/LIMIT, and native `MATCH LINK` for n-ary hyperedges. It is
- * read-only. Anti-silent-wrong: WHERE on arbitrary node properties, OR/NOT/XOR in WHERE, and WITH/UNWIND
- * pipelines THROW an explicit "unsupported" error rather than silently returning a wrong/empty result.
+ * Honest scope (NOT full Neo4j): MATCH/RETURN, name/form WHERE pins, node-property + edge
+ * strength/confidence filters, boolean WHERE (AND/OR/NOT, parenthesised), bounded variable-length paths,
+ * ORDER BY/LIMIT, and native `MATCH LINK` for n-ary hyperedges. It is read-only. Anti-silent-wrong: WHERE
+ * on a property that exists on NO matched node, XOR in WHERE, and WITH/UNWIND pipelines THROW an explicit
+ * "unsupported" error rather than silently returning a wrong/empty result.
  *
  * Conforms to docs/specs/04_Cypher_Facade_v0_1.md: a curated openCypher/GQL
  * subset lowered into the native hypergraph pattern IR (patternMatcher.Pattern),
@@ -76,17 +77,42 @@ interface ColRef { var: string; prop?: string }
 type CmpOp = '=' | '!=' | '<' | '>' | '<=' | '>='
 interface Filter { lhs: ColRef; op: CmpOp; rhs: string | number }
 
+// Boolean WHERE expression tree (AND/OR/NOT + parenthesised comparisons). A pure conjunction of
+// comparisons is lowered to `pins` + flat `filters` (keeping the compile-time name/form pin fast path);
+// anything with OR/NOT is kept as a `where` tree and evaluated per-row at runtime.
+type WExpr =
+  | { t: 'cmp'; lhs: ColRef; op: CmpOp; rhs: string | number }
+  | { t: 'and' | 'or'; l: WExpr; r: WExpr }
+  | { t: 'not'; e: WExpr }
+
 interface CypherAst {
   useSpace?: string
   explain: boolean
   write: boolean
   paths: PathPat[]
   links: LinkPat[]
-  pins: { var: string; value: string }[]   // form/name equalities → node-name pins
-  filters: Filter[]                          // general comparisons → post-match filter
+  pins: { var: string; value: string }[]   // form/name equalities → node-name pins (pure-AND fast path)
+  filters: Filter[]                          // pure-AND residual comparisons → post-match filter
+  where?: WExpr                              // set instead of pins/filters when OR/NOT is present
   ret: ColRef[] | '*'
   orderBy: { key: string; desc: boolean }[]
   limit?: number
+}
+
+type CmpLeaf = Extract<WExpr, { t: 'cmp' }>
+// A pure conjunction of comparisons (only `and` nodes over `cmp` leaves) → the flat leaf list; any `or`/`not`
+// makes it non-conjunctive → null (caller keeps the tree for runtime evaluation instead of the pin fast path).
+function flattenAndCmp(e: WExpr): CmpLeaf[] | null {
+  if (e.t === 'cmp') return [e]
+  if (e.t === 'and') { const l = flattenAndCmp(e.l), r = flattenAndCmp(e.r); return l && r ? [...l, ...r] : null }
+  return null
+}
+// Every comparison leaf in a WHERE tree (for the anti-silent-wrong projected-property check).
+function cmpLeaves(e: WExpr | undefined): CmpLeaf[] {
+  if (!e) return []
+  if (e.t === 'cmp') return [e]
+  if (e.t === 'not') return cmpLeaves(e.e)
+  return [...cmpLeaves(e.l), ...cmpLeaves(e.r)]
 }
 
 // ─── Tokenizer ─────────────────────────────────────────────────────────────────
@@ -132,7 +158,7 @@ class Parser {
         if (this.up() === 'LINK') { this.next(); ast.links.push(this.parseLink()) }
         else ast.paths.push(this.parsePath())
       } else if (kw === 'OPTIONAL') { this.next(); this.expect('MATCH'); ast.paths.push(this.parsePath()) }
-      else if (kw === 'WHERE') { this.next(); this.parseWhere(ast) }
+      else if (kw === 'WHERE') { this.next(); this.applyWhere(ast, this.parseWhereExpr()) }
       else if (kw === 'RETURN') { this.next(); ast.ret = this.parseReturn() }
       else if (kw === 'ORDER') { this.next(); this.expect('BY'); this.parseOrderBy(ast) }
       else if (kw === 'LIMIT') { this.next(); ast.limit = parseInt(this.next(), 10) }
@@ -208,23 +234,50 @@ class Parser {
     return link
   }
 
-  private parseWhere(ast: CypherAst): void {
+  // WHERE grammar (precedence NOT > AND > OR), parenthesised: or := and (OR and)* ; and := not (AND not)* ;
+  // not := NOT not | primary ; primary := '(' or ')' | cmp ; cmp := var '.' prop op value.
+  private parseWhereExpr(): WExpr { return this.parseOr() }
+  private parseOr(): WExpr {
+    let e = this.parseAnd()
     for (;;) {
-      const v = this.next(); this.expect('.'); const prop = this.next()
-      const opTok = this.next()
-      const op: CmpOp = (opTok === '<>' ? '!=' : opTok) as CmpOp
-      const rawTok = this.next()
-      const rhs = isNum(rawTok) ? Number(rawTok) : this.resolveVal(rawTok)
-      // form/name equality → node-name pin (compile-time). Everything else → filter.
-      if (op === '=' && (prop === 'form' || prop === 'name') && typeof rhs === 'string') ast.pins.push({ var: v, value: rhs })
-      else ast.filters.push({ lhs: { var: v, prop }, op, rhs })
-      if (this.up() === 'AND') { this.next(); continue }
-      // OR was SILENTLY DROPPED (only AND continued the loop) → wrong results. Refuse loudly.
-      if (this.up() === 'OR' || this.up() === 'NOT' || this.up() === 'XOR') {
-        throw new Error(`Cypher unsupported: ${this.up()} in WHERE — only AND-chained comparisons are implemented`)
-      }
-      break
+      const u = this.up()
+      if (u === 'OR') { this.next(); e = { t: 'or', l: e, r: this.parseAnd() } }
+      // XOR was silently skipped by the old flat loop (unknown token → main loop no-op) → wrong results.
+      else if (u === 'XOR') throw new Error('Cypher unsupported: XOR in WHERE — only AND/OR/NOT are implemented')
+      else return e
     }
+  }
+  private parseAnd(): WExpr {
+    let e = this.parseNot()
+    while (this.up() === 'AND') { this.next(); e = { t: 'and', l: e, r: this.parseNot() } }
+    return e
+  }
+  private parseNot(): WExpr {
+    if (this.up() === 'NOT') { this.next(); return { t: 'not', e: this.parseNot() } }
+    return this.parsePrimary()
+  }
+  private parsePrimary(): WExpr {
+    if (this.peek() === '(') { this.next(); const e = this.parseOr(); this.expect(')'); return e }
+    const v = this.next(); this.expect('.'); const prop = this.next()
+    const opTok = this.next()
+    const op: CmpOp = (opTok === '<>' ? '!=' : opTok) as CmpOp
+    const rawTok = this.next()
+    const rhs = isNum(rawTok) ? Number(rawTok) : this.resolveVal(rawTok)
+    return { t: 'cmp', lhs: { var: v, prop }, op, rhs }
+  }
+
+  // Lower the parsed tree: a pure conjunction of comparisons → compile-time name/form pins + flat filters
+  // (fast path, preserves the pattern-narrowing pin optimization). Any OR/NOT → keep the whole tree for
+  // runtime row evaluation (pins can't narrow a disjunction, so name/form equalities become row filters).
+  private applyWhere(ast: CypherAst, e: WExpr): void {
+    const conj = flattenAndCmp(e)
+    if (conj) {
+      for (const c of conj) {
+        if (c.op === '=' && (c.lhs.prop === 'form' || c.lhs.prop === 'name') && typeof c.rhs === 'string') {
+          ast.pins.push({ var: c.lhs.var, value: c.rhs })
+        } else ast.filters.push({ lhs: c.lhs, op: c.op, rhs: c.rhs })
+      }
+    } else ast.where = e
   }
 
   private parseReturn(): ColRef[] | '*' {
@@ -365,6 +418,18 @@ export function runCypher(as: AtomSpace, query: string, params: Record<string, s
     res.results.forEach((row, i) => {
       const rr: RRow = {}
       for (const [k, v] of Object.entries(row)) if (!k.startsWith('_')) rr[k] = v
+      // node-property projection: expose each grounded node's generic Values as `var.prop`, so WHERE/RETURN
+      // can filter and read arbitrary node properties (e.g. `a.age > 10`), not just name/form. Float/string
+      // Values project their first scalar; the row already carries `var` = node name for name/form predicates.
+      for (const [v, h] of Object.entries(res.groundings[i])) {
+        if (v.startsWith('_')) continue
+        const atom = as.getAtom(h)
+        if (!atom) continue
+        for (const [pk, pv] of Object.entries(atom.values)) {
+          const scalar = pv.kind === 'link' ? undefined : pv.value[0]
+          if (scalar !== undefined) rr[`${v}.${pk}`] = scalar
+        }
+      }
       // edge-var TruthValue projection (single fixed edges)
       for (const spec of edgeVarSpecs) {
         const tv = edgeTv(as, spec, res.groundings[i])
@@ -375,21 +440,34 @@ export function runCypher(as: AtomSpace, query: string, params: Record<string, s
     })
   }
 
-  // WHERE filters (comparisons over resolved values)
+  // WHERE filters (comparisons over resolved values). form/name → the `var` key (node name); every other
+  // property → the projected `var.prop` key (node Values or edge strength/confidence).
   const key = (c: ColRef) => (c.prop && c.prop !== 'form' && c.prop !== 'name' ? `${c.var}.${c.prop}` : c.var)
-  // Anti-silent-wrong: node property predicates (e.g. `a.age > 10`) are NOT projected into rows here — only
-  // name/form pins and edge strength/confidence are filterable. Filtering on an absent key silently dropped
-  // every row (0 results, correct answer non-empty). Detect that and THROW rather than return a wrong empty set.
+  // Anti-silent-wrong: node properties ARE projected above, so a real property filters correctly. But a
+  // predicate on a property that exists on NO matched node would silently drop every row (0 results when the
+  // true answer is non-empty). Detect that — across BOTH the flat filters and the boolean `where` tree — and
+  // THROW rather than return a wrong empty set.
   if (resolved.length > 0) {
     const projected = new Set(resolved.flatMap((r) => Object.keys(r)))
-    for (const f of ast.filters) {
-      if (!projected.has(key(f.lhs))) {
-        throw new Error(`Cypher unsupported: WHERE on node property '${f.lhs.var}.${f.lhs.prop}' — this read ` +
-          `facade filters only name/form and edge strength/confidence (refusing a silently-wrong empty result)`)
+    const refs = [...ast.filters.map((f) => f.lhs), ...cmpLeaves(ast.where).map((c) => c.lhs)]
+    for (const lhs of refs) {
+      if (!projected.has(key(lhs))) {
+        throw new Error(`Cypher unsupported: WHERE on node property '${lhs.var}.${lhs.prop}' — no matched node ` +
+          `carries that property (refusing a silently-wrong empty result)`)
       }
     }
   }
-  let rows = resolved.filter((r) => ast.filters.every((f) => cmp(r[key(f.lhs)], f.op, f.rhs)))
+  const evalW = (e: WExpr, r: RRow): boolean => {
+    switch (e.t) {
+      case 'cmp': return cmp(r[key(e.lhs)], e.op, e.rhs)
+      case 'and': return evalW(e.l, r) && evalW(e.r, r)
+      case 'or': return evalW(e.l, r) || evalW(e.r, r)
+      case 'not': return !evalW(e.e, r)
+    }
+  }
+  let rows = ast.where
+    ? resolved.filter((r) => evalW(ast.where as WExpr, r))
+    : resolved.filter((r) => ast.filters.every((f) => cmp(r[key(f.lhs)], f.op, f.rhs)))
 
   // ORDER BY
   if (ast.orderBy.length) {

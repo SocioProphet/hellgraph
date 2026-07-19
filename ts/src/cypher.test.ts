@@ -150,21 +150,62 @@ test('allowWrite opt-in lets a write parse without refusal', () => {
   assert.doesNotThrow(() => runCypher(as, 'MATCH (a)-[:IsA]->(b) SET a.x = "1" RETURN b LIMIT 1', {}, { allowWrite: true }))
 })
 
-// ─── Anti-silent-wrong: unsupported WHERE/clauses THROW rather than returning wrong results ───
-test('WHERE on a node property throws (was silently 0 rows)', () => {
-  const as = fixture()
-  // `a.foo > 1` is a node property predicate the read facade cannot evaluate — must throw, not return [].
+// ─── WO-5: node-property WHERE + boolean OR/NOT (engine 0.4.26) ─────────────────
+// A CSKG fixture whose concept nodes carry a numeric `severity` Value.
+function propFixture(): AtomSpace {
+  const as = fixture()   // rain/snow -IsA-> weather_event ; rain -RelatedTo-> wet -RelatedTo-> moist
+  const set = (n: string, k: string, v: number) => as.setValue(as.addNode('ConceptNode', n).handle, k, { kind: 'float', value: [v] })
+  set('weather_event', 'severity', 7)
+  set('wet', 'severity', 3)
+  set('moist', 'severity', 5)
+  return as
+}
+
+test('node-property WHERE filters on a real node Value (b.severity >= N)', () => {
+  const as = propFixture()
+  // rain -RelatedTo-> wet(sev 3) -RelatedTo-> moist(sev 5); keep only endpoints with severity >= 5.
+  const r = runCypher(as, 'MATCH (a)-[:RelatedTo*1..2]->(b) WHERE a.form = "rain" AND b.severity >= 5 RETURN b LIMIT 25')
+  assert.deepEqual(r.rows.map((x) => x.b), ['moist'])   // wet(3) filtered out, moist(5) kept
+})
+
+test('node property is projectable in RETURN', () => {
+  const as = propFixture()
+  const r = runCypher(as, 'MATCH (a)-[:IsA]->(b) WHERE a.form = "rain" RETURN b, b.severity LIMIT 5')
+  assert.deepEqual(r.rows, [{ b: 'weather_event', 'b.severity': '7' }])
+})
+
+test('WHERE on a property NO matched node carries still throws (anti-silent-wrong preserved)', () => {
+  const as = propFixture()
   assert.throws(
     () => runCypher(as, 'MATCH (a)-[:IsA]->(b) WHERE a.foo > 1 RETURN b LIMIT 10'),
     /unsupported: WHERE on node property/,
   )
 })
 
-test('OR / NOT in WHERE throws (was silently dropped)', () => {
+test('OR in WHERE returns the union (was refused)', () => {
+  const as = fixture()
+  const r = runCypher(as, 'MATCH (a)-[:IsA]->(b) WHERE a.form = "rain" OR a.form = "snow" RETURN a LIMIT 10')
+  assert.deepEqual(new Set(r.rows.map((x) => x.a)), new Set(['rain', 'snow']))
+})
+
+test('NOT in WHERE negates (was refused)', () => {
+  const as = fixture()   // both rain and snow -IsA-> weather_event; exclude rain
+  const r = runCypher(as, 'MATCH (a)-[:IsA]->(b) WHERE NOT a.form = "rain" RETURN a LIMIT 10')
+  assert.deepEqual(r.rows.map((x) => x.a), ['snow'])
+})
+
+test('parenthesised precedence: (rain OR snow) AND b.severity >= 7', () => {
+  const as = propFixture()
+  const r = runCypher(as, 'MATCH (a)-[:IsA]->(b) WHERE (a.form = "rain" OR a.form = "snow") AND b.severity >= 7 RETURN a LIMIT 10')
+  assert.deepEqual(new Set(r.rows.map((x) => x.a)), new Set(['rain', 'snow']))   // both point at weather_event(sev 7)
+})
+
+// ─── Anti-silent-wrong: still-unsupported forms THROW rather than returning wrong results ───
+test('XOR in WHERE still throws (unsupported)', () => {
   const as = fixture()
   assert.throws(
-    () => runCypher(as, 'MATCH (a)-[:IsA]->(b) WHERE a.form = "rain" OR a.form = "snow" RETURN b LIMIT 10'),
-    /unsupported: OR in WHERE/,
+    () => runCypher(as, 'MATCH (a)-[:IsA]->(b) WHERE a.form = "rain" XOR a.form = "snow" RETURN a LIMIT 10'),
+    /unsupported: XOR/,
   )
 })
 
@@ -176,5 +217,5 @@ test('WITH / UNWIND pipelines throw (were silent no-ops)', () => {
 test('name/form pins and edge strength/confidence WHERE still work (no false rejection)', () => {
   const as = fixture()
   const r = runCypher(as, 'MATCH (a)-[:IsA]->(b) WHERE a.form = "rain" RETURN b LIMIT 10')
-  assert.deepEqual(r.rows, [{ b: 'weather_event' }])   // pins unaffected by the new guard
+  assert.deepEqual(r.rows, [{ b: 'weather_event' }])   // pure-AND pin fast path unaffected
 })
