@@ -430,12 +430,53 @@ function looseEq(a: PropertyValue, b: PropertyValue): boolean {
   return String(a) === String(b)
 }
 
+// ─── SPO/POS/OSP triple indexes (WO-3) ───────────────────────────────────────────────────────────────
+// BGP matching used to scan ALL triples for every (pattern, partial-solution) — O(|triples|) per step.
+// Build permuted-key indexes ONCE per query (keyed on the triples array via a WeakMap, so the index is
+// shared across the BGP and every sub-group and GC'd with the query), then a pattern looks up only the
+// triples that can match its most selective BOUND term. matchTriple still validates every term, so the
+// results are IDENTICAL to the scan — a pure speedup.
+interface TripleIndex { s: Map<string, Triple[]>; p: Map<string, Triple[]>; o: Map<string, Triple[]> }
+const _indexCache = new WeakMap<Triple[], TripleIndex>()
+function tripleIndex(triples: Triple[]): TripleIndex {
+  const cached = _indexCache.get(triples)
+  if (cached) return cached
+  const s = new Map<string, Triple[]>(), p = new Map<string, Triple[]>(), o = new Map<string, Triple[]>()
+  const put = (m: Map<string, Triple[]>, k: string, t: Triple): void => { const a = m.get(k); if (a) a.push(t); else m.set(k, [t]) }
+  for (const t of triples) { put(s, String(t.subject), t); put(p, String(t.predicate), t); put(o, String(t.object), t) }
+  const idx: TripleIndex = { s, p, o }
+  _indexCache.set(triples, idx)
+  return idx
+}
+
+// Resolve a pattern term to its concrete string value (for index lookup), or null if still unbound.
+// String() matches matchTriple's own comparison (unify/looseEq stringify), so the key space is consistent.
+function boundValue(term: Term, binding: Binding): string | null {
+  if (term.kind === 'var') return term.name in binding ? String(binding[term.name]) : null
+  if (term.kind === 'iri') return term.value
+  return String(term.value)
+}
+
+// Candidate triples for a pattern under the current binding: the SMALLEST index bucket among the bound
+// terms. All-unbound (e.g. a leading `?s ?p ?o`) → the full set, which is unavoidable.
+function candidateTriples(pattern: TriplePattern, binding: Binding, triples: Triple[]): Triple[] {
+  const idx = tripleIndex(triples)
+  const sv = boundValue(pattern.s, binding)
+  const ov = boundValue(pattern.o, binding)
+  const pv = boundValue(pattern.p, binding)
+  let best: Triple[] | null = null
+  if (sv !== null) best = idx.s.get(sv) ?? []
+  if (ov !== null) { const c = idx.o.get(ov) ?? []; if (!best || c.length < best.length) best = c }
+  if (pv !== null) { const c = idx.p.get(pv) ?? []; if (!best || c.length < best.length) best = c }
+  return best ?? triples
+}
+
 function evalBGP(patterns: TriplePattern[], triples: Triple[], seed: Binding[]): Binding[] {
   let solutions = seed
   for (const pattern of patterns) {
     const nextSolutions: Binding[] = []
     for (const sol of solutions) {
-      for (const triple of triples) {
+      for (const triple of candidateTriples(pattern, sol, triples)) {
         const merged = matchTriple(pattern, triple, sol)
         if (merged) nextSolutions.push(merged)
       }
