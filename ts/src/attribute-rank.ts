@@ -37,6 +37,8 @@ export interface RankerSignals {
   consistency: number
   trust: number
   probabilistic: number
+  /** Ontological fit vs the class's KKO type — present only when a `kkoTypeOf` is supplied. */
+  coherence?: number
 }
 
 export interface RankedAttribute {
@@ -67,9 +69,14 @@ export interface AttributeRecommendation {
 export interface RankOptions {
   topK?: number
   minPeerCoverage?: number
+  /**
+   * Maps a node id → its KKO type IRIs (e.g. via `mapEntityToKko`/`kkoTypesOf` or a stored type edge).
+   * When supplied AND the class's instances carry KKO types, a 4th **coherence** ranker is fused in:
+   * an attribute scores higher when the peers carrying it share the class's ontological type. The ranker
+   * provides the mechanism; the caller chooses how entities are typed.
+   */
+  kkoTypeOf?: (nodeId: string) => string[]
 }
-
-const METHOD = 'rrf(consistency,trust,probabilistic)'
 
 function sealed(rec: Omit<AttributeRecommendation, 'hash'>): AttributeRecommendation {
   const hash = 'sha256:' + createHash('sha256').update(JSON.stringify(rec)).digest('hex')
@@ -78,11 +85,12 @@ function sealed(rec: Omit<AttributeRecommendation, 'hash'>): AttributeRecommenda
 
 /**
  * Rank candidate new attributes for `label` by fusing consistency + PageRank-trust + PLN-probabilistic
- * rankers, returning a proof-carrying receipt.
+ * (+ an optional KKO **coherence** ranker when `kkoTypeOf` is supplied), returning a proof-carrying receipt.
  */
 export function rankAttributeRecommendations(store: HellGraphStore, label: string, opts: RankOptions = {}): AttributeRecommendation {
   const topK = opts.topK ?? 10
   const minPeerCoverage = opts.minPeerCoverage ?? 0.2
+  const kkoTypeOf = opts.kkoTypeOf
   const snapshot = { nodes: store.allNodes().length, edges: store.edgeCount() }
 
   const own = profileClass(store, label)
@@ -91,20 +99,28 @@ export function rankAttributeRecommendations(store: HellGraphStore, label: strin
   const classIds = new Set(store.nodesByLabel(label).map((n) => n.id))
   const pr = pageRank(store)
 
-  // Peers: nodes outside the class that share ≥1 attribute key with it, carrying their PageRank.
-  const peers: { keys: Set<string>; pr: number }[] = []
+  // The class's ontological type: the KKO types its instances carry. Empty ⇒ coherence is inert.
+  const classTypes = new Set<string>()
+  if (kkoTypeOf) for (const id of classIds) for (const t of kkoTypeOf(id)) classTypes.add(t)
+  const coherenceActive = classTypes.size > 0
+  const method = coherenceActive
+    ? 'rrf(consistency,trust,probabilistic,coherence)'
+    : 'rrf(consistency,trust,probabilistic)'
+
+  // Peers: nodes outside the class that share ≥1 attribute key with it, carrying id + PageRank.
+  const peers: { id: string; keys: Set<string>; pr: number }[] = []
   for (const node of store.allNodes()) {
     if (classIds.has(node.id)) continue
     const keys = nodeAttributeKeys(store, node)
     let shares = false
     for (const k of keys) if (ownKeys.has(k)) { shares = true; break }
-    if (shares) peers.push({ keys, pr: pr.get(node.id) ?? 0 })
+    if (shares) peers.push({ id: node.id, keys, pr: pr.get(node.id) ?? 0 })
   }
   const nPeers = peers.length
-  if (nPeers === 0) return sealed({ label, method: METHOD, peers: 0, snapshot, recommendations: [] })
+  if (nPeers === 0) return sealed({ label, method, peers: 0, snapshot, recommendations: [] })
   const totalPeerPr = peers.reduce((s, p) => s + p.pr, 0) || 1
 
-  interface Cand { kk: string; key: string; kind: AttributeKind; peerCoverage: number; ownCoverage: number; consistency: number; trust: number; probabilistic: number }
+  interface Cand { kk: string; key: string; kind: AttributeKind; peerCoverage: number; ownCoverage: number; consistency: number; trust: number; probabilistic: number; coherence: number }
   const cands: Cand[] = []
   const seen = new Set<string>()
   for (const peer of peers) for (const kk of peer.keys) {
@@ -120,23 +136,32 @@ export function rankAttributeRecommendations(store: HellGraphStore, label: strin
     const consistency = peerCov * gap
     const trust = (withIt.reduce((s, p) => s + p.pr, 0) / totalPeerPr) * gap
     const probabilistic = peerCov * (nWith / (nWith + 1)) * gap // PLN strength × confidence × gap
+    // coherence: of the peers carrying this attribute, the fraction whose KKO type overlaps the class's.
+    let coherence = 0
+    if (coherenceActive) {
+      const fit = withIt.filter((p) => kkoTypeOf!(p.id).some((t) => classTypes.has(t))).length
+      coherence = (fit / nWith) * gap
+    }
     const [kind, ...rest] = kk.split(':')
-    cands.push({ kk, key: rest.join(':'), kind: kind as AttributeKind, peerCoverage: peerCov, ownCoverage: ownCov, consistency, trust, probabilistic })
+    cands.push({ kk, key: rest.join(':'), kind: kind as AttributeKind, peerCoverage: peerCov, ownCoverage: ownCov, consistency, trust, probabilistic, coherence })
   }
-  if (cands.length === 0) return sealed({ label, method: METHOD, peers: nPeers, snapshot, recommendations: [] })
+  if (cands.length === 0) return sealed({ label, method, peers: nPeers, snapshot, recommendations: [] })
 
   const orderBy = (sig: (c: Cand) => number): string[] =>
     [...cands].sort((a, b) => sig(b) - sig(a) || a.kk.localeCompare(b.kk)).map((c) => c.kk)
-  const fused = reciprocalRankFusion([orderBy((c) => c.consistency), orderBy((c) => c.trust), orderBy((c) => c.probabilistic)])
+  const orderings = [orderBy((c) => c.consistency), orderBy((c) => c.trust), orderBy((c) => c.probabilistic)]
+  if (coherenceActive) orderings.push(orderBy((c) => c.coherence))
+  const fused = reciprocalRankFusion(orderings)
   const byKk = new Map(cands.map((c) => [c.kk, c]))
 
   const recommendations: RankedAttribute[] = fused.slice(0, topK).map((f, i) => {
     const c = byKk.get(f.id)!
+    const signals: RankerSignals = { consistency: c.consistency, trust: c.trust, probabilistic: c.probabilistic }
+    if (coherenceActive) signals.coherence = c.coherence
     return {
       key: c.key, kind: c.kind, fusedScore: f.score, rank: i + 1,
-      peerCoverage: c.peerCoverage, ownCoverage: c.ownCoverage,
-      signals: { consistency: c.consistency, trust: c.trust, probabilistic: c.probabilistic },
+      peerCoverage: c.peerCoverage, ownCoverage: c.ownCoverage, signals,
     }
   })
-  return sealed({ label, method: METHOD, peers: nPeers, snapshot, recommendations })
+  return sealed({ label, method, peers: nPeers, snapshot, recommendations })
 }
