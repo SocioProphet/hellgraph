@@ -109,3 +109,51 @@ export function kkoTypesOf(store: HellGraphStore, iri: string): string[] {
   }
   return [...kko].sort()
 }
+
+// ─── Entity → KKO typing (the "Semantic Mapping" stage) ─────────────────────────────────────────
+
+/** Normalize a label for matching: case-fold, strip accents/punctuation, collapse whitespace. */
+function normalizeLabel(s: string): string {
+  return s.toLowerCase().normalize('NFKD').replace(/[̀-ͯ]/g, '').replace(/[^a-z0-9]+/g, ' ').trim()
+}
+
+/** A normalized `prefLabel` → reference-concept IRIs index. Build once, reuse across many mappings. */
+export function buildRcLabelIndex(store: HellGraphStore): Map<string, string[]> {
+  const index = new Map<string, string[]>()
+  for (const node of store.nodesByLabel(RC_LABEL)) {
+    const pref = node.properties['prefLabel']
+    if (typeof pref !== 'string') continue
+    const norm = normalizeLabel(pref)
+    if (!norm) continue
+    const arr = index.get(norm)
+    if (arr) arr.push(node.id)
+    else index.set(norm, [node.id])
+  }
+  return index
+}
+
+export interface KkoMapping {
+  entity: string
+  /** Matched reference-concept IRI, or null if no RC label matched. */
+  matched: string | null
+  prefLabel: string | null
+  /** KKO upper class(es) the matched RC rolls up to (via `kkoTypesOf`). */
+  kkoTypes: string[]
+  /** How many RCs matched the normalized label (>1 ⇒ ambiguous, first is returned). */
+  candidates: number
+}
+
+/**
+ * Map an estate entity's label to its KKO type by matching a reference concept, then rolling that RC up
+ * to its KKO upper class(es). v1 is exact normalized-`prefLabel` match; embedding/altLabel matching is
+ * the natural next layer. Pass a prebuilt `index` (from `buildRcLabelIndex`) when mapping many entities.
+ */
+export function mapEntityToKko(store: HellGraphStore, entity: string, index?: Map<string, string[]>): KkoMapping {
+  const idx = index ?? buildRcLabelIndex(store)
+  const matches = idx.get(normalizeLabel(entity)) ?? []
+  if (matches.length === 0) return { entity, matched: null, prefLabel: null, kkoTypes: [], candidates: 0 }
+  const rc = matches[0]
+  const node = store.getNode(rc)
+  const prefLabel = node && typeof node.properties['prefLabel'] === 'string' ? (node.properties['prefLabel'] as string) : null
+  return { entity, matched: rc, prefLabel, kkoTypes: kkoTypesOf(store, rc), candidates: matches.length }
+}

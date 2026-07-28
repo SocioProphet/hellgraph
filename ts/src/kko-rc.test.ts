@@ -2,7 +2,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { AtomSpace } from './atomspace'
 import { HellGraphStore } from './store'
-import { parseReferenceConcepts, loadReferenceConcepts, kkoTypesOf, RC_NS, RC_LABEL } from './kko-rc'
+import { parseReferenceConcepts, loadReferenceConcepts, kkoTypesOf, mapEntityToKko, buildRcLabelIndex, RC_NS, RC_LABEL } from './kko-rc'
 import { KKO_NS } from './kko'
 
 // Mirrors the real KBpedia RC format: rc: owl:Class, subClassOf rc:/kko:, skos:prefLabel/altLabel.
@@ -44,4 +44,21 @@ test('load is idempotent (content-addressed edges)', () => {
   const before = store.edgeCount()
   loadReferenceConcepts(store, RC_TTL)
   assert.equal(store.edgeCount(), before)
+})
+
+test('mapEntityToKko types an entity label to its RC + KKO upper types', () => {
+  const store = new HellGraphStore(new AtomSpace('rc-map', false))
+  loadReferenceConcepts(store, RC_TTL)
+  const m = mapEntityToKko(store, 'Cheese')
+  assert.equal(m.matched, rc('Cheese'))
+  assert.equal(m.prefLabel, 'cheese')
+  assert.deepEqual(m.kkoTypes, [KKO_NS + 'Artifacts'])
+  assert.equal(m.candidates, 1)
+  // normalization: different case / spacing / punctuation still resolves
+  const idx = buildRcLabelIndex(store)
+  assert.equal(mapEntityToKko(store, "  cow's-milk CHEESE ", idx).matched, rc('CowsMilkCheese'))
+  // unknown entity → clean null mapping
+  const u = mapEntityToKko(store, 'zzz-nonexistent', idx)
+  assert.equal(u.matched, null)
+  assert.deepEqual(u.kkoTypes, [])
 })
