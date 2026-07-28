@@ -80,7 +80,10 @@ export function loadReferenceConcepts(store: HellGraphStore, text: string): RcLo
   const concepts = parseReferenceConcepts(text)
   let subClassOfEdges = 0
   for (const rc of concepts) {
-    store.addNode(rc.iri, [RC_LABEL], rc.prefLabel !== undefined ? { prefLabel: rc.prefLabel } : {})
+    const props: Record<string, string> = {}
+    if (rc.prefLabel !== undefined) props['prefLabel'] = rc.prefLabel
+    if (rc.altLabels.length) props['altLabels'] = rc.altLabels.join('\n') // newline-joined; split on read
+    store.addNode(rc.iri, [RC_LABEL], props)
     for (const parentIri of rc.subClassOf) {
       store.addEdge('rdfs:subClassOf', rc.iri, parentIri)
       subClassOfEdges++
@@ -117,17 +120,23 @@ function normalizeLabel(s: string): string {
   return s.toLowerCase().normalize('NFKD').replace(/[̀-ͯ]/g, '').replace(/[^a-z0-9]+/g, ' ').trim()
 }
 
-/** A normalized `prefLabel` → reference-concept IRIs index. Build once, reuse across many mappings. */
+/** A normalized label → reference-concept IRIs index, over both `prefLabel` and `altLabel`s. Build once,
+ *  reuse across many mappings. Indexing altLabels raises recall (e.g. "physician" → the RC whose
+ *  prefLabel is "doctor" but which lists "physician" as an alt). */
 export function buildRcLabelIndex(store: HellGraphStore): Map<string, string[]> {
   const index = new Map<string, string[]>()
+  const add = (label: string, id: string): void => {
+    const norm = normalizeLabel(label)
+    if (!norm) return
+    const arr = index.get(norm)
+    if (arr) { if (!arr.includes(id)) arr.push(id) }
+    else index.set(norm, [id])
+  }
   for (const node of store.nodesByLabel(RC_LABEL)) {
     const pref = node.properties['prefLabel']
-    if (typeof pref !== 'string') continue
-    const norm = normalizeLabel(pref)
-    if (!norm) continue
-    const arr = index.get(norm)
-    if (arr) arr.push(node.id)
-    else index.set(norm, [node.id])
+    if (typeof pref === 'string') add(pref, node.id)
+    const alt = node.properties['altLabels']
+    if (typeof alt === 'string') for (const a of alt.split('\n')) add(a, node.id)
   }
   return index
 }

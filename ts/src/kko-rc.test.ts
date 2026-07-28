@@ -57,6 +57,8 @@ test('mapEntityToKko types an entity label to its RC + KKO upper types', () => {
   // normalization: different case / spacing / punctuation still resolves
   const idx = buildRcLabelIndex(store)
   assert.equal(mapEntityToKko(store, "  cow's-milk CHEESE ", idx).matched, rc('CowsMilkCheese'))
+  // altLabel match: "cow cheese" is an altLabel of rc:CowsMilkCheese, not its prefLabel
+  assert.equal(mapEntityToKko(store, 'cow cheese', idx).matched, rc('CowsMilkCheese'))
   // unknown entity → clean null mapping
   const u = mapEntityToKko(store, 'zzz-nonexistent', idx)
   assert.equal(u.matched, null)
