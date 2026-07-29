@@ -88,6 +88,32 @@ function sealed(rec: Omit<AttributeRecommendation, 'hash'>): AttributeRecommenda
 
 // Version-keyed PageRank cache: pageRank over the whole store dominated enrich latency (~0.7s at 55k
 // nodes, recomputed EVERY call). The store's logical clock invalidates exactly when the graph mutates.
+// Version-keyed attribute index: one pass over the graph builds per-node key-sets AND the inverted
+// key→nodes map. Kills the other enrich hotspot (O(N) node scan with per-node edge lookups on EVERY
+// call, then O(attrs × peers) membership filters) — peers come from the union of the class's key
+// buckets, and per-attribute support from bucket∩peer intersections. Invalidated by the logical clock.
+interface AttrIndex { byNode: Map<string, Set<string>>; byKey: Map<string, Set<string>> }
+const _attrIdxCache = new WeakMap<HellGraphStore, { v: number; idx: AttrIndex }>()
+function attributeIndex(store: HellGraphStore): AttrIndex {
+  const v = store.version()
+  const hit = _attrIdxCache.get(store)
+  if (hit && hit.v === v) return hit.idx
+  const byNode = new Map<string, Set<string>>()
+  const byKey = new Map<string, Set<string>>()
+  for (const node of store.allNodes()) {
+    const keys = nodeAttributeKeys(store, node)
+    byNode.set(node.id, keys)
+    for (const k of keys) {
+      let bucket = byKey.get(k)
+      if (!bucket) { bucket = new Set(); byKey.set(k, bucket) }
+      bucket.add(node.id)
+    }
+  }
+  const idx = { byNode, byKey }
+  _attrIdxCache.set(store, { v, idx })
+  return idx
+}
+
 const _prCache = new WeakMap<HellGraphStore, { v: number; pr: Map<string, number> }>()
 function cachedPageRank(store: HellGraphStore): Map<string, number> {
   const v = store.version()
@@ -123,15 +149,13 @@ export function rankAttributeRecommendations(store: HellGraphStore, label: strin
     ? 'rrf(consistency,trust,probabilistic,coherence)'
     : 'rrf(consistency,trust,probabilistic)'
 
-  // Peers: nodes outside the class that share ≥1 attribute key with it, carrying id + PageRank.
+  // Peers: nodes outside the class that share ≥1 attribute key with it — discovered via the inverted
+  // index (union of the class's key buckets) instead of a full-graph scan.
+  const { byNode, byKey } = attributeIndex(store)
+  const peerIds = new Set<string>()
+  for (const k of ownKeys) for (const id of byKey.get(k) ?? []) if (!classIds.has(id)) peerIds.add(id)
   const peers: { id: string; keys: Set<string>; pr: number }[] = []
-  for (const node of store.allNodes()) {
-    if (classIds.has(node.id)) continue
-    const keys = nodeAttributeKeys(store, node)
-    let shares = false
-    for (const k of keys) if (ownKeys.has(k)) { shares = true; break }
-    if (shares) peers.push({ id: node.id, keys, pr: pr.get(node.id) ?? 0 })
-  }
+  for (const id of peerIds) peers.push({ id, keys: byNode.get(id)!, pr: pr.get(id) ?? 0 })
   // Deterministic peer cap: coverage fractions stay meaningful while bounding the per-attribute
   // scoring cost on huge graphs. Highest-PageRank peers kept (ties by id) — reproducible for receipts.
   if (peers.length > maxPeers) {
