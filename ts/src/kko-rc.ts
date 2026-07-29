@@ -74,12 +74,7 @@ export function parseReferenceConcepts(text: string): ReferenceConcept[] {
   return [...byIri.values()]
 }
 
-/**
- * Ingest the reference-concept ABox into a store: each RC becomes a `KkoReferenceConcept` node
- * (carrying its prefLabel) with an `rdfs:subClassOf` edge to each superclass (RC or KKO). Idempotent.
- */
-export function loadReferenceConcepts(store: HellGraphStore, text: string): RcLoadStats {
-  const concepts = parseReferenceConcepts(text)
+function loadConceptList(store: HellGraphStore, concepts: ReferenceConcept[]): RcLoadStats {
   let subClassOfEdges = 0
   for (const rc of concepts) {
     const props: Record<string, string> = {}
@@ -92,6 +87,32 @@ export function loadReferenceConcepts(store: HellGraphStore, text: string): RcLo
     }
   }
   return { concepts: concepts.length, subClassOfEdges }
+}
+
+/**
+ * Ingest the reference-concept ABox into a store: each RC becomes a `KkoReferenceConcept` node
+ * (carrying its prefLabel) with an `rdfs:subClassOf` edge to each superclass (RC or KKO). Idempotent.
+ *
+ * MEMORY-BOUNDED for the real 37MB / 55k-concept file: parsing the whole text at once holds ~600k
+ * triple objects and OOM-killed a 512Mi pod (exit 134). Above `batchThreshold` bytes the text is split
+ * on the per-concept `# http://…` comment markers KBpedia emits, and parsed/loaded in batches with the
+ * `@prefix` header prepended to each — peak memory becomes one batch, results identical.
+ */
+export function loadReferenceConcepts(store: HellGraphStore, text: string, opts: { batchBlocks?: number; batchThreshold?: number } = {}): RcLoadStats {
+  const batchThreshold = opts.batchThreshold ?? 4_000_000
+  if (text.length <= batchThreshold) return loadConceptList(store, parseReferenceConcepts(text))
+
+  const batchBlocks = opts.batchBlocks ?? 4000
+  const header = text.split('\n').filter((l) => l.startsWith('@prefix') || l.startsWith('@base')).join('\n') + '\n'
+  const blocks = text.split(/\n(?=# http)/)
+  let concepts = 0, subClassOfEdges = 0
+  for (let i = 0; i < blocks.length; i += batchBlocks) {
+    const chunk = header + blocks.slice(i, i + batchBlocks).join('\n')
+    const stats = loadConceptList(store, parseReferenceConcepts(chunk))
+    concepts += stats.concepts
+    subClassOfEdges += stats.subClassOfEdges
+  }
+  return { concepts, subClassOfEdges }
 }
 
 /**

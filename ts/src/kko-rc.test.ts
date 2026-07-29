@@ -106,3 +106,11 @@ test('materializeKkoTypes writes typedAs edges; entityKkoTypes reads them', () =
   const before = store.edgeCount(); materializeKkoTypes(store, 'Client')
   assert.equal(store.edgeCount(), before, 'idempotent')
 })
+
+test('batched load (forced) equals whole-text load', () => {
+  const store = new HellGraphStore(new AtomSpace('rc-batch', false))
+  // batchThreshold 1 forces the batched path even on the tiny fixture; results must be identical
+  const st = loadReferenceConcepts(store, RC_TTL, { batchThreshold: 1, batchBlocks: 1 })
+  assert.equal(st.concepts, 2); assert.equal(st.subClassOfEdges, 2)
+  assert.deepEqual(kkoTypesOf(store, rc('CowsMilkCheese')), [KKO_NS + 'Artifacts'])
+})
