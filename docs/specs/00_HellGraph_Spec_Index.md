@@ -90,6 +90,12 @@ Freeze the canonical semantics, interfaces, projections, and pilot overlays befo
    - invariants: one evidence spine · Telos≠Truth (policy gates, proof asserts) · sovereign
      graph≠event bus · falsifiability=Test-Obligation · Memini=ECAN
 
+15. `15_NLQ_Typed_Plan_Compiler_v0_1.md`
+   - NL question → ontology-annotated tokens → side-effect-free restricted search over the
+     vendored SemanticAction registry → sense-metric-ranked plans → sealed receipt
+   - invariants: search-time purity · effects proposed never taken · a mention is not a value ·
+     the creativity penalty IS the admissibility discount
+
 ## Canonical Kernel Theorem
 
 One canonical core: immutable typed atoms plus versioned valuations.
