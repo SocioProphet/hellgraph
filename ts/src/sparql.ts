@@ -1,5 +1,6 @@
 import type { HellGraphStore } from './store'
 import type { Binding, PropertyValue, SparqlResult, Triple } from './types'
+import { cloneDict, emptyDict, mergeDicts, toPlainRow } from './safe-dict.js'
 
 export type { Binding, SparqlResult }
 
@@ -20,6 +21,17 @@ export type { Binding, SparqlResult }
  * VALUES/BIND → join/extend; OPTIONAL → left-join; MINUS → antijoin; FILTER →
  * restriction; then GROUP/aggregate or DISTINCT / ORDER / OFFSET / LIMIT / projection.
  */
+
+// ─── Solution bindings ─────────────────────────────────────────────────────────
+// A Binding is keyed by SPARQL variable names, which come straight off the wire, so every
+// intermediate binding is a null-prototype dictionary and output rows are materialized back
+// onto a normal prototype at the boundary. See safe-dict.ts for why (js/remote-property-injection).
+// NB: object spread `{ ...binding }` re-attaches Object.prototype — use cloneBinding/mergeBindings.
+
+const emptyBinding = (): Binding => emptyDict<PropertyValue>()
+const cloneBinding = (b: Binding): Binding => cloneDict(b)
+const mergeBindings = (a: Binding, b: Binding): Binding => mergeDicts(a, b)
+const toResultRow = (entries: Iterable<readonly [string, PropertyValue]>): Binding => toPlainRow(entries)
 
 // ─── Term model ────────────────────────────────────────────────────────────────
 
@@ -412,7 +424,7 @@ function unquote(tok: string): string {
 // ─── Evaluator ───────────────────────────────────────────────────────────────
 
 function matchTriple(pattern: TriplePattern, triple: Triple, binding: Binding): Binding | null {
-  const next: Binding = { ...binding }
+  const next: Binding = cloneBinding(binding)
 
   function unify(term: Term, value: PropertyValue): boolean {
     if (term.kind === 'var') {
@@ -511,7 +523,7 @@ function evalPath(pattern: TriplePattern, binding: Binding, triples: Triple[]): 
   for (const from of froms) {
     for (const to of [...reachFrom(from)].sort()) {
       if (ov !== null && to !== ov) continue                             // object bound → must equal
-      const b: Binding = { ...binding }
+      const b: Binding = cloneBinding(binding)
       if (sVar) b[sVar] = from
       if (oVar) b[oVar] = to
       results.push(b)
@@ -539,12 +551,12 @@ function evalBGP(patterns: TriplePattern[], triples: Triple[], seed: Binding[]):
 
 function joinSolutions(a: Binding[], b: Binding[]): Binding[] {
   const out: Binding[] = []
-  for (const x of a) for (const y of b) if (compatible(x, y)) out.push({ ...x, ...y })
+  for (const x of a) for (const y of b) if (compatible(x, y)) out.push(mergeBindings(x, y))
   return out
 }
 
 function evalGroup(group: GroupGraphPattern, triples: Triple[]): Binding[] {
-  let solutions = evalBGP(group.patterns, triples, [{}])
+  let solutions = evalBGP(group.patterns, triples, [emptyBinding()])
 
   // Lone nested { … } subgroups → natural join.
   for (const sub of group.subgroups) solutions = joinSolutions(solutions, evalGroup(sub, triples))
@@ -558,7 +570,7 @@ function evalGroup(group: GroupGraphPattern, triples: Triple[]): Binding[] {
   // VALUES: inline data → join.
   for (const vb of group.values) {
     const rows: Binding[] = vb.rows.map((row) => {
-      const b: Binding = {}
+      const b: Binding = emptyBinding()
       vb.vars.forEach((v, i) => { if (row[i] !== null && row[i] !== undefined) b[v] = row[i] as PropertyValue })
       return b
     })
@@ -567,7 +579,11 @@ function evalGroup(group: GroupGraphPattern, triples: Triple[]): Binding[] {
 
   // BIND: compute a new variable per solution.
   for (const bind of group.binds) {
-    solutions = solutions.map((sol) => ({ ...sol, [bind.var]: evalBind(bind.expr, sol) ?? null } as Binding))
+    solutions = solutions.map((sol) => {
+      const next = cloneBinding(sol)
+      next[bind.var] = evalBind(bind.expr, sol) ?? null
+      return next
+    })
   }
 
   // OPTIONAL → left join
@@ -576,7 +592,7 @@ function evalGroup(group: GroupGraphPattern, triples: Triple[]): Binding[] {
     for (const sol of solutions) {
       const matches = evalGroup(opt, triples).filter((m) => compatible(sol, m))
       if (matches.length === 0) next.push(sol)
-      else for (const m of matches) next.push({ ...sol, ...m })
+      else for (const m of matches) next.push(mergeBindings(sol, m))
     }
     solutions = next
   }
@@ -624,10 +640,13 @@ function aggregate(solutions: Binding[], groupBy: string[], aggregates: AggSpec[
   const variables = [...groupBy, ...aggregates.map((a) => a.as)]
   const bindings: Binding[] = []
   for (const rows of groups.values()) {
-    const out: Binding = {}
-    for (const g of groupBy) out[g] = rows[0]?.[g] ?? null
-    for (const a of aggregates) out[a.as] = computeAgg(a, rows)
-    bindings.push(out)
+    // Keys here are GROUP BY variables and aggregate aliases — both query-derived. Collect into
+    // an entry list and materialize via toResultRow so a name like `__proto__` is stored as an
+    // own data property instead of being swallowed by the inherited setter.
+    const out: [string, PropertyValue][] = []
+    for (const g of groupBy) out.push([g, rows[0]?.[g] ?? null])
+    for (const a of aggregates) out.push([a.as, computeAgg(a, rows)])
+    bindings.push(toResultRow(out))
   }
   return { variables, bindings }
 }
@@ -770,13 +789,10 @@ export function runSparql(store: HellGraphStore, queryText: string): SparqlResul
     ? Array.from(new Set(solutions.flatMap((s) => Object.keys(s))))
     : query.projection
 
-  let bindings = solutions.map((s) => {
-    // Build via a Map so projection variable names (query-derived) can't inject
-    // properties, then materialize a plain Binding (js/remote-property-injection).
-    const m = new Map<string, PropertyValue | null>()
-    for (const v of variables) m.set(v, s[v] ?? null)
-    return Object.fromEntries(m) as Binding
-  })
+  // Projection variable names are query-derived. `s` is null-prototype, so `s[v]` can only ever
+  // return a value this query actually bound — never an inherited Object.prototype member — and
+  // toResultRow writes even a hostile name as an own data property.
+  let bindings = solutions.map((s) => toResultRow(variables.map((v) => [v, s[v] ?? null] as const)))
 
   // DISTINCT
   if (query.distinct) {
