@@ -14,7 +14,7 @@
 import type { HellGraphStore } from './store'
 import { profileClass, type ClassProfile } from './attribute-profile'
 import { rankAttributeRecommendations, type AttributeRecommendation, type RankOptions } from './attribute-rank'
-import { RC_LABEL, buildRcLabelIndex, mapEntityToKko } from './kko-rc'
+import { RC_LABEL, buildRcLabelIndex, mapEntityToKko, entityKkoTypes } from './kko-rc'
 
 export interface EnrichResult {
   profile: ClassProfile
@@ -38,6 +38,9 @@ export function enrichClass(store: HellGraphStore, label: string, opts: EnrichOp
   if (opts.autoKkoCoherence !== false && opts.kkoTypeOf === undefined && store.nodesByLabel(RC_LABEL).length > 0) {
     const index = buildRcLabelIndex(store)
     const kkoTypeOf = (id: string): string[] => {
+      // materialized typing first (graph fact via kko:typedAs edges), string matching as fallback
+      const viaEdges = entityKkoTypes(store, id)
+      if (viaEdges.length > 0) return viaEdges
       const node = store.getNode(id)
       const key = typeof node?.properties['name'] === 'string' ? (node.properties['name'] as string) : id
       return mapEntityToKko(store, key, index).kkoTypes

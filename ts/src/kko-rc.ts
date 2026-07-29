@@ -170,6 +170,41 @@ export function mapEntityToKko(store: HellGraphStore, entity: string, index?: Ma
   return { entity, matched: rc, prefLabel, kkoTypes: kkoTypesOf(store, rc), candidates: matches.length }
 }
 
+// ─── Materialized typing: entity→RC as graph fact, not per-call string matching ─────────────────
+
+/** Edge label binding an entity node to its reference concept: entity --kko:typedAs--> rc. */
+export const TYPED_AS = 'kko:typedAs'
+
+export interface MaterializeStats { scanned: number; typed: number; edges: number }
+
+/**
+ * Write entity→RC typing INTO the graph: for every node carrying `label`, resolve its `name` property
+ * (else id) against the RC label index and add a `kko:typedAs` edge to the matched reference concept.
+ * Idempotent (content-addressed edges). Typing becomes queryable/auditable graph fact — coherence and
+ * downstream reasoning read edges instead of re-matching strings on every call.
+ */
+export function materializeKkoTypes(store: HellGraphStore, label: string, index?: Map<string, string[]>): MaterializeStats {
+  const idx = index ?? buildRcLabelIndex(store)
+  let scanned = 0, typed = 0, edges = 0
+  for (const node of store.nodesByLabel(label)) {
+    scanned++
+    const key = typeof node.properties['name'] === 'string' ? (node.properties['name'] as string) : node.id
+    const m = mapEntityToKko(store, key, idx)
+    if (!m.matched) continue
+    typed++
+    store.addEdge(TYPED_AS, node.id, m.matched)
+    edges++
+  }
+  return { scanned, typed, edges }
+}
+
+/** An entity's KKO upper types via its materialized `kko:typedAs` edge(s) — [] when untyped. */
+export function entityKkoTypes(store: HellGraphStore, id: string): string[] {
+  const out = new Set<string>()
+  for (const rc of store.out(id, TYPED_AS)) for (const t of kkoTypesOf(store, rc.id)) out.add(t)
+  return [...out].sort()
+}
+
 // ─── Semantic (embedding) mapping — recall beyond exact labels ──────────────────────────────────
 // Uses the engine's standard embedding contract (semantic.ts EmbedFn: EMBEDDINGS_URL / Ollama).
 

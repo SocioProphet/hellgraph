@@ -2,7 +2,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { AtomSpace } from './atomspace'
 import { HellGraphStore } from './store'
-import { parseReferenceConcepts, loadReferenceConcepts, kkoTypesOf, mapEntityToKko, buildRcLabelIndex, buildRcEmbeddingIndex, mapEntityToKkoSemantic, RC_NS, RC_LABEL } from './kko-rc'
+import { parseReferenceConcepts, loadReferenceConcepts, kkoTypesOf, mapEntityToKko, buildRcLabelIndex, buildRcEmbeddingIndex, mapEntityToKkoSemantic, materializeKkoTypes, entityKkoTypes, RC_NS, RC_LABEL } from './kko-rc'
 import { KKO_NS } from './kko'
 
 // Mirrors the real KBpedia RC format: rc: owl:Class, subClassOf rc:/kko:, skos:prefLabel/altLabel.
@@ -92,4 +92,17 @@ test('mapEntityToKko types an entity label to its RC + KKO upper types', () => {
   const u = mapEntityToKko(store, 'zzz-nonexistent', idx)
   assert.equal(u.matched, null)
   assert.deepEqual(u.kkoTypes, [])
+})
+
+test('materializeKkoTypes writes typedAs edges; entityKkoTypes reads them', () => {
+  const store = new HellGraphStore(new AtomSpace('rc-mat', false))
+  loadReferenceConcepts(store, RC_TTL)
+  store.addNode('c1', ['Client'], { name: 'cheese' })
+  store.addNode('c2', ['Client'], { name: 'zzz-unknown' })
+  const st = materializeKkoTypes(store, 'Client')
+  assert.equal(st.scanned, 2); assert.equal(st.typed, 1); assert.equal(st.edges, 1)
+  assert.deepEqual(entityKkoTypes(store, 'c1'), [KKO_NS + 'Artifacts'])  // via the typedAs edge
+  assert.deepEqual(entityKkoTypes(store, 'c2'), [])                        // honest untyped
+  const before = store.edgeCount(); materializeKkoTypes(store, 'Client')
+  assert.equal(store.edgeCount(), before, 'idempotent')
 })
