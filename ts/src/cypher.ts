@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto'
-import { AtomSpace, nodeHandle, linkHandle, type Handle } from './atomspace'
-import { findMatches, V, N, L, type Pattern, type PatternTerm } from './patternMatcher'
+import { AtomSpace, nodeHandle, linkHandle, type Atom, type Handle } from './atomspace'
+import { findMatches, V, N, L, type Pattern, type PatternTerm, type Grounding } from './patternMatcher'
 
 /**
  * Cypher Facade v0.1 — a human/agent-friendly READ query surface over the AtomSpace.
@@ -26,9 +26,20 @@ import { findMatches, V, N, L, type Pattern, type PatternTerm } from './patternM
  * TruthValue as `r.strength` / `r.confidence`, so CSKG edge weights are
  * filterable and sortable: `WHERE r.confidence > 0.5 ... ORDER BY r.confidence DESC`.
  *
+ * Façade encoding (store.ts, the supported write path — 0.4.45): `addNode(id, labels, props)`
+ * writes ONE ConceptNode(name = id) carrying its labels in the `graph:labels` Value and each
+ * property under a `prop:`-namespaced Value key. Cypher therefore reads BOTH namespaces:
+ *   • a label matches an atom TYPE (natively-typed atoms, e.g. the KKO lattice kko.ts declares)
+ *     OR membership of `graph:labels` (façade-written nodes); multi-label nodes match on ANY label;
+ *   • `n.price` reads the `prop:price` Value (the raw Value key stays readable too).
+ * Reading only one namespace is what made a façade-written graph answer `MATCH (n:Label)` with a
+ * single all-empty row — silent-wrong, fixed in 0.4.45.
+ *
  * Sentinel discipline (Archetype §3.2 / §14): this v0.1 is READ-ONLY, rejects
  * unbounded traversals, caps hop-count, and requires a LIMIT — so an agent can
- * never issue an accidentally expensive query.
+ * never issue an accidentally expensive query. A label/anchor-free node pattern is a SCAN, so it
+ * is bounded twice over: it stops as soon as LIMIT rows exist (when nothing downstream can
+ * re-order or drop them) and it THROWS at `maxScan` candidates rather than silently truncating.
  *
  * Every query carries a snapshot (`evaluatedAtSeq`) and a `queryHash`, so the
  * result is bindable to the reasoning-evidence receipt spine.
@@ -38,11 +49,17 @@ const NODE_TYPE_DEFAULT = 'ConceptNode'
 const REL_LINK = 'EvaluationLink'
 const REL_PRED = 'PredicateNode'
 const REL_LIST = 'ListLink'
+// The two Value namespaces store.ts writes façade nodes under (see the header note).
+const LABELS_KEY = 'graph:labels'
+const PROP_NS = 'prop:'
+// `(n:Concept)` is the facade's spelling of "the default ConceptNode type", not a stored label.
+const CONCEPT_ALIAS = 'Concept'
 
 export interface CypherOptions {
   maxHops?: number          // Sentinel: max variable-length hops. Default 3.
   requireLimit?: boolean    // Sentinel: require an explicit LIMIT. Default true.
   maxRows?: number          // Hard row cap. Default 1000.
+  maxScan?: number          // Sentinel: max node candidates a label/anchor-free scan may visit. Default 100000.
   allowWrite?: boolean      // Allow mutation clauses. Default false.
   mode?: string             // Declared epistemic mode carried onto evidence.
   onEvidence?: (rec: CypherEvidence) => void
@@ -91,11 +108,11 @@ interface CypherAst {
   write: boolean
   paths: PathPat[]
   links: LinkPat[]
-  pins: { var: string; value: string }[]   // form/name equalities → node-name pins (pure-AND fast path)
+  pins: { var: string; value: string }[]   // `form` equalities → node-identity pins (pure-AND fast path)
   filters: Filter[]                          // pure-AND residual comparisons → post-match filter
   where?: WExpr                              // set instead of pins/filters when OR/NOT is present
   ret: ColRef[] | '*'
-  orderBy: { key: string; desc: boolean }[]
+  orderBy: { ref: ColRef; desc: boolean }[]
   limit?: number
 }
 
@@ -156,8 +173,8 @@ class Parser {
       if (kw === 'MATCH') {
         this.next()
         if (this.up() === 'LINK') { this.next(); ast.links.push(this.parseLink()) }
-        else ast.paths.push(this.parsePath())
-      } else if (kw === 'OPTIONAL') { this.next(); this.expect('MATCH'); ast.paths.push(this.parsePath()) }
+        else this.addPath(ast, this.parsePath())
+      } else if (kw === 'OPTIONAL') { this.next(); this.expect('MATCH'); this.addPath(ast, this.parsePath()) }
       else if (kw === 'WHERE') { this.next(); this.applyWhere(ast, this.parseWhereExpr()) }
       else if (kw === 'RETURN') { this.next(); ast.ret = this.parseReturn() }
       else if (kw === 'ORDER') { this.next(); this.expect('BY'); this.parseOrderBy(ast) }
@@ -220,6 +237,29 @@ class Parser {
     return path
   }
 
+  /**
+   * Record a parsed path and lower its inline `{…}` property map.
+   * `{form:"x"}` is the node-IDENTITY pin (compile-time, narrows the pattern); every OTHER inline
+   * property is a predicate and is lowered to the same residual filter list WHERE uses — it used to
+   * be parsed and then silently DROPPED, so `(n {symbol:"SP:AAA"})` matched every node. An inline
+   * predicate on an anonymous node has no row key to filter on, so it is refused loudly instead.
+   * A comma-separated multi-pattern MATCH was also silently dropped after the comma; refuse it too
+   * (`MATCH (a) MATCH (b)` is the supported spelling).
+   */
+  private addPath(ast: CypherAst, path: PathPat): void {
+    if (this.peek() === ',') {
+      throw new Error('Cypher unsupported: comma-separated MATCH patterns — write a separate MATCH clause per pattern')
+    }
+    for (const node of path.nodes) {
+      for (const p of node.props) {
+        if (p.key === 'form') continue
+        if (!node.var) throw new Error(`Cypher unsupported: inline property '{${p.key}: …}' on an anonymous node — give the node a variable`)
+        ast.filters.push({ lhs: { var: node.var, prop: p.key }, op: '=', rhs: isNum(p.value) ? Number(p.value) : p.value })
+      }
+    }
+    ast.paths.push(path)
+  }
+
   private parseLink(): LinkPat {
     let alias: string | undefined
     let first = this.next()
@@ -266,14 +306,22 @@ class Parser {
     return { t: 'cmp', lhs: { var: v, prop }, op, rhs }
   }
 
-  // Lower the parsed tree: a pure conjunction of comparisons → compile-time name/form pins + flat filters
-  // (fast path, preserves the pattern-narrowing pin optimization). Any OR/NOT → keep the whole tree for
-  // runtime row evaluation (pins can't narrow a disjunction, so name/form equalities become row filters).
+  // Lower the parsed tree: a pure conjunction of comparisons → compile-time `form` identity pins + flat
+  // filters (fast path, preserves the pattern-narrowing pin optimization). Any OR/NOT → keep the whole
+  // tree for runtime row evaluation (pins can't narrow a disjunction, so identity equalities become
+  // row filters).
+  //
+  // `name` is NOT pinned (it was, through 0.4.44). Spec 04 §Property Access defines `n.name` as the
+  // stored `prop.name` valuation, and a façade node routinely has a `name` property that differs from
+  // its id — pinning it compiled `WHERE n.name = "Alice"` into an identity lookup for an atom named
+  // "Alice" and silently returned nothing. `form` stays the reserved identity pin, and `name` falls
+  // back to identity at row level when the node carries no `name` property, so the old spelling keeps
+  // working (it just no longer narrows the pattern).
   private applyWhere(ast: CypherAst, e: WExpr): void {
     const conj = flattenAndCmp(e)
     if (conj) {
       for (const c of conj) {
-        if (c.op === '=' && (c.lhs.prop === 'form' || c.lhs.prop === 'name') && typeof c.rhs === 'string') {
+        if (c.op === '=' && c.lhs.prop === 'form' && typeof c.rhs === 'string') {
           ast.pins.push({ var: c.lhs.var, value: c.rhs })
         } else ast.filters.push({ lhs: c.lhs, op: c.op, rhs: c.rhs })
       }
@@ -300,7 +348,7 @@ class Parser {
       if (this.peek() === '.') { this.next(); prop = this.next() }
       let desc = false
       if (this.up() === 'ASC' || this.up() === 'DESC') { desc = this.up() === 'DESC'; this.next() }
-      ast.orderBy.push({ key: prop ? `${v}.${prop}` : v, desc })
+      ast.orderBy.push({ ref: { var: v, prop }, desc })
       if (this.peek() === ',') this.next(); else break
     }
   }
@@ -314,37 +362,112 @@ class Parser {
 
 // ─── Compiler: AST → native Pattern(s) + edge specs (for TruthValue projection) ──
 
-type TermRef = { kind: 'var'; name: string; type: string } | { kind: 'node'; type: string; name: string }
+type TermRef = { kind: 'var'; name: string; type?: string } | { kind: 'node'; type: string; name: string }
 interface EdgeSpec { var?: string; rel: string; dir: 'out' | 'in' | 'both'; src: TermRef; tgt: TermRef }
 
+/**
+ * One node position in the query, carrying what the native Pattern IR cannot express.
+ * A Cypher label is NOT an atom type (see the header note), and an identity-pinned node is a
+ * CONSTANT in the IR — so the matcher never binds its variable. Both are settled here, against the
+ * groundings, instead of being dropped.
+ */
+interface NodeSlot {
+  irVar: string          // grounding key: the user's variable, or a generated `_anon`/`_pin` name
+  label?: string         // enforced over BOTH namespaces (atom type OR `graph:labels` membership)
+  pinnedHandle?: Handle  // identity-pinned node: bound explicitly, since the IR holds it as a constant
+}
+
 let anon = 0
-function nodeTermRef(n: NodePat, pin: Map<string, string>): TermRef {
-  const type = n.label && n.label !== 'Concept' ? n.label : NODE_TYPE_DEFAULT
-  const inline = n.props.find((p) => p.key === 'form' || p.key === 'name')?.value
+function nodeTermRef(as: AtomSpace, n: NodePat, pin: Map<string, string>, slots: NodeSlot[]): TermRef {
+  const label = n.label
+  const inline = n.props.find((p) => p.key === 'form')?.value
   const pinned = inline ?? (n.var ? pin.get(n.var) : undefined)
-  if (pinned) return { kind: 'node', type, name: pinned }
-  return { kind: 'var', name: n.var ?? `_anon${anon++}`, type }
+  if (pinned) {
+    // A label may still name a real atom TYPE (natively-typed atoms): prefer the natively-typed atom
+    // when one exists under (label, name), else the façade's ConceptNode. Either way the label is
+    // re-checked as a predicate below, so a wrong guess yields no rows rather than a wrong row.
+    const type = label && label !== CONCEPT_ALIAS && as.getNode(label, pinned) ? label : NODE_TYPE_DEFAULT
+    slots.push({ irVar: n.var ?? `_pin${anon++}`, label, pinnedHandle: nodeHandle(type, pinned) })
+    return { kind: 'node', type, name: pinned }
+  }
+  const name = n.var ?? `_anon${anon++}`
+  slots.push({ irVar: name, label })
+  // Labelled vars stay UNTYPED in the IR (a label is not an atom type) and are narrowed by the label
+  // predicate; unlabelled vars keep the ConceptNode restriction they have always had.
+  return { kind: 'var', name, type: label ? undefined : NODE_TYPE_DEFAULT }
 }
 const asTerm = (r: TermRef): PatternTerm => (r.kind === 'node' ? N(r.type, r.name) : V(r.name, r.type))
+
+/**
+ * Cypher label semantics (settled in 0.4.45). `(n:Foo)` matches an atom when EITHER
+ *   (a) its atom TYPE is Foo or a subtype of Foo — natively-typed atoms, e.g. the hierarchy kko.ts
+ *       declares on the type lattice; this is what the facade has always done, and it stays; OR
+ *   (b) its `graph:labels` Value contains Foo — every node written through HellGraphStore.addNode,
+ *       which is the supported write path and was previously unmatchable by its own labels.
+ * A multi-label node matches on ANY of its labels (openCypher semantics).
+ */
+function atomMatchesLabel(as: AtomSpace, atom: Atom | undefined, label: string): boolean {
+  if (!atom) return false
+  if (as.types.isA(atom.type, label === CONCEPT_ALIAS ? NODE_TYPE_DEFAULT : label)) return true
+  const v = atom.values[LABELS_KEY]
+  return v !== undefined && v.kind === 'string' && v.value.includes(label)
+}
+
+// ─── Label index (version-keyed) ─────────────────────────────────────────────
+// `graph:labels` is a multi-valued Value, so the AtomSpace's exact-match value index cannot answer
+// "which nodes carry label X" (it keys the whole label list). Build the inverted index once per
+// AtomSpace VERSION — same discipline as the attribute index — so a label scan costs O(|label|)
+// while the space is unchanged, and O(nodes) only on the first query after a write.
+interface LabelIndex { version: number; byLabel: Map<string, Handle[]> }
+const LABEL_INDEX = new WeakMap<AtomSpace, LabelIndex>()
+
+function labelIndex(as: AtomSpace): Map<string, Handle[]> {
+  const hit = LABEL_INDEX.get(as)
+  if (hit && hit.version === as.logicalClock) return hit.byLabel
+  const byLabel = new Map<string, Handle[]>()
+  for (const atom of as.getByType(NODE_TYPE_DEFAULT, false)) {
+    const v = atom.values[LABELS_KEY]
+    if (v === undefined || v.kind !== 'string') continue
+    for (const label of v.value) {
+      const bucket = byLabel.get(label)
+      if (bucket) bucket.push(atom.handle)
+      else byLabel.set(label, [atom.handle])
+    }
+  }
+  LABEL_INDEX.set(as, { version: as.logicalClock, byLabel })
+  return byLabel
+}
+
+/** Candidate atoms for a node position no clause binds: the union of both label namespaces. */
+function scanCandidates(as: AtomSpace, label: string | undefined): Handle[] {
+  if (label === undefined) return as.getByType(NODE_TYPE_DEFAULT, false).map((a) => a.handle)
+  const byType = as.getByType(label === CONCEPT_ALIAS ? NODE_TYPE_DEFAULT : label, true)
+  const byLabel = labelIndex(as).get(label) ?? []
+  if (byType.length === 0) return byLabel
+  const out = new Set<Handle>(byLabel)
+  for (const a of byType) out.add(a.handle)
+  return Array.from(out)
+}
 
 function edgeClause(rel: string, src: PatternTerm, tgt: PatternTerm, dir: 'out' | 'in' | 'both') {
   const [a, b] = dir === 'in' ? [tgt, src] : [src, tgt]
   return L(REL_LINK, N(REL_PRED, rel), L(REL_LIST, a, b))
 }
 
-interface Compiled { patterns: Pattern[]; edgeSpecs: EdgeSpec[] }
+interface Compiled { patterns: Pattern[]; edgeSpecs: EdgeSpec[]; slots: NodeSlot[] }
 
-function compile(ast: CypherAst): Compiled {
+function compile(as: AtomSpace, ast: CypherAst): Compiled {
   anon = 0
   const pin = new Map<string, string>()
   for (const p of ast.pins) pin.set(p.var, p.value)
 
   const fixedClauses: Extract<PatternTerm, { kind: 'link' }>[] = []
   const edgeSpecs: EdgeSpec[] = []
+  const slots: NodeSlot[] = []
   let varAlternatives: Pattern[] | null = null
 
   for (const path of ast.paths) {
-    const refs = path.nodes.map((n) => nodeTermRef(n, pin))
+    const refs = path.nodes.map((n) => nodeTermRef(as, n, pin, slots))
     if (path.edges.length === 1 && (path.edges[0].lo !== 1 || path.edges[0].hi !== 1)) {
       // variable-length: expand to alternatives (no edge-var TV projection here)
       const e = path.edges[0]
@@ -372,7 +495,7 @@ function compile(ast: CypherAst): Compiled {
   const patterns = varAlternatives
     ? varAlternatives.map((alt) => ({ clauses: [...fixedClauses, ...alt.clauses] }))
     : [{ clauses: fixedClauses }]
-  return { patterns, edgeSpecs }
+  return { patterns, edgeSpecs, slots }
 }
 
 // ─── Edge TruthValue resolution ──────────────────────────────────────────────
@@ -394,64 +517,144 @@ function edgeTv(as: AtomSpace, spec: EdgeSpec, grounding: Record<string, Handle>
 
 // ─── Runner ────────────────────────────────────────────────────────────────────
 
+type RRow = Record<string, string | number>
+
+/**
+ * Resolve a `var[.prop]` reference against a projected row. ONE resolver, shared by WHERE, ORDER BY
+ * and RETURN, so the three can never disagree — they did: RETURN fell back to the node id for ANY
+ * unknown property (so `n.price` RENDERED the node id) while WHERE on the same reference matched
+ * nothing. Resolution order:
+ *   • `var`             → the bound node's name (its façade id).
+ *   • `var.form`        → RESERVED node identity, never shadowed (it is the compile-time pin).
+ *   • `var.prop`        → the projected property: the bare `prop:`-namespaced name, or a raw Value key.
+ *   • `var.name`        → the stored `name` property (spec 04 §Property Access), else the identity.
+ * Anything never projected stays `undefined`: RETURN renders '' and WHERE refuses loudly.
+ */
+function refValue(r: RRow, c: ColRef): string | number | undefined {
+  if (!c.prop || c.prop === 'form') return r[c.var]
+  const v = r[`${c.var}.${c.prop}`]
+  if (v !== undefined) return v
+  return c.prop === 'name' ? r[c.var] : undefined
+}
+
 export function runCypher(as: AtomSpace, query: string, params: Record<string, string> = {}, opts: CypherOptions = {}): CypherResult {
   const maxHops = opts.maxHops ?? 3
   const requireLimit = opts.requireLimit ?? true
   const maxRows = opts.maxRows ?? 1000
+  const maxScan = opts.maxScan ?? 100_000
 
   const ast = new Parser(tokenize(query), params).parse()
   if (ast.write && !opts.allowWrite) throw new Error('Cypher facade v0.1 is read-only; mutation clauses (CREATE/MERGE/SET/DELETE) are refused')
   for (const p of ast.paths) for (const e of p.edges) if (e.hi > maxHops) throw new Error(`Cypher: variable-length hop ${e.hi} exceeds maxHops ${maxHops}`)
   if (requireLimit && ast.limit === undefined && !ast.explain) throw new Error('Cypher: a LIMIT is required (Sentinel bounded-traversal policy)')
 
-  const { patterns, edgeSpecs } = compile(ast)
+  const { patterns, edgeSpecs, slots } = compile(as, ast)
   const queryHash = 'sha256:' + createHash('sha256').update(query.replace(/\s+/g, ' ').trim()).digest('hex')
   if (ast.explain) return { columns: [], rows: [], evaluatedAtSeq: as.logicalClock, queryHash, useSpace: ast.useSpace, plan: patterns }
 
   const edgeVarSpecs = edgeSpecs.filter((s) => s.var)
-  type RRow = Record<string, string | number>
   const seen = new Set<string>()
   const resolved: RRow[] = []
 
-  for (const pattern of patterns) {
-    const res = findMatches(as, pattern)
-    res.results.forEach((row, i) => {
-      const rr: RRow = {}
-      for (const [k, v] of Object.entries(row)) if (!k.startsWith('_')) rr[k] = v
-      // node-property projection: expose each grounded node's generic Values as `var.prop`, so WHERE/RETURN
-      // can filter and read arbitrary node properties (e.g. `a.age > 10`), not just name/form. Float/string
-      // Values project their first scalar; the row already carries `var` = node name for name/form predicates.
-      for (const [v, h] of Object.entries(res.groundings[i])) {
-        if (v.startsWith('_')) continue
-        const atom = as.getAtom(h)
-        if (!atom) continue
-        for (const [pk, pv] of Object.entries(atom.values)) {
-          const scalar = pv.kind === 'link' ? undefined : pv.value[0]
-          if (scalar !== undefined) rr[`${v}.${pk}`] = scalar
-        }
+  // Sentinel bound on a node scan. Truncating at LIMIT is only CORRECT when nothing downstream can
+  // re-order or drop rows: with an ORDER BY or any predicate the full candidate set is needed, so the
+  // scan runs to completion and THROWS at maxScan rather than silently truncating.
+  const streamable = ast.orderBy.length === 0 && ast.filters.length === 0 && !ast.where
+  const rowBudget = Math.min(ast.limit ?? maxRows, maxRows)
+  let scanned = 0
+
+  // Build one output row from a complete grounding. Returns false when enough rows exist.
+  const emit = (g: Grounding): boolean => {
+    const rr: RRow = {}
+    for (const [v, h] of Object.entries(g)) {
+      if (v.startsWith('_')) continue
+      const atom = as.getAtom(h)
+      if (!atom) continue
+      // `var` = the node's façade id. findMatches only reports variables its CLAUSES bind, so a
+      // label-only pattern (no clauses) and an identity-pinned node (a constant, not a variable)
+      // both left the row's own variable unbound — `RETURN n` rendered ''. Bind it from the atom.
+      rr[v] = atom.name ?? atom.type
+      // Node-property projection: every scalar Value is readable as `var.key` under its RAW key…
+      for (const [pk, pv] of Object.entries(atom.values)) {
+        if (pv.kind === 'link') continue
+        const scalar = pv.value[0]
+        if (scalar !== undefined) rr[`${v}.${pk}`] = scalar
       }
-      // edge-var TruthValue projection (single fixed edges)
-      for (const spec of edgeVarSpecs) {
-        const tv = edgeTv(as, spec, res.groundings[i])
-        if (tv) { rr[`${spec.var}.strength`] = tv.strength; rr[`${spec.var}.confidence`] = tv.confidence }
+      // …and, for the façade's `prop:` namespace, under the BARE name every query actually asks for.
+      // Projecting only the raw key meant `n.price` was never a key, so RETURN silently rendered the
+      // node id and WHERE silently dropped every row. The façade namespace wins a name collision.
+      for (const [pk, pv] of Object.entries(atom.values)) {
+        if (pv.kind === 'link' || !pk.startsWith(PROP_NS)) continue
+        const scalar = pv.value[0]
+        if (scalar !== undefined) rr[`${v}.${pk.slice(PROP_NS.length)}`] = scalar
       }
-      const key = JSON.stringify(rr)
-      if (!seen.has(key)) { seen.add(key); resolved.push(rr) }
-    })
+    }
+    // edge-var TruthValue projection (single fixed edges)
+    for (const spec of edgeVarSpecs) {
+      const tv = edgeTv(as, spec, g)
+      if (tv) { rr[`${spec.var}.strength`] = tv.strength; rr[`${spec.var}.confidence`] = tv.confidence }
+    }
+    const rowKey = JSON.stringify(rr)
+    if (!seen.has(rowKey)) { seen.add(rowKey); resolved.push(rr) }
+    return !streamable || resolved.length < rowBudget
   }
 
-  // WHERE filters (comparisons over resolved values). form/name → the `var` key (node name); every other
-  // property → the projected `var.prop` key (node Values or edge strength/confidence).
-  const key = (c: ColRef) => (c.prop && c.prop !== 'form' && c.prop !== 'name' ? `${c.var}.${c.prop}` : c.var)
+  // Slots are per NODE POSITION, but two positions may name the SAME variable
+  // (`MATCH (a:X) MATCH (a:Y)`), so resolve per VARIABLE: every label declared for it must hold, and
+  // two different identity pins on one variable are unsatisfiable.
+  const byVar = new Map<string, { labels: string[]; pins: Set<Handle> }>()
+  for (const s of slots) {
+    let e = byVar.get(s.irVar)
+    if (!e) { e = { labels: [], pins: new Set() }; byVar.set(s.irVar, e) }
+    if (s.label !== undefined) e.labels.push(s.label)
+    if (s.pinnedHandle !== undefined) e.pins.add(s.pinnedHandle)
+  }
+
+  for (const pattern of patterns) {
+    const res = findMatches(as, pattern)
+    const clauseBound = new Set(res.variables)
+    // What the clauses could not settle: an identity pin is a CONSTANT in the IR, so its variable is
+    // never bound (bind it here, and drop the pattern when the pinned atom does not exist); a node
+    // position no clause binds at all must be SCANNED — that is the `MATCH (n:Label)` case which
+    // compiled to zero clauses and which the matcher then satisfied with one empty binding.
+    let groundings: Grounding[] = res.groundings
+    const scanVars: { irVar: string; labels: string[] }[] = []
+    for (const [irVar, e] of byVar) {
+      const pin = e.pins.size === 1 ? e.pins.values().next().value as Handle : undefined
+      if (e.pins.size > 1 || (pin !== undefined && !as.getAtom(pin))) { groundings = []; break }
+      if (pin !== undefined) groundings = groundings.map((g) => ({ ...g, [irVar]: pin }))
+      else if (!clauseBound.has(irVar)) { scanVars.push({ irVar, labels: e.labels }); continue }
+      for (const label of e.labels) groundings = groundings.filter((g) => atomMatchesLabel(as, as.getAtom(g[irVar]!), label))
+    }
+    const candidates = scanVars.map((v) => {
+      let c = scanCandidates(as, v.labels[0])
+      for (const label of v.labels.slice(1)) c = c.filter((h) => atomMatchesLabel(as, as.getAtom(h), label))
+      return c
+    })
+    const walk = (i: number, g: Grounding): boolean => {
+      if (i === scanVars.length) return emit(g)
+      for (const h of candidates[i]!) {
+        if (++scanned > maxScan) {
+          throw new Error(`Cypher: node scan exceeded maxScan ${maxScan} candidates — narrow the pattern with a ` +
+            `label, a form pin or an edge, or raise maxScan (Sentinel bounded-traversal policy)`)
+        }
+        if (!walk(i + 1, { ...g, [scanVars[i]!.irVar]: h })) return false
+      }
+      return true
+    }
+    let more = true
+    for (const g of groundings) { if (!walk(0, g)) { more = false; break } }
+    if (!more) break
+  }
+
   // Anti-silent-wrong: node properties ARE projected above, so a real property filters correctly. But a
   // predicate on a property that exists on NO matched node would silently drop every row (0 results when the
   // true answer is non-empty). Detect that — across BOTH the flat filters and the boolean `where` tree — and
   // THROW rather than return a wrong empty set.
   if (resolved.length > 0) {
-    const projected = new Set(resolved.flatMap((r) => Object.keys(r)))
     const refs = [...ast.filters.map((f) => f.lhs), ...cmpLeaves(ast.where).map((c) => c.lhs)]
     for (const lhs of refs) {
-      if (!projected.has(key(lhs))) {
+      if (!resolved.some((r) => refValue(r, lhs) !== undefined)) {
         throw new Error(`Cypher unsupported: WHERE on node property '${lhs.var}.${lhs.prop}' — no matched node ` +
           `carries that property (refusing a silently-wrong empty result)`)
       }
@@ -459,21 +662,22 @@ export function runCypher(as: AtomSpace, query: string, params: Record<string, s
   }
   const evalW = (e: WExpr, r: RRow): boolean => {
     switch (e.t) {
-      case 'cmp': return cmp(r[key(e.lhs)], e.op, e.rhs)
+      case 'cmp': return cmp(refValue(r, e.lhs), e.op, e.rhs)
       case 'and': return evalW(e.l, r) && evalW(e.r, r)
       case 'or': return evalW(e.l, r) || evalW(e.r, r)
       case 'not': return !evalW(e.e, r)
     }
   }
-  let rows = ast.where
-    ? resolved.filter((r) => evalW(ast.where as WExpr, r))
-    : resolved.filter((r) => ast.filters.every((f) => cmp(r[key(f.lhs)], f.op, f.rhs)))
+  // Both lists always apply: `filters` also carries inline `{prop: value}` predicates, which an
+  // OR/NOT `where` tree must not shadow.
+  let rows = resolved.filter((r) => ast.filters.every((f) => cmp(refValue(r, f.lhs), f.op, f.rhs)))
+  if (ast.where) rows = rows.filter((r) => evalW(ast.where as WExpr, r))
 
   // ORDER BY
   if (ast.orderBy.length) {
     rows = [...rows].sort((a, b) => {
-      for (const { key: k, desc } of ast.orderBy) {
-        const c = compareVal(a[k], b[k])
+      for (const { ref, desc } of ast.orderBy) {
+        const c = compareVal(refValue(a, ref), refValue(b, ref))
         if (c !== 0) return desc ? -c : c
       }
       return 0
@@ -481,12 +685,14 @@ export function runCypher(as: AtomSpace, query: string, params: Record<string, s
   }
 
   // Projection + stringify
-  const outCols = ast.ret === '*'
+  const outRefs: { col: string; ref: ColRef }[] = ast.ret === '*'
     ? Array.from(new Set(resolved.flatMap((r) => Object.keys(r)).filter((k) => !k.includes('.'))))
-    : ast.ret.map((c) => (c.prop ? `${c.var}.${c.prop}` : c.var))
+        .map((c) => ({ col: c, ref: { var: c } }))
+    : ast.ret.map((c) => ({ col: c.prop ? `${c.var}.${c.prop}` : c.var, ref: c }))
+  const outCols = outRefs.map((c) => c.col)
   let outRows = rows.map((r) => {
     const o: Record<string, string> = {}
-    for (const c of outCols) { const v = r[c] ?? r[c.split('.')[0]]; o[c] = v === undefined ? '' : String(v) }
+    for (const { col, ref } of outRefs) { const v = refValue(r, ref); o[col] = v === undefined ? '' : String(v) }
     return o
   })
 

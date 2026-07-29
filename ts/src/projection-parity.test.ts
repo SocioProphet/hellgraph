@@ -18,6 +18,14 @@ import { runCypher } from './cypher'
  *
  * This suite pins the parity contract for graphs built VIA THE FAÇADE (the supported write path):
  *   façade (allNodes/allEdges/out) ⇄ triples() RDF view ⇄ SPARQL ⇄ Cypher must agree exactly.
+ *
+ * CONTRACT EXTENSION (0.4.45) — the surfaces must agree on what they RENDER, not only on what
+ * they say EXISTS. Tests (a)–(e) compared existence, membership and counts; every one of them
+ * passed while Cypher rendered `n.price` as the node id and `MATCH (n:MarketDataEvent)` as a
+ * single row of empty strings against 9,825 real production events. Existence parity cannot see a
+ * wrong VALUE, so (f) and (g) below compare the rendered value and the label set across all four
+ * surfaces. Any new projection surface must be added to (f)/(g), not only to (a)–(c).
+ *
  * It also characterizes the KNOWN-lossy directions so any change in the loss surface is loud:
  *   • raw AtomSpace links (e.g. InheritanceLink) do NOT project — by design; see kko.ts.
  *   • edge PROPERTIES do not appear in triples() — plain triples cannot carry edge attributes
@@ -93,6 +101,47 @@ test('(d) KNOWN-LOSSY direction: raw AtomSpace InheritanceLink does NOT project 
   g.addEdge('rdfs:subClassOf', 'cat', 'animal')
   assert.equal(g.edgeCount(), before.edges + 1)
   assert.equal(g.triples().filter((t) => t.subject === 'cat' && t.isIri).length, 1)
+})
+
+test('(f) RENDERED-VALUE parity: every node property renders identically on all four surfaces', () => {
+  const { g, as } = fixture()
+  const bindings = runSparql(g, 'SELECT ?s ?p ?o WHERE { ?s ?p ?o } LIMIT 1000').bindings
+  const sparqlValue = new Map(bindings.map((b) => [`${String(b['s'])} |${String(b['p'])}`, String(b['o'])]))
+  const tripleValue = new Map(g.triples().map((t) => [`${t.subject} |${t.predicate}`, String(t.object)]))
+
+  let compared = 0
+  for (const n of g.allNodes()) {
+    for (const [k, v] of Object.entries(n.properties)) {
+      const expected = String(v)                       // the façade's own report is ground truth
+      const col = `x.${k}`
+      const rows = runCypher(as, `MATCH (x:${n.labels[0]}) WHERE x.form = "${n.id}" RETURN ${col} LIMIT 5`).rows
+      assert.equal(rows.length, 1, `Cypher must return exactly one row for ${n.id}`)
+      assert.equal(rows[0]![col], expected, `Cypher renders ${n.id}.${k}`)
+      assert.equal(tripleValue.get(`${n.id} |${k}`), expected, `triples() renders ${n.id}.${k}`)
+      assert.equal(sparqlValue.get(`${n.id} |${k}`), expected, `SPARQL renders ${n.id}.${k}`)
+      compared++
+    }
+  }
+  assert.equal(compared, 4, 'alice.name, alice.age, bob.name, carol.name — all four actually compared')
+  // The trap this closes: `name` is BOTH a stored property ("Alice") and, for a node with no such
+  // property, the façade id. Whichever a surface renders, they must all render the SAME thing.
+  assert.equal(runCypher(as, 'MATCH (x:Person) WHERE x.form = "alice" RETURN x.name LIMIT 5').rows[0]!['x.name'], 'Alice')
+})
+
+test('(g) LABEL parity: every façade label is matchable in Cypher, SPARQL and the store', () => {
+  const { g, as } = fixture()
+  const labels = Array.from(new Set(g.allNodes().flatMap((n) => n.labels)))
+  assert.deepEqual(labels.sort(), ['Admin', 'Person'], 'fixture ground truth (carol is multi-label)')
+  for (const label of labels) {
+    const viaStore = g.nodesByLabel(label).map((n) => n.id).sort()
+    const viaCypher = runCypher(as, `MATCH (n:${label}) RETURN n LIMIT 100`).rows.map((r) => r['n']).sort()
+    const viaSparql = runSparql(g, `SELECT ?s WHERE { ?s ?p ?o FILTER(?p = "rdf:type" && ?o = "${label}") }`)
+      .bindings.map((b) => String(b['s'])).sort()
+    assert.deepEqual(viaCypher, viaStore, `Cypher label ${label} === store.nodesByLabel`)
+    assert.deepEqual(viaSparql, viaStore, `SPARQL rdf:type ${label} === store.nodesByLabel`)
+  }
+  assert.deepEqual(runCypher(as, 'MATCH (n:Admin) RETURN n LIMIT 100').rows, [{ n: 'carol' }],
+    'and the second label of a multi-label node is matchable on its own')
 })
 
 test('(e) PINNED PARITY GAP: edgeCount() counts a malformed EvaluationLink the projections refuse', () => {
