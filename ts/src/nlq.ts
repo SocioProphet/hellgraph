@@ -70,7 +70,8 @@ import {
 
 // ─── Vendored contract: sha-asserted at import ──────────────────────────────────
 
-type SchemaObj = Record<string, unknown>
+/** A parsed JSON Schema object. Exported with `validateAgainst`, which takes one. */
+export type SchemaObj = Record<string, unknown>
 
 /**
  * Keywords carrying validation semantics that `validateAgainst` implements. Anything else that could
@@ -84,7 +85,13 @@ const SUPPORTED_KEYWORDS = new Set([
 /** Pure annotations — no validation effect; safe to ignore. */
 const ANNOTATION_KEYWORDS = new Set(['$schema', '$id', 'title', 'description', 'default', 'examples'])
 
-function assertSupportedKeywords(schema: unknown, at: string): void {
+/**
+ * Assert a vendored schema uses only keywords `validateAgainst` implements. Exported because every
+ * vendored sourceos-spec contract in the engine (SemanticAction here, EffectRequest in
+ * `vendor-graph.ts`) must clear the same bar at import: a contract using an unimplemented keyword
+ * fails LOUDLY rather than silently validating less than it says.
+ */
+export function assertSupportedKeywords(schema: unknown, at: string): void {
   if (Array.isArray(schema)) { schema.forEach((v, i) => assertSupportedKeywords(v, `${at}[${i}]`)); return }
   if (schema === null || typeof schema !== 'object') return
   for (const [k, v] of Object.entries(schema as SchemaObj)) {
@@ -142,7 +149,14 @@ function isAbsoluteUri(s: string): boolean {
   return /^[A-Za-z][A-Za-z0-9+.-]*:[^\s]*$/.test(s)
 }
 
-function validateAgainst(schema: SchemaObj, value: unknown, at: string, errs: string[]): void {
+/**
+ * Validate `value` against the implemented 2020-12 subset of `schema`, appending violations to
+ * `errs`. Shared by every vendored-contract validator in the engine so there is ONE validation
+ * subset, guarded by ONE `assertSupportedKeywords` bar — never two that can drift apart.
+ * `format` is enforced for `uri` only; a contract relying on another `format` must check it
+ * explicitly at the call site (see `vendor-graph.ts` and `requestedAt`).
+ */
+export function validateAgainst(schema: SchemaObj, value: unknown, at: string, errs: string[]): void {
   const t = schema['type']
   if (typeof t === 'string') {
     const actual = jsonTypeOf(value)
