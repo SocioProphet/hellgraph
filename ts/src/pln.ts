@@ -14,6 +14,17 @@
  *     A→C (strong) + B→C (strong) + A,B not yet linked
  *     → A→B (conservative: s1*s2*0.4, c1*c2*0.4) — they might be related
  *
+ * Truth-value storage contract (0.4.41): a PLN truth value is a (strength,
+ * confidence) PAIR and both halves are persisted as separate edge properties.
+ *   read  — strength from properties['strength'], falling back to
+ *           properties['confidence'] then 0.5 (legacy edges carry only
+ *           'confidence', where the single number served as both halves);
+ *           confidence from properties['confidence'], falling back to 0.5.
+ *   write — every derived edge stores BOTH { strength, confidence }.
+ * Before 0.4.41 both halves were read from 'confidence' and derived edges
+ * wrote only 'confidence' = strength, collapsing the distinction at the
+ * storage boundary (s=s1·s2 and c=c1·c2·0.9 became indistinguishable).
+ *
  * The sidecar (OpenCog PLN) handles full URE-backed chaining with all rules.
  * This TypeScript path is the fast, in-process fallback for zero-latency inference.
  */
@@ -67,7 +78,10 @@ export function forwardChain(opts: PLNOptions = {}): PLNResult {
 
   for (const e of allEdges) {
     if (!adj.has(e.from)) adj.set(e.from, [])
-    const s = Number(e.properties['confidence'] ?? 0.5)
+    // Truth-value read contract: strength and confidence are DISTINCT stored
+    // properties. Legacy edges carry only 'confidence' (one number serving as
+    // both halves), so strength falls back to it before the 0.5 prior.
+    const s = Number(e.properties['strength'] ?? e.properties['confidence'] ?? 0.5)
     const c = Number(e.properties['confidence'] ?? 0.5)
     const src = String(e.properties['epistemicClass'] ?? 'unknown')
     adj.get(e.from)!.push({ to: e.to, s, c, sources: [src] })
@@ -104,7 +118,8 @@ export function forwardChain(opts: PLNOptions = {}): PLNResult {
         if (s_revised > best.s * 1.05 || c_revised > best.c * 1.05) {
           g.addEdge(CHAIN_EDGE, a, b, {
             epistemicClass: 'pln_revision',
-            confidence: Math.min(s_revised, 1),
+            strength:   Math.min(s_revised, 1),
+            confidence: c_revised,
             promotionState: 'inferred',
             createdAt: now(),
           })
@@ -139,7 +154,8 @@ export function forwardChain(opts: PLNOptions = {}): PLNResult {
 
           g.addEdge(CHAIN_EDGE, a, cc, {
             epistemicClass:  'pln_deduction',
-            confidence:      inferredS,
+            strength:        inferredS,
+            confidence:      inferredC,
             promotionState:  'inferred',
             createdAt:       now(),
           })
@@ -203,7 +219,8 @@ export function forwardChain(opts: PLNOptions = {}): PLNResult {
       if (abdS < MIN_STRENGTH) continue
       g.addEdge(CHAIN_EDGE, a, b, {
         epistemicClass: 'pln_abduction',
-        confidence: abdS,
+        strength:   abdS,
+        confidence: abdC,
         promotionState: 'candidate',
         sharedNeighbors: shared,
         createdAt: now(),
