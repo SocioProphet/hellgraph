@@ -23,7 +23,7 @@ test('rankAttributeRecommendations fuses three rankers into a proof-carrying rec
   assert.equal(rec.label, 'Person')
   assert.equal(rec.method, 'rrf(consistency,trust,probabilistic)')
   assert.equal(rec.peers, 2)                          // the two Employees (share 'name')
-  assert.deepEqual(rec.snapshot, { nodes: 6, edges: 3 })
+  assert.equal(rec.snapshot.nodes, 6); assert.equal(rec.snapshot.edges, 3); assert.ok(rec.snapshot.seq > 0)
   assert.match(rec.hash, /^sha256:[0-9a-f]{64}$/)     // proof-carrying
 
   const keys = rec.recommendations.map((r) => `${r.kind}:${r.key}`)

@@ -29,7 +29,8 @@ export interface ExplorationSuggestion {
 export interface Exploration {
   seeds: string[]
   method: string
-  snapshot: { nodes: number; edges: number }
+  /** `seq` = the store's monotonic logical clock — the receipt's real binding to graph state. */
+  snapshot: { seq: number; nodes: number; edges: number }
   suggestions: ExplorationSuggestion[]
   /** sha256 over the ranked suggestions + snapshot (proof-carrying). */
   hash: string
@@ -48,7 +49,7 @@ function sealed(rec: Omit<Exploration, 'hash'>): Exploration {
 /** Rank the nodes most worth exploring next from `seeds`, as a proof-carrying exploration. */
 export function exploreFrom(store: HellGraphStore, seeds: string[], opts: ExploreOptions = {}): Exploration {
   const topK = opts.topK ?? 10
-  const snapshot = { nodes: store.allNodes().length, edges: store.edgeCount() }
+  const snapshot = { seq: store.version(), nodes: store.allNodes().length, edges: store.edgeCount() }
   const seedSet = new Set(seeds)
 
   const ppr = personalizedPageRank(store, seeds)

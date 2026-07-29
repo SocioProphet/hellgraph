@@ -18,7 +18,7 @@ function fixture(): HellGraphStore {
 test('exploreFrom ranks graph-proximal nodes to explore next (proof-carrying)', () => {
   const ex = exploreFrom(fixture(), ['a'], { topK: 4 })
   assert.equal(ex.method, 'rrf(personalized-pagerank,seed-adjacency)')
-  assert.deepEqual(ex.snapshot, { nodes: 5, edges: 4 })
+  assert.equal(ex.snapshot.nodes, 5); assert.equal(ex.snapshot.edges, 4); assert.ok(ex.snapshot.seq > 0)
   assert.match(ex.hash, /^sha256:[0-9a-f]{64}$/)
   const ids = ex.suggestions.map((s) => s.id)
   assert.ok(!ids.includes('a'), 'the seed is excluded')

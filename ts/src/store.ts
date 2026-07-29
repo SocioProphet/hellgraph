@@ -278,6 +278,9 @@ export class HellGraphStore {
   nodeCount(): number { return this.as.getByType(ENTITY, false).length }
   edgeCount(): number { return this.as.getByType('EvaluationLink', false).length }
 
+  /** Monotonic mutation counter (the AtomSpace logical clock) — cheap cache key + receipt binding. */
+  version(): number { return this.as.logicalClock }
+
   orphanNodeCount(): number {
     let n = 0
     for (const atom of this.as.getByType(ENTITY, false)) {

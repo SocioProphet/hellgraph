@@ -59,8 +59,9 @@ export interface AttributeRecommendation {
   method: string
   /** Peer instances considered. */
   peers: number
-  /** Graph state the ranking was computed against — binds the receipt to a snapshot. */
-  snapshot: { nodes: number; edges: number }
+  /** Graph state the ranking was computed against. `seq` is the store's monotonic logical clock —
+   *  the real receipt binding (counts alone collide; the clock does not). */
+  snapshot: { seq: number; nodes: number; edges: number }
   recommendations: RankedAttribute[]
   /** sha256 over the ranked output + snapshot (proof-carrying). */
   hash: string
@@ -69,6 +70,8 @@ export interface AttributeRecommendation {
 export interface RankOptions {
   topK?: number
   minPeerCoverage?: number
+  /** Cap on peers scored (deterministic top-PageRank subset). Default 2000. */
+  maxPeers?: number
   /**
    * Maps a node id → its KKO type IRIs (e.g. via `mapEntityToKko`/`kkoTypesOf` or a stored type edge).
    * When supplied AND the class's instances carry KKO types, a 4th **coherence** ranker is fused in:
@@ -83,6 +86,18 @@ function sealed(rec: Omit<AttributeRecommendation, 'hash'>): AttributeRecommenda
   return { ...rec, hash }
 }
 
+// Version-keyed PageRank cache: pageRank over the whole store dominated enrich latency (~0.7s at 55k
+// nodes, recomputed EVERY call). The store's logical clock invalidates exactly when the graph mutates.
+const _prCache = new WeakMap<HellGraphStore, { v: number; pr: Map<string, number> }>()
+function cachedPageRank(store: HellGraphStore): Map<string, number> {
+  const v = store.version()
+  const hit = _prCache.get(store)
+  if (hit && hit.v === v) return hit.pr
+  const pr = pageRank(store)
+  _prCache.set(store, { v, pr })
+  return pr
+}
+
 /**
  * Rank candidate new attributes for `label` by fusing consistency + PageRank-trust + PLN-probabilistic
  * (+ an optional KKO **coherence** ranker when `kkoTypeOf` is supplied), returning a proof-carrying receipt.
@@ -91,13 +106,14 @@ export function rankAttributeRecommendations(store: HellGraphStore, label: strin
   const topK = opts.topK ?? 10
   const minPeerCoverage = opts.minPeerCoverage ?? 0.2
   const kkoTypeOf = opts.kkoTypeOf
-  const snapshot = { nodes: store.allNodes().length, edges: store.edgeCount() }
+  const maxPeers = opts.maxPeers ?? 2000
+  const snapshot = { seq: store.version(), nodes: store.allNodes().length, edges: store.edgeCount() }
 
   const own = profileClass(store, label)
   const ownCoverage = new Map(own.attributes.map((a) => [akey(a.kind, a.key), a.coverage]))
   const ownKeys = new Set(ownCoverage.keys())
   const classIds = new Set(store.nodesByLabel(label).map((n) => n.id))
-  const pr = pageRank(store)
+  const pr = cachedPageRank(store)
 
   // The class's ontological type: the KKO types its instances carry. Empty ⇒ coherence is inert.
   const classTypes = new Set<string>()
@@ -115,6 +131,12 @@ export function rankAttributeRecommendations(store: HellGraphStore, label: strin
     let shares = false
     for (const k of keys) if (ownKeys.has(k)) { shares = true; break }
     if (shares) peers.push({ id: node.id, keys, pr: pr.get(node.id) ?? 0 })
+  }
+  // Deterministic peer cap: coverage fractions stay meaningful while bounding the per-attribute
+  // scoring cost on huge graphs. Highest-PageRank peers kept (ties by id) — reproducible for receipts.
+  if (peers.length > maxPeers) {
+    peers.sort((a, b) => b.pr - a.pr || a.id.localeCompare(b.id))
+    peers.length = maxPeers
   }
   const nPeers = peers.length
   if (nPeers === 0) return sealed({ label, method, peers: 0, snapshot, recommendations: [] })
