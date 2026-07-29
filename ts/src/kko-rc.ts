@@ -15,6 +15,8 @@
  */
 import { parseTurtle } from './turtle'
 import type { HellGraphStore } from './store'
+import { HnswIndex } from './ann'
+import type { EmbedFn } from './semantic'
 import { KKO_NS } from './kko'
 
 export const RC_NS = 'http://kbpedia.org/kko/rc/'
@@ -154,8 +156,9 @@ export interface KkoMapping {
 
 /**
  * Map an estate entity's label to its KKO type by matching a reference concept, then rolling that RC up
- * to its KKO upper class(es). v1 is exact normalized-`prefLabel` match; embedding/altLabel matching is
- * the natural next layer. Pass a prebuilt `index` (from `buildRcLabelIndex`) when mapping many entities.
+ * to its KKO upper class(es). Exact normalized pref/altLabel match; for semantic (synonym/embedding)
+ * matching of misses, see `buildRcEmbeddingIndex` + `mapEntityToKkoSemantic`. Pass a prebuilt `index`
+ * (from `buildRcLabelIndex`) when mapping many entities.
  */
 export function mapEntityToKko(store: HellGraphStore, entity: string, index?: Map<string, string[]>): KkoMapping {
   const idx = index ?? buildRcLabelIndex(store)
@@ -165,4 +168,69 @@ export function mapEntityToKko(store: HellGraphStore, entity: string, index?: Ma
   const node = store.getNode(rc)
   const prefLabel = node && typeof node.properties['prefLabel'] === 'string' ? (node.properties['prefLabel'] as string) : null
   return { entity, matched: rc, prefLabel, kkoTypes: kkoTypesOf(store, rc), candidates: matches.length }
+}
+
+// ─── Semantic (embedding) mapping — recall beyond exact labels ──────────────────────────────────
+// Uses the engine's standard embedding contract (semantic.ts EmbedFn: EMBEDDINGS_URL / Ollama).
+
+export interface RcEmbeddingIndex {
+  hnsw: HnswIndex
+  /** RC IRIs actually embedded (labels with non-empty vectors). */
+  embedded: number
+}
+
+export interface SemanticKkoMapping extends KkoMapping {
+  /** 'exact' when the label index hit; 'semantic' when the embedding index resolved it; 'none' otherwise. */
+  via: 'exact' | 'semantic' | 'none'
+  /** Cosine similarity of the semantic match (present when via='semantic'). */
+  similarity?: number
+}
+
+/**
+ * Embed every reference concept's `prefLabel` into an HNSW index (id = RC IRI). This is the one-time
+ * data-prep step for semantic mapping — O(#RCs) embed calls, so batch/cache upstream as needed. Labels
+ * whose embedding fails (empty vector) are skipped, never faked.
+ */
+export async function buildRcEmbeddingIndex(store: HellGraphStore, embed: EmbedFn): Promise<RcEmbeddingIndex> {
+  const hnsw = new HnswIndex()
+  let embedded = 0
+  for (const node of store.nodesByLabel(RC_LABEL)) {
+    const pref = node.properties['prefLabel']
+    if (typeof pref !== 'string' || !pref) continue
+    const v = await embed(pref)
+    if (v.length === 0) continue
+    hnsw.add(node.id, v)
+    embedded++
+  }
+  return { hnsw, embedded }
+}
+
+/**
+ * Semantic entity→KKO mapping: exact label match first (free, precise); on a miss, embed the entity and
+ * take the nearest RC prefLabel above `minSimilarity` from the prebuilt embedding index. Falls back to a
+ * clean 'none' mapping — never a fabricated match.
+ */
+export async function mapEntityToKkoSemantic(
+  store: HellGraphStore,
+  entity: string,
+  embedIndex: RcEmbeddingIndex,
+  embed: EmbedFn,
+  opts: { minSimilarity?: number; labelIndex?: Map<string, string[]> } = {},
+): Promise<SemanticKkoMapping> {
+  const exact = mapEntityToKko(store, entity, opts.labelIndex)
+  if (exact.matched) return { ...exact, via: 'exact' }
+  const minSimilarity = opts.minSimilarity ?? 0.6
+  const qv = await embed(entity)
+  if (qv.length > 0 && embedIndex.embedded > 0) {
+    const [best] = embedIndex.hnsw.search(qv, 1)
+    if (best && best.score >= minSimilarity) {
+      const node = store.getNode(best.id)
+      const prefLabel = node && typeof node.properties['prefLabel'] === 'string' ? (node.properties['prefLabel'] as string) : null
+      return {
+        entity, matched: best.id, prefLabel, kkoTypes: kkoTypesOf(store, best.id),
+        candidates: 1, via: 'semantic', similarity: best.score,
+      }
+    }
+  }
+  return { ...exact, via: 'none' }
 }
