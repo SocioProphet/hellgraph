@@ -56,6 +56,16 @@ jobs:
         if: steps.changed.outputs.ts == 'true'
         run: npm run typecheck
 
+      # The TypeScript suite was never executed by ANY workflow: ci.yml runs
+      # `cargo test --workspace` (Rust only) and this job ran typecheck + build + a dist
+      # staleness check. 401 tests existed and nothing invoked them, so a TS regression
+      # could merge with every required check green — typecheck proves it COMPILES, not
+      # that it WORKS. Runs before the dist rebuild so a logic failure is reported as a
+      # test failure rather than surfacing later as a confusing dist diff.
+      - name: Test
+        if: steps.changed.outputs.ts == 'true'
+        run: npm test
+
       - name: Rebuild dist
         if: steps.changed.outputs.ts == 'true'
         run: npm run build
