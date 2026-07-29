@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto'
 import { AtomSpace, nodeHandle, linkHandle, type Atom, type Handle } from './atomspace'
 import { findMatches, V, N, L, type Pattern, type PatternTerm, type Grounding } from './patternMatcher'
+import { cloneDict, emptyDict, ownValue, toPlainRow } from './safe-dict.js'
 
 /**
  * Cypher Facade v0.1 — a human/agent-friendly READ query surface over the AtomSpace.
@@ -354,8 +355,10 @@ class Parser {
   }
 
   private resolveVal(tok: string): string {
-    if (tok === '$') return this.params[this.next()] ?? ''
-    if (tok?.startsWith('$')) return this.params[tok.slice(1)] ?? ''
+    // The parameter NAME is query-derived and `params` is caller-supplied, so an own-property
+    // read only: `$constructor` must be an unsupplied parameter, not Object.prototype.constructor.
+    if (tok === '$') return ownValue(this.params, this.next()) ?? ''
+    if (tok?.startsWith('$')) return ownValue(this.params, tok.slice(1)) ?? ''
     return unquote(tok)
   }
 }
@@ -565,7 +568,9 @@ export function runCypher(as: AtomSpace, query: string, params: Record<string, s
 
   // Build one output row from a complete grounding. Returns false when enough rows exist.
   const emit = (g: Grounding): boolean => {
-    const rr: RRow = {}
+    // Keyed by Cypher variable names and `var.prop` paths, all query-derived — null-prototype
+    // so a variable named `__proto__` is stored rather than swallowed (see safe-dict.ts).
+    const rr: RRow = emptyDict<string | number>()
     for (const [v, h] of Object.entries(g)) {
       if (v.startsWith('_')) continue
       const atom = as.getAtom(h)
@@ -622,7 +627,7 @@ export function runCypher(as: AtomSpace, query: string, params: Record<string, s
     for (const [irVar, e] of byVar) {
       const pin = e.pins.size === 1 ? e.pins.values().next().value as Handle : undefined
       if (e.pins.size > 1 || (pin !== undefined && !as.getAtom(pin))) { groundings = []; break }
-      if (pin !== undefined) groundings = groundings.map((g) => ({ ...g, [irVar]: pin }))
+      if (pin !== undefined) groundings = groundings.map((g) => { const n = cloneDict(g); n[irVar] = pin; return n })
       else if (!clauseBound.has(irVar)) { scanVars.push({ irVar, labels: e.labels }); continue }
       for (const label of e.labels) groundings = groundings.filter((g) => atomMatchesLabel(as, as.getAtom(g[irVar]!), label))
     }
@@ -638,7 +643,9 @@ export function runCypher(as: AtomSpace, query: string, params: Record<string, s
           throw new Error(`Cypher: node scan exceeded maxScan ${maxScan} candidates — narrow the pattern with a ` +
             `label, a form pin or an edge, or raise maxScan (Sentinel bounded-traversal policy)`)
         }
-        if (!walk(i + 1, { ...g, [scanVars[i]!.irVar]: h })) return false
+        const next = cloneDict(g)
+        next[scanVars[i]!.irVar] = h
+        if (!walk(i + 1, next)) return false
       }
       return true
     }
@@ -690,11 +697,15 @@ export function runCypher(as: AtomSpace, query: string, params: Record<string, s
         .map((c) => ({ col: c, ref: { var: c } }))
     : ast.ret.map((c) => ({ col: c.prop ? `${c.var}.${c.prop}` : c.var, ref: c }))
   const outCols = outRefs.map((c) => c.col)
-  let outRows = rows.map((r) => {
-    const o: Record<string, string> = {}
-    for (const { col, ref } of outRefs) { const v = refValue(r, ref); o[col] = v === undefined ? '' : String(v) }
-    return o
-  })
+  // Column names are query-derived (RETURN aliases). Materialize via toPlainRow so a hostile
+  // name lands as an own data property instead of hitting the inherited __proto__ setter and
+  // leaving a DECLARED column missing from every row.
+  let outRows = rows.map((r) =>
+    toPlainRow(outRefs.map(({ col, ref }) => {
+      const v = refValue(r, ref)
+      return [col, v === undefined ? '' : String(v)] as const
+    })),
+  )
 
   outRows = outRows.slice(0, Math.min(ast.limit ?? maxRows, maxRows))
   opts.onEvidence?.({ queryHash, space: as.id, mode: opts.mode ?? 'operational', columns: outCols, rowCount: outRows.length, evaluatedAtSeq: as.logicalClock, useSpace: ast.useSpace })

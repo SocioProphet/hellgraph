@@ -1,4 +1,5 @@
 import { AtomSpace, nodeHandle, type Atom, type Handle } from './atomspace'
+import { cloneDict, emptyDict } from './safe-dict.js'
 
 /**
  * Pattern Matcher — native hypergraph query over the AtomSpace.
@@ -46,7 +47,10 @@ export const L = (type: string, ...outgoing: PatternTerm[]): Extract<PatternTerm
 // ─── Matcher ───────────────────────────────────────────────────────────────────
 
 export function findMatches(as: AtomSpace, pattern: Pattern): MatchResult {
-  let groundings: Grounding[] = [{}]
+  // Null-prototype: pattern variable names reach here from Cypher query text, and on a plain
+  // object `'__proto__' in binding` below is spuriously true — unifyTerm would then compare the
+  // candidate handle against Object.prototype, fail, and drop every match (see safe-dict.ts).
+  let groundings: Grounding[] = [emptyDict<Handle>()]
 
   for (const clause of pattern.clauses) {
     const next: Grounding[] = []
@@ -103,7 +107,9 @@ function unifyTerm(as: AtomSpace, term: PatternTerm, handle: Handle, binding: Gr
         const atom = as.getAtom(handle)
         if (!atom || !as.types.isA(atom.type, term.type)) return null
       }
-      return { ...binding, [term.name]: handle }
+      const bound = cloneDict(binding)
+      bound[term.name] = handle
+      return bound
     }
     case 'node':
       return nodeHandle(term.type, term.name) === handle ? binding : null

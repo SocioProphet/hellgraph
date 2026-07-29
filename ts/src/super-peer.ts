@@ -36,6 +36,7 @@ import type { AuditSink } from './policy.js'
 import { Metrics } from './metrics.js'
 import { RateLimiter } from './rate-limit.js'
 import { loadOptionalDep as loadDep } from './optional-dep.js'
+import { sanitizeLogValue } from './log-safe.js'
 
 /** Per-route scope requirement (enforced only when an auth verifier is configured). */
 const ROUTE_SCOPE: Record<string, Scope> = {
@@ -312,9 +313,11 @@ export class SuperPeer {
       send(404, { error: 'not found' })
     } catch (err) {
       this.metrics?.inc('hellgraph_errors_total')
-      // Don't leak internal error/stack detail to the client (js/stack-trace-exposure);
-      // log a newline-stripped, bounded detail server-side (no CR/LF → no log-injection).
-      const detail = (err instanceof Error ? err.message : String(err)).replace(/[\r\n\t]+/g, ' ').slice(0, 500)
+      // Don't leak internal error/stack detail to the client (js/stack-trace-exposure); log a
+      // bounded, single-line detail server-side. The message is attacker-shaped — a SPARQL parse
+      // error embeds the offending token verbatim — so it goes through sanitizeLogValue, which
+      // neutralizes every line terminator and control sequence, not just CR/LF (js/log-injection).
+      const detail = sanitizeLogValue(err instanceof Error ? err.message : err)
       console.error('[super-peer] request error:', detail)
       send(500, { error: 'internal error' })
     }

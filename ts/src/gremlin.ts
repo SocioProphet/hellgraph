@@ -1,5 +1,12 @@
 import type { HellGraphStore } from './store'
 import type { GraphNode, GraphEdge, GremlinResult, PropertyValue } from './types'
+import { ownValue } from './safe-dict.js'
+
+/** Read a property whose KEY came from the traversal text. Own properties only: without this,
+ *  `values("constructor")` / `values("toString")` hand the caller inherited Object.prototype
+ *  FUNCTIONS as if they were stored graph data, and `has("constructor", …)` compares against
+ *  one (js/remote-property-injection — see safe-dict.ts). */
+const prop = (e: GraphNode | GraphEdge, key: string): PropertyValue | undefined => ownValue(e.properties, key)
 
 /**
  * A Gremlin/TinkerPop-style traversal engine over HellGraph's property graph.
@@ -29,7 +36,7 @@ export class GraphTraversal {
   }
 
   has(key: string, value: PropertyValue): GraphTraversal {
-    return this.derive(this.nodes().filter((n) => looseEq(n.properties[key], value)))
+    return this.derive(this.nodes().filter((n) => looseEq(prop(n, key), value)))
   }
 
   out(label?: string): GraphTraversal {
@@ -55,7 +62,7 @@ export class GraphTraversal {
   // ─── Terminal-ish steps ──────────────────────────────────────────────────
 
   values(key: string): GraphTraversal {
-    const out = this.current.map((t) => (isNode(t) || isEdge(t)) ? t.properties[key] : t).filter((v) => v !== undefined)
+    const out = this.current.map((t) => (isNode(t) || isEdge(t)) ? prop(t, key) : t).filter((v) => v !== undefined)
     return this.derive(out as Traverser[])
   }
 
@@ -77,8 +84,8 @@ export class GraphTraversal {
 
   order(key: string, desc = false): GraphTraversal {
     const sorted = [...this.current].sort((a, b) => {
-      const av = isNode(a) || isEdge(a) ? a.properties[key] : a
-      const bv = isNode(b) || isEdge(b) ? b.properties[key] : b
+      const av = isNode(a) || isEdge(a) ? prop(a, key) : a
+      const bv = isNode(b) || isEdge(b) ? prop(b, key) : b
       const an = Number(av), bn = Number(bv)
       const cmp = !Number.isNaN(an) && !Number.isNaN(bn) ? an - bn : String(av ?? '').localeCompare(String(bv ?? ''))
       return desc ? -cmp : cmp
