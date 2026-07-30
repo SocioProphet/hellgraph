@@ -46,7 +46,15 @@ jobs:
           fi
           base="${{ github.event.pull_request.base.sha }}"
           head="${{ github.event.pull_request.head.sha }}"
-          if git diff --name-only "$base" "$head" | grep -qE '^(package\.json|ts/)'; then
+          # Must include package-lock.json and THIS WORKFLOW, not just package.json and ts/**:
+          #   - a dependency bump can land entirely in the lockfile, and that is exactly the
+          #     change most likely to break the suite;
+          #   - a PR editing only ts-ci.yml previously skipped every step, so the workflow that
+          #     defines this gate was the one change the gate never ran on. This PR is that
+          #     shape: before this line was widened, the commit adding the Test step below had
+          #     it reported as `skipped`.
+          if git diff --name-only "$base" "$head" \
+             | grep -qE '^(package(-lock)?\.json|ts/|\.github/workflows/ts-ci\.yml)'; then
             echo "ts=true" >> "$GITHUB_OUTPUT"
           else
             echo "ts=false" >> "$GITHUB_OUTPUT"
@@ -65,6 +73,16 @@ jobs:
         if: steps.changed.outputs.ts == 'true'
         run: npm run typecheck
 
+      # The TypeScript suite was never executed by ANY workflow: ci.yml runs
+      # `cargo test --workspace` (Rust only) and this job ran typecheck + build + a dist
+      # staleness check. 401 tests existed and nothing invoked them, so a TS regression
+      # could merge with every required check green — typecheck proves it COMPILES, not
+      # that it WORKS. Runs before the dist rebuild so a logic failure is reported as a
+      # test failure rather than surfacing later as a confusing dist diff.
+      - name: Test
+        if: steps.changed.outputs.ts == 'true'
+        run: npm test
+
       - name: Rebuild dist
         if: steps.changed.outputs.ts == 'true'
         run: npm run build
@@ -81,7 +99,7 @@ jobs:
 
       - name: No TS/dist changes — required check trivially satisfied
         if: steps.changed.outputs.ts != 'true'
-        run: echo "This PR touches no package.json or ts/** files; build-and-verify-dist has nothing to verify."
+        run: echo "This PR touches no package.json, package-lock.json, ts/** or ts-ci.yml files; build-and-verify-dist has nothing to verify."
 
   # ── Vendored-ontology provenance (W12) ─────────────────────────────────────────────
   # ontology/kko/PROVENANCE.md recorded a sha256 that NOTHING verified. Consumers across the
