@@ -16,8 +16,17 @@ on:
     paths:
       - "package.json"
       - "ts/**"
+      - "ontology/**"
+      - "scripts/**"
       - ".github/workflows/ts-ci.yml"
   pull_request: {}
+
+# Both jobs only read the checkout and install from the public registry. Declared at workflow
+# level so a job added later inherits least-privilege instead of silently getting the default
+# write-scoped token (CodeQL actions/missing-workflow-permissions — which was already open
+# against this file on `main` for build-and-verify-dist, not just the new job below).
+permissions:
+  contents: read
 
 jobs:
   build-and-verify-dist:
