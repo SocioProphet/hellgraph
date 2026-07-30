@@ -16,8 +16,17 @@ on:
     paths:
       - "package.json"
       - "ts/**"
+      - "ontology/**"
+      - "scripts/**"
       - ".github/workflows/ts-ci.yml"
   pull_request: {}
+
+# Both jobs only read the checkout and install from the public registry. Declared at workflow
+# level so a job added later inherits least-privilege instead of silently getting the default
+# write-scoped token (CodeQL actions/missing-workflow-permissions — which was already open
+# against this file on `main` for build-and-verify-dist, not just the new job below).
+permissions:
+  contents: read
 
 jobs:
   build-and-verify-dist:
@@ -73,3 +82,20 @@ jobs:
       - name: No TS/dist changes — required check trivially satisfied
         if: steps.changed.outputs.ts != 'true'
         run: echo "This PR touches no package.json or ts/** files; build-and-verify-dist has nothing to verify."
+
+  # ── Vendored-ontology provenance (W12) ─────────────────────────────────────────────
+  # ontology/kko/PROVENANCE.md recorded a sha256 that NOTHING verified. Consumers across the
+  # estate (prophet-platform apps/owl-reasoner) pin the same digest and assert it at import, so
+  # the engine — the artifact's source of truth — was the one copy where drift went unnoticed.
+  # Runs on every PR (cheap, no path filter) so a re-vendor can never land unverified.
+  kko-provenance:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Install
+        run: npm install --no-audit --no-fund
+      - name: Verify vendored KKO provenance + generated kko-data.ts
+        run: npm run check:kko

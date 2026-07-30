@@ -1,0 +1,100 @@
+#!/usr/bin/env node
+/**
+ * KKO vendored-ontology provenance guard.
+ *
+ * ── Why this exists (W12 inventory hygiene, 2026-07) ─────────────────────────────────
+ * `ontology/kko/PROVENANCE.md` is the best provenance record in the estate — source, licence,
+ * version IRI, byte count, sha256. It is also, until this script, verified by NOTHING. The
+ * digest was a line in a Markdown file: correct, and connected to no check. Two consumers
+ * (prophet-platform's owl-reasoner and nugget-extractor's KKO type refs) pin the SAME digest and
+ * now assert it at import, so the engine — the artifact's source of truth — was the one copy
+ * where drift would have gone unnoticed.
+ *
+ * ── What it enforces ─────────────────────────────────────────────────────────────────
+ *   1. `ontology/kko/kko-2.10.n3` still hashes to the sha256 recorded in PROVENANCE.md, and is
+ *      still the recorded byte length. The doc is the source of the expectation, so the doc and
+ *      the artifact can never silently disagree.
+ *   2. PROVENANCE.md pins a COMMIT, not just a branch. `@ master` is a moving reference: re-run
+ *      the retrieval later and you may get different bytes while claiming the same provenance.
+ *   3. The generated `ts/src/kko-data.ts` is exactly what `scripts/gen-kko.mjs` produces from
+ *      that .n3 — i.e. the ontology the engine actually SHIPS derives from the vendored source.
+ *      A hand-edit to kko-data.ts, or a re-vendored .n3 without a regeneration, otherwise leaves
+ *      the runtime ontology silently diverged from the file whose provenance we publish.
+ *      (Same doctrine as this repo's existing ts/dist staleness gate — a generated artifact must
+ *      be reproducible from its source, or the source is not the source.)
+ *
+ * Read-only: it regenerates into memory and compares. It never writes ts/src.
+ *
+ * Run:  node --import tsx scripts/check-kko-provenance.mjs
+ */
+import { readFileSync } from 'node:fs'
+import { createHash } from 'node:crypto'
+import { fileURLToPath } from 'node:url'
+
+const die = (m) => { console.error(`✗ ${m}`); process.exit(1) }
+const url = (p) => fileURLToPath(new URL(p, import.meta.url))
+
+const n3Path = url('../ontology/kko/kko-2.10.n3')
+const mdPath = url('../ontology/kko/PROVENANCE.md')
+const dataPath = url('../ts/src/kko-data.ts')
+
+// ── 1) the artifact matches the digest ITS OWN provenance record declares ──
+const doc = readFileSync(mdPath, 'utf8')
+const declared = (doc.match(/\*\*SHA-256:\*\*\s*`([0-9a-f]{64})`/) || [])[1]
+if (!declared) die('ontology/kko/PROVENANCE.md does not declare a **SHA-256:** `<64hex>` — the record must state what the artifact should be')
+
+const bytes = readFileSync(n3Path)
+const actual = createHash('sha256').update(bytes).digest('hex')
+if (actual !== declared)
+  die(`vendored KKO TBox DRIFTED: sha256 ${actual} != ${declared} declared in ontology/kko/PROVENANCE.md.\n` +
+      `  This digest is pinned by consumers too (prophet-platform apps/owl-reasoner asserts it at import).\n` +
+      `  Re-vendor, then update PROVENANCE.md AND every consumer pin in the same change.`)
+
+const declaredBytes = Number(((doc.match(/\*\*Bytes:\*\*\s*([\d,]+)/) || [])[1] || '0').replace(/,/g, ''))
+if (declaredBytes && bytes.length !== declaredBytes)
+  die(`vendored KKO TBox is ${bytes.length} bytes, PROVENANCE.md declares ${declaredBytes}`)
+
+// ── 2) the source must be PINNED, not a moving branch ref ──
+// NB: search for the commit pin only AFTER removing the sha256 from the text. A naive
+// /[0-9a-f]{40}/ over the whole document matches a 40-char window INSIDE the 64-char sha256 —
+// the check would have been satisfied by the very digest it is supposed to be independent of.
+// (A checker that validates itself validates nothing; this repo's estate has been bitten by
+// exactly that shape before.)
+const withoutDigest = doc.split(declared).join('')
+const commitPin = (withoutDigest.match(/\b([0-9a-f]{40})\b/) || [])[1]
+if (!commitPin)
+  die('ontology/kko/PROVENANCE.md pins no commit sha. "@ master" is a MOVING reference — the same ' +
+      'retrieval later can return different bytes and still claim this provenance. Pin the commit.')
+for (const needle of ['SocioProphet/kbpedia', 'CC-BY-4.0'])
+  if (!doc.includes(needle)) die(`ontology/kko/PROVENANCE.md does not record ${needle}`)
+
+// ── 3) the SHIPPED ontology is reproducible from the vendored source ──
+// Imported lazily and by URL so this file stays plain .mjs; needs `node --import tsx`.
+const { parseKko } = await import('../ts/src/kko.ts')
+const onto = parseKko(bytes.toString('utf8'))
+onto.classes.sort((a, b) => a.iri.localeCompare(b.iri))   // same deterministic order gen-kko.mjs uses
+
+const rows = onto.classes
+  .map((c) => {
+    const label = c.label !== undefined ? `, label: ${JSON.stringify(c.label)}` : ''
+    return `  { iri: ${JSON.stringify(c.iri)}${label}, subClassOf: ${JSON.stringify(c.subClassOf)} },`
+  })
+  .join('\n')
+
+const expected = `// GENERATED by scripts/gen-kko.mjs from ontology/kko/kko-2.10.n3 — do not edit by hand.
+// KKO ${onto.version} · ${onto.classes.length} classes. Regenerate after re-vendoring KKO.
+import type { KkoClass } from './kko'
+
+export const KKO_VERSION = ${JSON.stringify(onto.version)}
+export const KKO_CLASSES: KkoClass[] = [
+${rows}
+]
+`
+
+if (readFileSync(dataPath, 'utf8') !== expected)
+  die('ts/src/kko-data.ts is NOT what scripts/gen-kko.mjs produces from ontology/kko/kko-2.10.n3.\n' +
+      '  The ontology the engine ships has diverged from the vendored file whose provenance we publish.\n' +
+      "  Run: node --import tsx scripts/gen-kko.mjs   then commit ts/src/kko-data.ts")
+
+console.log(`✓ KKO provenance verified — ${actual.slice(0, 16)}… (${bytes.length.toLocaleString()} bytes), ` +
+            `${onto.classes.length} classes ${onto.version}; ts/src/kko-data.ts reproduces from source`)
