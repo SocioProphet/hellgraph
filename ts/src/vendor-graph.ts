@@ -367,6 +367,7 @@ export function ingestVendorFreshness(
   const seenArtifact = new Set<string>()
   const seenApp = new Set<string>()
   const seenContract = new Set<string>()
+  const seenRelease = new Set<string>()
 
   const ensureRepo = (repo: string, url?: string, workspaceBinding?: string): string => {
     const id = vfpId.repository(repo)
@@ -410,12 +411,21 @@ export function ingestVendorFreshness(
         stats.artifacts++
       }
 
+      // Gated like every other counter. `stats.releases++` was unguarded, so it counted manifest
+      // LINES while `artifacts`, `contracts`, `repositories` and `consumerApps` counted NODES
+      // CREATED — and a register that declares the same release twice (two entries for one
+      // `source_id`, the ordinary way a fork is written) made the two disagree with no way for a
+      // caller to tell which question it had asked. First declaration wins, as it already does for
+      // artifacts; the `releasedAs` edge is still drawn either way.
       const releaseId = vfpId.release(sourceId, version)
-      const rProps: Record<string, PropertyValue> = { version, sourceId }
-      put(rProps, 'observedAt', field<string>(r, 'observedAt'))
-      store.addNode(releaseId, [VFP.Release], rProps)
+      if (!seenRelease.has(releaseId)) {
+        seenRelease.add(releaseId)
+        const rProps: Record<string, PropertyValue> = { version, sourceId }
+        put(rProps, 'observedAt', field<string>(r, 'observedAt'))
+        store.addNode(releaseId, [VFP.Release], rProps)
+        stats.releases++
+      }
       store.addEdge(VFP_EDGE.releasedAs, artifactId, releaseId)
-      stats.releases++
 
       // Contract changes: DECLARED on the release, and mirrored onto the artifact as a
       // `changesContract` property so the risk question never has to guess from version numbers.
@@ -473,8 +483,17 @@ export function ingestVendorFreshness(
       const aProps: Record<string, PropertyValue> = { artifactId: `${sourceId}@${version}`, version, sourceId }
       put(aProps, 'digest', field<string>(a, 'vendoredDigest'))
       store.addNode(pinnedArtifactId, [VFP.Artifact], aProps)
+      // Only if the source actually declares a repo. `?? ''` built `vfp:repo/` — an edge to the
+      // empty repository id, whose target node the source loop never created because it skips
+      // sources with no `repo`. A dangling edge is worse here than a missing one: `store.in()` on
+      // that id is a query anyone can run, and the graph's claim is that receipts derive from it.
+      // Routed through `ensureRepo` so the target is guaranteed to exist rather than assumed to.
       const src = sources.find((s) => field<string>(s, 'sourceId') === sourceId)
-      if (src) store.addEdge(VFP_EDGE.producedBy, pinnedArtifactId, vfpId.repository(field<string>(src, 'repo') ?? ''))
+      const srcRepo = src ? field<string>(src, 'repo') ?? '' : ''
+      if (src && srcRepo) {
+        const producerId = ensureRepo(srcRepo, field<string>(src, 'url'), field<string>(src, 'workspaceBinding'))
+        store.addEdge(VFP_EDGE.producedBy, pinnedArtifactId, producerId)
+      }
       stats.artifacts++
     } else if (field<string>(a, 'vendoredDigest')) {
       store.setNodeProperty(pinnedArtifactId, 'digest', field<string>(a, 'vendoredDigest')!)
@@ -509,11 +528,154 @@ export function ingestVendorFreshness(
   return stats
 }
 
+// ─── Version precedence ─────────────────────────────────────────────────────────
+
+/**
+ * Compare two version strings by RELEASE PRECEDENCE. Returns <0, 0, >0 for `a` before, equal to,
+ * or after `b`, so it drops straight into `Array.prototype.sort`.
+ *
+ * The default `.sort()` is ASCII, and ASCII ranks `0.4.9` above `0.4.46` — not a hypothetical, this
+ * engine is at 0.4.46. It also ranks the literal `unknown` and any commit sha above every real
+ * release, because letters sort above digits, and this graph holds both: a pin may name a version
+ * the release history does not list, and that artifact is a head like any other.
+ *
+ * **The ordering is TOTAL and documented, because an undocumented tie-break is how this class of
+ * bug comes back.** In order of application:
+ *
+ *  1. **Shape.** A version is *release-shaped* if it is an optional `v`, then dot-separated runs of
+ *     digits, then an optional `-prerelease`, then an optional `+build`. Everything else — commit
+ *     shas, dates, `unknown`, the empty string — is **not a release** and sorts BELOW every
+ *     release-shaped version. Two non-release strings compare by ASCII between themselves. This is
+ *     the rule that stops `unknown` from being proposed as the next release to cut.
+ *  2. **Release components, numerically**, left to right. A missing component is `0`, so `0.4` and
+ *     `0.4.0` name the same release (and `0.4` precedes `0.4.1`). Compared as digit strings rather
+ *     than via `Number`, so precision does not silently collapse two distinct versions into a tie.
+ *  3. **Prerelease loses to the release** (semver §11): `1.0.0-rc.1` precedes `1.0.0`.
+ *  4. **Between two prereleases**, semver §11 identifier precedence: dot-separated identifiers
+ *     left to right; all-digit identifiers compare numerically and rank BELOW alphanumeric ones;
+ *     alphanumeric identifiers compare by ASCII; a prefix ranks below a longer identifier list, so
+ *     `rc.1` precedes `rc.1.1`. Deliberately NOT ASCII on the whole suffix, which would put
+ *     `rc.10` below `rc.2` and reintroduce the very defect this function exists to remove.
+ *  5. **Build metadata is ignored** for precedence (semver §10).
+ *  6. **Final tie-break: ASCII on the raw string**, so **`compareVersions` returns `0` only for
+ *     two identical strings.** Versions that name the same release but are written differently —
+ *     `0.4` and `0.4.0`, `1.0.0` and `v1.0.0`, `1.0.0+a` and `1.0.0+b` — tie under rules 1–5 and
+ *     are then ordered by their raw text. That is the deliberate choice: an unresolved tie makes a
+ *     sort's output depend on the input order, and the result of this sort is sealed into a
+ *     receipt that has to be re-derivable from the graph alone. Equal precedence, ordered anyway.
+ */
+export function compareVersions(a: string, b: string): number {
+  const ascii = (x: string, y: string): number => (x < y ? -1 : x > y ? 1 : 0)
+  const pa = parseVersion(a)
+  const pb = parseVersion(b)
+
+  // (1) Non-releases sort below every release.
+  if (pa === undefined || pb === undefined) {
+    if (pa === undefined && pb === undefined) return ascii(a, b)
+    return pa === undefined ? -1 : 1
+  }
+
+  // (2) Release components, numerically, missing ⇒ 0.
+  const components = Math.max(pa.release.length, pb.release.length)
+  for (let i = 0; i < components; i++) {
+    const d = compareNumericIds(pa.release[i] ?? '0', pb.release[i] ?? '0')
+    if (d !== 0) return d
+  }
+
+  // (3) Same release: a prerelease ranks below the release it leads to.
+  if (pa.prerelease === undefined || pb.prerelease === undefined) {
+    if (pa.prerelease === undefined && pb.prerelease === undefined) return ascii(a, b) // (5)(6)
+    return pa.prerelease === undefined ? 1 : -1
+  }
+
+  // (4) Both prereleases: semver §11 identifier precedence.
+  const ids = Math.max(pa.prerelease.length, pb.prerelease.length)
+  for (let i = 0; i < ids; i++) {
+    const x = pa.prerelease[i]
+    const y = pb.prerelease[i]
+    if (x === undefined) return -1 // a shorter identifier list ranks below a longer one
+    if (y === undefined) return 1
+    const xNum = isDigits(x)
+    const yNum = isDigits(y)
+    if (xNum !== yNum) return xNum ? -1 : 1 // numeric identifiers rank below alphanumeric
+    const d = xNum ? compareNumericIds(x, y) : ascii(x, y)
+    if (d !== 0) return d
+  }
+  return ascii(a, b) // (6)
+}
+
+/** A version split into the parts that decide precedence. `prerelease` absent ⇒ a plain release. */
+interface ParsedVersion {
+  /** Dot-separated numeric components, kept as digit strings so comparison stays exact. */
+  release: string[]
+  prerelease: string[] | undefined
+}
+
+const isDigits = (s: string): boolean => {
+  if (s.length === 0) return false
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i)
+    if (c < 48 || c > 57) return false
+  }
+  return true
+}
+
+/** Compare two all-digit identifiers exactly: leading zeros dropped, then length, then ASCII. */
+function compareNumericIds(x: string, y: string): number {
+  let i = 0
+  let j = 0
+  while (i < x.length - 1 && x.charCodeAt(i) === 48) i++
+  while (j < y.length - 1 && y.charCodeAt(j) === 48) j++
+  const sx = x.slice(i)
+  const sy = y.slice(j)
+  if (sx.length !== sy.length) return sx.length < sy.length ? -1 : 1
+  return sx < sy ? -1 : sx > sy ? 1 : 0
+}
+
+/**
+ * Parse a version into release components and prerelease identifiers, or `undefined` if it is not
+ * release-shaped.
+ *
+ * Hand-scanned rather than matched with a regex, deliberately: these strings come from the vendor
+ * register, `slug()` in this same file already had a CodeQL `js/polynomial-redos` finding on a
+ * register-supplied value, and a nested-quantifier version pattern is the textbook way to earn a
+ * second one. This scan is linear and cannot backtrack.
+ */
+function parseVersion(raw: string): ParsedVersion | undefined {
+  let s = raw
+  if (s.charCodeAt(0) === 118 /* v */) s = s.slice(1)
+  const plus = s.indexOf('+')
+  if (plus !== -1) s = s.slice(0, plus) // build metadata is not part of precedence
+  const dash = s.indexOf('-')
+  const core = dash === -1 ? s : s.slice(0, dash)
+  const pre = dash === -1 ? undefined : s.slice(dash + 1)
+  if (core.length === 0) return undefined
+
+  const release = core.split('.')
+  for (const component of release) if (!isDigits(component)) return undefined
+
+  if (pre === undefined) return { release, prerelease: undefined }
+  const prerelease = pre.split('.')
+  // An empty identifier (`1.0.0-`, `1.0.0-a..b`) is not a legal prerelease, so the string is not
+  // release-shaped at all — better a documented non-release than a silent partial parse.
+  for (const id of prerelease) if (id.length === 0) return undefined
+  return { release, prerelease }
+}
+
 // ─── Graph readers (pure) ───────────────────────────────────────────────────────
 
 const str = (v: PropertyValue | undefined): string | undefined => (typeof v === 'string' ? v : undefined)
 
-/** Walk `vfp:supersededBy` forward from `artifactNodeId`, longest path, cycle-safe. */
+/**
+ * Walk `vfp:supersededBy` forward from `artifactNodeId`, cycle-safe.
+ *
+ * On a fork this takes the LOWEST NEXT NODE ID — not the longest path, which is what this
+ * docstring used to claim while the code two lines below did, and said it did, something else.
+ * Lowest-id is the correct rule and the deliberate one: the walk has to be replayable from the
+ * graph alone or the receipt it feeds cannot be re-derived, and "longest" is not decidable in one
+ * forward pass anyway. The consequence is that the chain is the deterministic branch, not
+ * necessarily the deepest one, and `releaseDistance` counts hops along it.
+ */
 function supersessionChain(store: HellGraphStore, artifactNodeId: string): string[] {
   const chain: string[] = []
   const seen = new Set<string>([artifactNodeId])
@@ -1049,12 +1211,21 @@ export function analyzeVendorFreshness(store: HellGraphStore, opts: AnalyzeOptio
   })
 }
 
-/** The newest version this repository has released, per the graph. Read-only. */
+/**
+ * The newest version this repository has released, per the graph. Read-only.
+ *
+ * A repository can produce several artifacts — this one produces an npm package and a Rust crate —
+ * so the head set routinely holds more than one candidate and they have to be RANKED. Ranked by
+ * `compareVersions`, never by `.sort()`: ASCII put `0.4.9` ahead of `0.4.46`, and put a pin's
+ * commit sha or the literal `unknown` ahead of every real release. This value is handed to
+ * `blastRadiusOf` as `proposedVersion`, so getting it wrong misnames the release in every
+ * blast-radius report the analysis seals.
+ */
 function newestReleasedVersion(store: HellGraphStore, repository: string): string {
   const repoNodeId = vfpId.repository(repository)
   const produced = store.in(repoNodeId, VFP_EDGE.producedBy)
   // The newest artifact is the one nothing supersedes.
   const heads = produced.filter((a) => store.out(a.id, VFP_EDGE.supersededBy).length === 0)
-  const versions = heads.map((a) => str(a.properties['version']) ?? '').filter(Boolean).sort()
+  const versions = heads.map((a) => str(a.properties['version']) ?? '').filter(Boolean).sort(compareVersions)
   return versions[versions.length - 1] ?? 'unknown'
 }
