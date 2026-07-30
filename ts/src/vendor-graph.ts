@@ -1228,9 +1228,19 @@ export interface VendorFreshnessAnalysis {
   risks: ContractCrossingRisk[]
   /** Blast radius per producing repository, sorted by repo name. */
   blastRadius: BlastRadiusReport[]
-  /** Pins whose DECLARED disposition contradicts the DERIVED state — the only hard violation. */
+  /** Pins whose DECLARED disposition contradicts the DERIVED state. */
   dispositionViolations: string[]
-  /** Re-vendor proposals. Emitted, never executed; empty unless `requestedAt` is supplied. */
+  /**
+   * Proposals WITHHELD because they did not validate against the vendored contract, as
+   * `${pinKey}: ${violation}`. `RevendorProposal.contractViolations` says a violating proposal is
+   * not emitted; this is where the ones that were not emitted are named, so the withholding is
+   * visible in the seal instead of being a silent omission.
+   */
+  contractViolations: string[]
+  /**
+   * Re-vendor proposals. Emitted, never executed; empty unless `requestedAt` is supplied.
+   * Contains only proposals that validated — see `contractViolations` for the rest.
+   */
   proposals: RevendorProposal[]
   /** sha256 over everything above (proof-carrying). */
   hash: string
@@ -1286,7 +1296,7 @@ export function analyzeVendorFreshness(store: HellGraphStore, opts: AnalyzeOptio
   const dispositionViolations = pins.filter((p) => !p.dispositionAgrees)
     .map((p) => `${p.pinKey}: declared '${p.disposition}' but derived '${p.freshnessState}' (${p.rationale})`)
 
-  const proposals = opts.requestedAt === undefined ? [] : pins
+  const candidates = opts.requestedAt === undefined ? [] : pins
     .filter((p) => p.freshnessState === 'stale')
     .map((p) => {
       const repo = store.out(store.out(p.pinId, VFP_EDGE.pinnedAt)[0]?.id ?? '', VFP_EDGE.producedBy)[0]
@@ -1298,6 +1308,26 @@ export function analyzeVendorFreshness(store: HellGraphStore, opts: AnalyzeOptio
       })
     })
 
+  // `RevendorProposal.contractViolations` has always said "non-empty means the proposal is NOT
+  // emitted". Nothing implemented that sentence: every candidate was sealed regardless, and the
+  // array had no reader anywhere in the repo — no branch, no `.length`, no throw. A violation
+  // sealed into a receipt nobody reads is worse than no check, because the receipt then carries
+  // evidence that the system looked.
+  //
+  // So the declared rule is now the actual rule: a violating proposal is WITHHELD, and its
+  // violations are named at the top level the way `dispositionViolations` already is. Withholding
+  // alone would be a silent drop, and naming alone would leave a consumer free to act on a
+  // proposal the contract says was never emitted; it takes both.
+  //
+  // Reported, not thrown. `analyzeVendorFreshness` is documented PURE and deterministic, and one
+  // malformed pin must not destroy the verdicts for every other pin in the run — the same reason
+  // `dispositionViolations` is a list and not an exception. The engine proposes; a membrane gate
+  // outside it decides.
+  const proposals = candidates.filter((p) => p.contractViolations.length === 0)
+  const contractViolations = candidates
+    .filter((p) => p.contractViolations.length > 0)
+    .flatMap((p) => p.contractViolations.map((v) => `${p.effectRequest.target.identifier}: ${v}`))
+
   return sealed({
     method: METHOD,
     contract: { ...EFFECT_REQUEST_CONTRACT },
@@ -1306,6 +1336,7 @@ export function analyzeVendorFreshness(store: HellGraphStore, opts: AnalyzeOptio
     risks,
     blastRadius,
     dispositionViolations,
+    contractViolations,
     proposals,
   })
 }
