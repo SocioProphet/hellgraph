@@ -43,16 +43,56 @@
  *
  *   R4  Coverage assertions, so the gate cannot quietly stop covering things:
  *       every canonical surface still exists, every tracked type name still resolves to a
- *       declaration, and the guarded set is non-empty.
+ *       declaration, the graph property bag is still called `properties`, and the guarded
+ *       set is non-empty.
+ *
+ *   R5  The READ mode. A COMPUTED-key READ off an object that carries Object.prototype:
+ *       `props[key]` returns inherited FUNCTIONS, so `g.V().values("constructor")` really
+ *       does hand back the Object constructor as if it were stored graph data, and
+ *       `has("constructor", …)` compares against one. That was gremlin.ts's half of the
+ *       original CodeQL alert (js/remote-property-injection) and R1–R4 scored gremlin.ts
+ *       ZERO both before and after the fix.
+ *
+ *       R5 is ORIGIN-DIRECTED, not "any computed read" — the four guarded surfaces contain
+ *       57 computed element accesses and almost all of them are array indexing
+ *       (`tokens[pos]`, `row[i]`) or reads off dictionaries R3 already guarantees are
+ *       null-prototype (`binding[term.name]`). Flagging those would be 57 false positives
+ *       and one switched-off gate. Two base forms are flagged, both provenance-known:
+ *
+ *         (a) `<expr>.properties[k]` — the graph's own property bag. `GraphNode.properties`
+ *             and `GraphEdge.properties` (types.ts) are `Record<string, PropertyValue>`
+ *             built by `store.addNode()` from a caller-supplied object literal, so they
+ *             carry Object.prototype, and their KEYS arrive in query text. This is the
+ *             gremlin.ts pattern, verbatim.
+ *         (b) an identifier whose construction R1 already tracks as plain-prototype (`{}`,
+ *             `Object.assign({}, …)`, `Object.fromEntries(…)`, `toPlainRow(…)`), read with
+ *             a computed key. Same scope machinery as R1, so aliasing, casts and deferred
+ *             assignment do not launder a read any more than they launder a write.
+ *
+ *       Literal keys are trusted, exactly as in R1. Assignment TARGETS belong to R1, so the
+ *       two rules never double-report the same node. The fix is `ownValue(bag, key)` — a
+ *       CALL, not an element access, so fixed code stops matching the rule instead of
+ *       needing an exemption from it. There is no allowlist.
  *
  * ── What this does NOT catch (read this before trusting it) ──────────────────────────
  * A floor under the convention, not a proof of it. Known holes, roughly by likelihood:
  *
- *   · The READ mode. `props[key]` off a normal-prototype object returns inherited FUNCTIONS
- *     (`values("constructor")` really does hand back the Object constructor). That was
- *     gremlin.ts's half of the CodeQL alert, and this gate scores gremlin.ts CLEAN both
- *     before and after that fix — a dynamic read is indistinguishable from a legitimate one
- *     without knowing the object's provenance. `ownValue()` there is still only a convention.
+ *   · R5's bag set is ONE MEMBER NAME, `.properties`. It is the only untrusted-keyed,
+ *     prototype-bearing bag in this engine's type surface, and R4 fails loudly if it is
+ *     renamed — but a NEW such bag under a different name is not covered until it is added
+ *     here. `atom.values[…]` is deliberately not in the set: it is an Atom's Value map, read
+ *     with source-fixed constants, not with names off the wire.
+ *   · R5 says nothing about a computed read off a bag reached through a FUNCTION PARAMETER
+ *     typed `Record<string, …>`. Provenance is unknown there — the caller may have passed a
+ *     null-prototype dictionary — and guessing in either direction is worse than the stated
+ *     gap. R3 is the compensating control: a parameter typed as a tracked dictionary is
+ *     guaranteed null-prototype at every construction site, so reading it computed is safe.
+ *   · R5 does not chase a bag through a local alias of a MEMBER access:
+ *     `const p = node.properties; p[key]` is form (b) with an origin R1 does not record,
+ *     because `node.properties` is not one of the tracked constructors. `p` would have to be
+ *     seeded from `{}` for R5 to see it. The direct `node.properties[key]` — the shape the
+ *     alert was actually about, and the shape the fluent traversal code naturally writes —
+ *     IS caught.
  *   · The `in` mode. `'__proto__' in binding` on a prototype-bearing object is not detected.
  *   · Laundering across a function boundary. R1 is intra-procedural: pass `{}` to a helper
  *     that performs the computed write and neither end is flagged on its own. In practice
@@ -97,6 +137,21 @@ const TRACKED_TYPE_HOMES = {
   RRow: 'cypher.ts',
   SafeDict: 'safe-dict.ts',
 }
+
+/**
+ * Member names that hold an untrusted-keyed bag on an object WITH Object.prototype — the base
+ * of a computed read that R5 flags.
+ *
+ * `properties` is the graph's own bag: `GraphNode.properties` / `GraphEdge.properties` are
+ * `Record<string, PropertyValue>` (types.ts), materialized by `store.addNode()` from a
+ * caller-supplied object literal, and keyed by names that arrive in query text —
+ * `g.V().values(k)`, `has(k, v)`, `order(k)`. Kept to the one name deliberately: this is a
+ * NAME-keyed rule and a name-keyed rule that guesses is a false-positive generator.
+ */
+const PROTO_BEARING_BAGS = new Set(['properties'])
+
+/** Where each bag must still be declared — a rename must break R5 loudly, not silently. */
+const BAG_HOMES = { properties: { file: 'types.ts', owners: ['GraphNode', 'GraphEdge'] } }
 
 /**
  * Expressions that yield an object WITH Object.prototype. A computed-key assignment onto one
@@ -193,6 +248,24 @@ function isLiteralKey(node) {
                     (ts.isPrefixUnaryExpression(node) && ts.isNumericLiteral(node.operand)))
 }
 
+/**
+ * Is this element access being WRITTEN rather than read? R1 owns writes; R5 owns reads, and
+ * the two must not both report the same node. Covers `o[k] = v`, `o[k] += v`, `o[k]++` and
+ * `delete o[k]` — everything that is not a value-producing read.
+ */
+function isAssignmentTarget(node) {
+  const p = node.parent
+  if (!p) return false
+  if (ts.isBinaryExpression(p) && p.left === node &&
+      (p.operatorToken.kind === ts.SyntaxKind.EqualsToken ||
+       (p.operatorToken.kind >= ts.SyntaxKind.FirstCompoundAssignment &&
+        p.operatorToken.kind <= ts.SyntaxKind.LastCompoundAssignment))) return true
+  if ((ts.isPostfixUnaryExpression(p) || ts.isPrefixUnaryExpression(p)) && p.operand === node) {
+    return p.operator === ts.SyntaxKind.PlusPlusToken || p.operator === ts.SyntaxKind.MinusMinusToken
+  }
+  return ts.isDeleteExpression(p)
+}
+
 const OPENS_SCOPE = (n) =>
   ts.isSourceFile(n) || ts.isBlock(n) || ts.isModuleBlock(n) || ts.isCaseBlock(n) ||
   ts.isForStatement(n) || ts.isForOfStatement(n) || ts.isForInStatement(n) ||
@@ -281,6 +354,32 @@ export function scanSource(fileName, text) {
       }
     }
 
+    // ── R5: computed-key READ off a normal-prototype object ──────────────────────────
+    // Origin-directed, like R1. Two base forms, both with KNOWN provenance:
+    //   (a) `<expr>.properties[k]`  — the graph's property bag (PROTO_BEARING_BAGS)
+    //   (b) `o[k]` where `o` is a binding R1 already tracks as plain-prototype
+    // Reads only: an assignment target is R1's, so the two never report the same node.
+    if (ts.isElementAccessExpression(node) && !isLiteralKey(node.argumentExpression) &&
+        !isAssignmentTarget(node)) {
+      const base = unwrap(node.expression)
+      let what = null
+      if (base && ts.isPropertyAccessExpression(base) && PROTO_BEARING_BAGS.has(base.name.text)) {
+        what = `\`${base.getText(sf).slice(0, 40)}\` is a \`.${base.name.text}\` bag — ` +
+          `built from an object literal, so it carries Object.prototype`
+      } else if (base && ts.isIdentifier(base)) {
+        const origin = lookup(base.text)
+        if (origin) what = `\`${base.text}\` is ${origin} — it has Object.prototype`
+      }
+      if (what) {
+        report('R5', node,
+          `${what} — and takes a computed-key READ \`${node.getText(sf).slice(0, 48)}\`. ` +
+          `Keys like "constructor" / "toString" / "valueOf" are not stored data but they RESOLVE, ` +
+          `so the read hands back an inherited FUNCTION as if it were a graph value ` +
+          `(js/remote-property-injection). Read it with ownValue(bag, key) (safe-dict.ts), which ` +
+          `returns undefined for anything not stored as an OWN property.`)
+      }
+    }
+
     // ── R2: object spread ────────────────────────────────────────────────────────────
     if (ts.isSpreadAssignment(node)) {
       report('R2', node,
@@ -358,6 +457,7 @@ export const FIXTURES = [
     id: 'prefix-row-cast-launder',
     expect: 'flagged',
     rule: 'R1',
+    exclusive: true, // and R5 must NOT also fire: a computed WRITE is R1's, and only R1's
     why: 'an `as` cast on the initializer must not launder an object literal',
     code: `declare const k: string
       export function f() { const row = {} as Record<string, string>; row[k] = 'x'; return row }`,
@@ -445,7 +545,107 @@ export const FIXTURES = [
       export function f(): Binding { return {} }`,
   },
 
+  // ── R5: the READ mode ─────────────────────────────────────────────────────────────
+  {
+    id: 'prefix-gremlin-values',
+    expect: 'flagged',
+    rule: 'R5',
+    why: 'the VERBATIM pre-ownValue gremlin.ts read — the other half of the CodeQL alert, which ' +
+         'R1-R4 scored zero on both before and after the fix',
+    code: `
+      type PropertyValue = string | number | boolean
+      interface GraphNode { id: string; labels: string[]; properties: Record<string, PropertyValue> }
+      interface GraphEdge { id: string; label: string; properties: Record<string, PropertyValue> }
+      type Traverser = GraphNode | GraphEdge | PropertyValue
+      declare function isNode(t: Traverser): t is GraphNode
+      declare function isEdge(t: Traverser): t is GraphEdge
+      declare function looseEq(a: unknown, b: unknown): boolean
+      export class T {
+        constructor(private current: Traverser[]) {}
+        values(key: string) {
+          return this.current.map((t) => (isNode(t) || isEdge(t)) ? t.properties[key] : t).filter((v) => v !== undefined)
+        }
+        has(nodes: GraphNode[], key: string, value: PropertyValue) {
+          return nodes.filter((n) => looseEq(n.properties[key], value))
+        }
+        order(key: string, desc = false) {
+          return [...this.current].sort((a, b) => {
+            const av = isNode(a) || isEdge(a) ? a.properties[key] : a
+            const bv = isNode(b) || isEdge(b) ? b.properties[key] : b
+            return desc ? String(bv).localeCompare(String(av)) : String(av).localeCompare(String(bv))
+          })
+        }
+      }`,
+  },
+  {
+    id: 'read-off-plain-seed',
+    expect: 'flagged',
+    rule: 'R5',
+    why: 'form (b): a computed read off a binding R1 already knows is plain-prototype',
+    code: `declare const k: string
+      export function f() { const bag = Object.fromEntries([['a', 1]]); return bag[k] }`,
+  },
+  {
+    id: 'read-alias-launder',
+    expect: 'flagged',
+    rule: 'R5',
+    why: 'an alias must not launder a READ any more than it launders a write',
+    code: `declare const k: string
+      export function f() { const bag = {}; const alias = bag; return (alias as Record<string, number>)[k] }`,
+  },
+  {
+    id: 'read-in-condition',
+    expect: 'flagged',
+    rule: 'R5',
+    why: 'a read in a predicate is still a read — this is `has(key, value)`, where the inherited ' +
+         'function becomes the left-hand side of a comparison',
+    code: `interface GraphNode { properties: Record<string, string> }
+      declare const nodes: GraphNode[]; declare const key: string; declare const value: string
+      export function f() { return nodes.filter((n) => n.properties[key] === value) }`,
+  },
+
   // ── must stay clean ───────────────────────────────────────────────────────────────
+  {
+    id: 'ownvalue-read',
+    expect: 'clean',
+    why: 'the FIX: ownValue(bag, key) is a call, not an element access — fixed code stops matching ' +
+         'the rule rather than needing an exemption from it',
+    code: `type PropertyValue = string | number
+      interface GraphNode { properties: Record<string, PropertyValue> }
+      declare function ownValue<V>(s: Record<string, V> | undefined, k: string): V | undefined
+      declare const nodes: GraphNode[]; declare const key: string
+      export function f() { return nodes.map((n) => ownValue(n.properties, key)) }`,
+  },
+  {
+    id: 'array-index-read',
+    expect: 'clean',
+    why: 'the reason R5 is origin-directed: the guarded surfaces are full of `tokens[pos]` and ' +
+         '`row[i]`, and flagging those would be 57 false positives and one switched-off gate',
+    code: `declare const tokens: string[]; declare const rows: number[][]
+      export class P { private pos = 0
+        peek() { return tokens[this.pos] }
+        next() { return tokens[this.pos++] }
+        cell(i: number, j: number) { return rows[i]![j] } }`,
+  },
+  {
+    id: 'read-off-null-prototype-dict',
+    expect: 'clean',
+    why: 'reading a Binding/Grounding computed is SAFE — R3 guarantees every construction site is ' +
+         'emptyDict/cloneDict/mergeDicts, so there is no prototype to inherit from. This is what ' +
+         'sparql.ts and patternMatcher.ts do on nearly every line',
+    code: `type Binding = Record<string, string>
+      declare function emptyDict<V>(): Record<string, V>
+      declare const term: { name: string }
+      export function f(binding: Binding) { const fresh: Binding = emptyDict<string>(); return [binding[term.name], fresh[term.name]] }`,
+  },
+  {
+    id: 'literal-key-read',
+    expect: 'clean',
+    why: 'a source-fixed key on a property bag is trusted, the same way a literal-key WRITE is',
+    code: `interface GraphNode { properties: Record<string, string> }
+      declare const n: GraphNode
+      export function f() { return [n.properties['name'], n.properties["type"]] }`,
+  },
   {
     id: 'sanctioned-construction',
     expect: 'clean',
@@ -534,6 +734,12 @@ export function runSelfTest() {
         failures.push(`${fx.id}: MUST be flagged (${fx.rule}) and was NOT — ${fx.why}`)
       } else if (fx.rule && !found.some((v) => v.rule === fx.rule)) {
         failures.push(`${fx.id}: expected ${fx.rule}, got ${[...new Set(found.map((v) => v.rule))].join('+')} — ${fx.why}`)
+      } else if (fx.exclusive && found.some((v) => v.rule !== fx.rule)) {
+        // Two rules reporting one node is a real defect, not a harmless duplicate: the same line
+        // appears twice in the failure list under two different diagnoses, and whichever is read
+        // first is the one that gets acted on.
+        failures.push(`${fx.id}: expected ONLY ${fx.rule}, also got ` +
+          `${[...new Set(found.filter((v) => v.rule !== fx.rule).map((v) => v.rule))].join('+')} — ${fx.why}`)
       }
     } else if (found.length > 0) {
       failures.push(`${fx.id}: MUST stay clean and was flagged ${found.map((v) => `${v.rule}@${v.line}`).join(', ')} — ${fx.why}`)
@@ -595,6 +801,22 @@ function main() {
     }
   }
 
+  // R5 keys on a member NAME, so a rename turns it into a no-op exactly the way a type rename
+  // would neuter R3. Assert the bag is still declared, and still declared on its owners.
+  for (const [bag, { file, owners }] of Object.entries(BAG_HOMES)) {
+    const path = SRC + file
+    const text = existsSync(path) ? readFileSync(path, 'utf8') : ''
+    const missing = owners.filter((owner) => {
+      const decl = new RegExp(`\\binterface\\s+${owner}\\b[\\s\\S]*?\\n}`).exec(text)
+      return !decl || !new RegExp(`^\\s*${bag}\\??\\s*:`, 'm').test(decl[0])
+    })
+    if (missing.length) {
+      problems.push(`R4  \`${bag}\` is no longer declared on ${missing.join(', ')} in ts/src/${file}. R5 keys on ` +
+        `that MEMBER NAME, so a rename turns the READ-mode rule into a no-op — update ` +
+        `PROTO_BEARING_BAGS/BAG_HOMES in scripts/check-safe-dict.mjs.`)
+    }
+  }
+
   const files = guardedFiles()
   if (files.length === 0) problems.push('R4  the guarded file set is EMPTY — this scan verified nothing.')
 
@@ -615,7 +837,7 @@ function main() {
 
   console.log(
     `✓ safe-dict gate — ${files.length} guarded surface(s) [${files.join(', ')}], ` +
-    `${nodes.toLocaleString()} AST nodes, rules R1–R4 clean; ` +
+    `${nodes.toLocaleString()} AST nodes, rules R1–R5 clean; ` +
     `self-test: ${FIXTURES.filter((f) => f.expect === 'flagged').length} must-fail / ` +
     `${FIXTURES.filter((f) => f.expect === 'clean').length} must-pass fixtures all behaved.`)
 }

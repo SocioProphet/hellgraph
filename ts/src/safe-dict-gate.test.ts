@@ -87,9 +87,77 @@ test('GATE: every must-fail fixture is flagged and every must-pass fixture is cl
   const mustPass = FIXTURES.filter((f) => f.expect === 'clean')
   assert.ok(mustFail.length >= 8, `only ${mustFail.length} must-fail fixtures — the table has been hollowed out`)
   assert.ok(mustPass.length >= 5, `only ${mustPass.length} must-pass fixtures — nothing is guarding false positives`)
-  for (const rule of ['R1', 'R2', 'R3']) {
+  for (const rule of ['R1', 'R2', 'R3', 'R5']) {
     assert.ok(mustFail.some((f) => f.rule === rule), `no must-fail fixture exercises ${rule}`)
   }
+})
+
+// ─── RED: the READ mode — gremlin.ts's half of the same CodeQL alert ──────────────────
+// The other half of js/remote-property-injection, and the half R1–R4 could not see: the gate
+// scored gremlin.ts ZERO both before and after 0.4.47 fixed it, so `ownValue()` there was a
+// convention with nothing holding it. `n.properties[key]` off a GraphNode returns INHERITED
+// members — `g.V().values("constructor")` really does hand back the Object constructor as if
+// it were stored graph data, and `has("constructor", …)` compares against one. This is that
+// code, from the call sites 0.4.47 changed.
+
+const PRE_FIX_GREMLIN_READS = `
+  type PropertyValue = string | number | boolean
+  interface GraphNode { id: string; labels: string[]; properties: Record<string, PropertyValue> }
+  interface GraphEdge { id: string; label: string; properties: Record<string, PropertyValue> }
+  type Traverser = GraphNode | GraphEdge | PropertyValue
+  declare function isNode(t: Traverser): t is GraphNode
+  declare function isEdge(t: Traverser): t is GraphEdge
+  declare function looseEq(a: unknown, b: unknown): boolean
+  export class GraphTraversal {
+    constructor(private current: Traverser[]) {}
+    has(nodes: GraphNode[], key: string, value: PropertyValue) {
+      return nodes.filter((n) => looseEq(n.properties[key], value))
+    }
+    values(key: string) {
+      return this.current.map((t) => (isNode(t) || isEdge(t)) ? t.properties[key] : t)
+    }
+    order(key: string) {
+      return [...this.current].sort((a, b) => {
+        const av = isNode(a) || isEdge(a) ? a.properties[key] : a
+        const bv = isNode(b) || isEdge(b) ? b.properties[key] : b
+        return String(av).localeCompare(String(bv))
+      })
+    }
+  }
+`
+
+test('GATE: the pre-ownValue gremlin property READS are REJECTED', async () => {
+  const { scanSource } = await loadGate()
+  const found = scanSource('ts/src/gremlin.ts', PRE_FIX_GREMLIN_READS)
+
+  assert.ok(found.some((v) => v.rule === 'R5'),
+    `expected R5 (computed read off a prototype-bearing bag), got ${found.map((v) => v.rule).join(', ') || 'nothing'}`)
+  assert.equal(found.filter((v) => v.rule === 'R5').length, 4,
+    'has(), values() and both arms of order() — every call site 0.4.47 routed through ownValue()')
+})
+
+test('GATE: the shipped gremlin.ts is ACCEPTED — ownValue() is the fix, not an exemption', async () => {
+  const { scanSource } = await loadGate()
+  const src = readFileSync(join(__dirname, 'gremlin.ts'), 'utf8')
+  assert.deepEqual(scanSource('ts/src/gremlin.ts', src), [],
+    'ownValue(bag, key) is a CALL, not an element access, so fixed code stops matching the rule')
+})
+
+test('GATE: R5 does not flag array indexing or reads off null-prototype dictionaries', async () => {
+  // The reason R5 is origin-directed rather than "any computed read": the four guarded surfaces
+  // hold 57 computed element accesses, and all but the property-bag reads are array indexing or
+  // reads off dictionaries R3 already guarantees are built with emptyDict/cloneDict/mergeDicts.
+  // A rule that flagged those would be 57 false positives and one switched-off gate.
+  const { scanSource } = await loadGate()
+  const clean = `
+    type Binding = Record<string, string>
+    declare function emptyDict<V>(): Record<string, V>
+    declare const tokens: string[]; declare const term: { name: string }
+    export class P { private pos = 0
+      peek() { return tokens[this.pos] }
+      bound(binding: Binding) { const fresh: Binding = emptyDict<string>(); return [binding[term.name], fresh[term.name]] } }
+  `
+  assert.deepEqual(scanSource('ts/src/sparql.ts', clean), [])
 })
 
 // ─── Coverage: the gate must still be pointed at the real surfaces ────────────────────

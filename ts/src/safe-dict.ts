@@ -40,7 +40,13 @@
  *   R2  any object spread.
  *   R3  an object literal in a position typed Binding / Grounding / RRow / SafeDict —
  *       declaration, parameter default, `as` cast, `satisfies`, or annotated return.
- *   R4  coverage: those surfaces still exist and those type names still resolve.
+ *   R4  coverage: those surfaces still exist, those type names still resolve, and the graph
+ *       property bag R5 keys on is still called `properties`.
+ *   R5  the READ mode: a computed-key READ off an object that carries Object.prototype —
+ *       `node.properties[expr]` (the graph's own bag), or a local seeded from `{}` /
+ *       Object.assign({}, …) / Object.fromEntries(…) / toPlainRow(…). `ownValue()` is the
+ *       fix, and it is a CALL rather than an element access, so corrected code stops
+ *       matching the rule instead of needing an exemption from it.
  *
  * The NB was a comment for exactly one commit, and in that commit it was already violated:
  * patternMatcher.ts kept `const row: Record<string, string> = {}` for its OUTPUT row, so
@@ -50,9 +56,11 @@
  * typed `Record<string, string>`: a rule watching only the four names would have been green
  * against the actual bug.
  *
- * What the gate does NOT catch is listed at the top of the script — chiefly the READ mode
- * (`props[key]` off a normal-prototype object; use ownValue) and any laundering through a
- * function boundary. It is a floor under the convention, not a proof of it.
+ * What the gate does NOT catch is listed at the top of the script — chiefly the `in` mode
+ * (`'__proto__' in binding`), any laundering through a function boundary, a computed read off
+ * a bag reached through a `Record<string, …>` PARAMETER (provenance unknown at that point),
+ * and a prototype-bearing bag under a member name other than `properties`. It is a floor
+ * under the convention, not a proof of it.
  */
 
 /** A dictionary whose keys are untrusted. Structurally a Record; semantically null-prototype. */
