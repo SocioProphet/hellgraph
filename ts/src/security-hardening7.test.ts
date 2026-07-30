@@ -7,10 +7,11 @@ import { join } from 'node:path'
 process.env['HELLGRAPH_STORE_DIR'] = mkdtempSync(join(tmpdir(), 'hg-sec7-'))
 
 import { getHellGraph } from './store.js'
-import { getAtomSpace } from './atomspace.js'
+import { getAtomSpace, AtomSpace } from './atomspace.js'
 import { runSparql } from './sparql.js'
 import { runGremlin } from './gremlin.js'
 import { runCypher } from './cypher.js'
+import { findMatches, V, L } from './patternMatcher.js'
 import { sanitizeLogValue, LOG_FIELD_MAX } from './log-safe.js'
 
 const g = getHellGraph()
@@ -147,6 +148,32 @@ test('SECURITY: an unsupplied Cypher $param named for a prototype member resolve
     constructor: bait,
   }) as { rows: Record<string, string>[] }
   assert.equal(supplied.rows.length, 1, 'a genuinely supplied parameter named "constructor" must still resolve')
+})
+
+// ─── Attack 17b: the pattern matcher's OUTPUT row ──────────────────────────────────────────
+// The groundings inside findMatches were made null-prototype, but the row it hands back was
+// still built as `const row: Record<string, string> = {}` and keyed by the same query-derived
+// variable names. `row['__proto__'] = v` hits Object.prototype's inherited SETTER, so the write
+// is swallowed: the variable stays listed in `variables` and is absent from every row. A
+// DECLARED column that silently is not there — the WRITE mode safe-dict.ts documents, left
+// behind at the boundary of the very file that fixed the interior.
+
+test('SECURITY: a pattern variable named __proto__ appears as an own column in the result row', () => {
+  const space = new AtomSpace('sec7-patternmatcher', false)
+  space.addLink('ListLink', [space.addNode('ConceptNode', 'alice'), space.addNode('ConceptNode', 'bob')])
+
+  for (const name of HOSTILE_KEYS) {
+    const r = findMatches(space, { clauses: [L('ListLink', V(name), V('other'))] })
+
+    assert.ok(r.variables.includes(name), `${name}: precondition — the variable is declared`)
+    assert.equal(r.results.length, 1, `${name}: precondition — the pattern matches one grounding`)
+
+    const row = r.results[0]!
+    assert.ok(isOwnData(row, name),
+      `${name}: declared in variables but not an own data property of the row — the write was swallowed`)
+    assert.equal(typeof (row as Record<string, unknown>)[name], 'string',
+      `${name}: must read back as the atom label, not an inherited member`)
+  }
 })
 
 // ─── Attack 18: log-entry forgery at the log boundary ──────────────────────────────────────

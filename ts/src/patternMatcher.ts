@@ -1,5 +1,5 @@
 import { AtomSpace, nodeHandle, type Atom, type Handle } from './atomspace'
-import { cloneDict, emptyDict } from './safe-dict.js'
+import { cloneDict, emptyDict, toPlainRow } from './safe-dict.js'
 
 /**
  * Pattern Matcher — native hypergraph query over the AtomSpace.
@@ -75,14 +75,17 @@ export function findMatches(as: AtomSpace, pattern: Pattern): MatchResult {
   })
 
   const variables = pattern.select ?? collectVars(pattern.clauses)
-  const results = groundings.map((g) => {
-    const row: Record<string, string> = {}
-    for (const v of variables) {
+  // Output rows are keyed by pattern variable names, which arrive from Cypher query text — so this
+  // is the same untrusted-key surface as the groundings above, at the boundary rather than inside
+  // it. Built through toPlainRow (CreateDataProperty) instead of `row[v] = …` on a plain object:
+  // assigning `__proto__` hits Object.prototype's inherited SETTER, the write is swallowed, and the
+  // variable stays listed in `variables` while being absent from every row — a declared column that
+  // silently is not there, which is the WRITE mode described in safe-dict.ts.
+  const results = groundings.map((g) =>
+    toPlainRow(variables.map((v) => {
       const atom = g[v] ? as.getAtom(g[v]) : undefined
-      row[v] = atom ? (atom.name ?? atom.type) : ''
-    }
-    return row
-  })
+      return [v, atom ? (atom.name ?? atom.type) : ''] as const
+    })))
 
   return { variables, results, groundings, evaluatedAtSeq: as.logicalClock }
 }
