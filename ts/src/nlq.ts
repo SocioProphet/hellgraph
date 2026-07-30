@@ -81,11 +81,42 @@ function isAbsoluteUri(s: string): boolean {
 }
 
 /**
- * `format: "date-time"` — an RFC-3339 instant: date, `T`, time, and an EXPLICIT offset (`Z` or
- * ±HH:MM). A bare date (`2026-07-29`) names a day, not an instant, and does not pass.
+ * Length of `month` in `year`, by the proleptic Gregorian calendar.
+ *
+ * Computed rather than asked of `Date`: `Date.UTC(year, …)` maps a two-digit year onto 19xx, so
+ * `Date.UTC(50, 2, 0)` answers for 1950 — a wrong answer this function must not inherit for the
+ * years `\d{4}` admits.
+ */
+const DAYS_IN_MONTH = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+function daysInMonth(year: number, month: number): number {
+  if (month === 2) return (year % 4 === 0 && year % 100 !== 0) || year % 400 === 0 ? 29 : 28
+  return DAYS_IN_MONTH[month - 1] as number
+}
+
+/**
+ * `format: "date-time"` — an ISO-8601 date-time in its RFC-3339 profile: date, `T`, time, and an
+ * EXPLICIT offset (`Z` or ±HH:MM). A bare date (`2026-07-29`) names a day, not an instant, and does
+ * not pass. (The violation message below says "ISO-8601 date-time"; the two names are used for the
+ * same rule throughout, and RFC 3339 is the profile that makes the offset mandatory.)
+ *
+ * Shape is necessary but NOT sufficient. A purely structural regex accepts `2026-99-99T99:99:99Z`,
+ * which has the right punctuation and names no time — so a value that no clock could ever produce
+ * would satisfy a check whose entire purpose is that a declared format is an enforced one. The
+ * component ranges are therefore checked too, and the day against the real length of that month in
+ * that year, so `2026-02-30` is rejected rather than waved through.
  */
 function isIsoDateTime(s: string): boolean {
-  return /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$/.test(s)
+  const m = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(?:Z|([+-])(\d{2}):(\d{2}))$/.exec(s)
+  if (m === null) return false
+  const year = Number(m[1]), month = Number(m[2]), day = Number(m[3])
+  if (month < 1 || month > 12) return false
+  if (day < 1 || day > daysInMonth(year, month)) return false
+  if (Number(m[4]) > 23 || Number(m[5]) > 59) return false
+  // 60 is a leap second, which RFC 3339 permits (`23:59:60Z`).
+  if (Number(m[6]) > 60) return false
+  // Present together or not at all — the regex alternation guarantees it.
+  if (m[7] !== undefined && (Number(m[8]) > 23 || Number(m[9]) > 59)) return false
+  return true
 }
 
 /**

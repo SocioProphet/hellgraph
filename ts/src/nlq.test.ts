@@ -256,6 +256,52 @@ test('every accepted format has TEETH: it accepts the good value and rejects the
   }
 })
 
+/**
+ * Copilot review finding on #37. A structural regex accepts the right punctuation, not a time:
+ * `2026-99-99T99:99:99Z` cleared the old check. A format check that admits values no clock can
+ * produce is shape-matching wearing enforcement's clothes, which is the thing this whole section
+ * exists to prevent — so the ranges, and the calendar, are asserted here.
+ */
+test('date-time rejects impossible instants, not just the wrong shape', () => {
+  const IMPOSSIBLE = [
+    '2026-99-99T99:99:99Z',   // the value that cleared the purely structural regex
+    '2026-13-01T00:00:00Z',   // month 13
+    '2026-00-01T00:00:00Z',   // month 0
+    '2026-02-30T00:00:00Z',   // February 30 — shape-valid, calendar-impossible
+    '2026-04-31T00:00:00Z',   // April has 30 days
+    '2026-01-32T00:00:00Z',   // day 32
+    '2026-01-00T00:00:00Z',   // day 0
+    '2026-01-01T24:00:00Z',   // hour 24
+    '2026-01-01T00:60:00Z',   // minute 60
+    '2026-01-01T00:00:61Z',   // second 61 (60 is a permitted leap second)
+    '2026-01-01T00:00:00+99:00', // offset hours out of range
+    '2026-01-01T00:00:00+00:99', // offset minutes out of range
+  ]
+  for (const bad of IMPOSSIBLE) {
+    assert.equal(matchesFormat('date-time', bad), false, `${bad} must not pass as an instant`)
+    const errs: string[] = []
+    validateAgainst({ type: 'string', format: 'date-time' }, bad, 'v', errs)
+    assert.equal(errs.length, 1, `${bad} must be reported as a violation`)
+  }
+
+  // …and the real ones still pass, including the leap second and a genuine leap day.
+  for (const good of [
+    '2026-07-29T00:00:00Z',
+    '2024-02-29T12:00:00Z',      // 2024 is a leap year
+    '2000-02-29T00:00:00Z',      // divisible by 400 — a leap year
+    '2026-12-31T23:59:60Z',      // leap second, permitted by RFC 3339
+    '2026-01-01T00:00:00.123Z',
+    '2026-01-01T00:00:00-05:00',
+  ]) {
+    assert.equal(matchesFormat('date-time', good), true, `${good} is a real instant and must pass`)
+  }
+
+  // 1900 is NOT a leap year (divisible by 100, not by 400) — the rule `Date.UTC` would have got
+  // wrong for a two-digit year is exercised at both ends.
+  assert.equal(matchesFormat('date-time', '1900-02-29T00:00:00Z'), false)
+  assert.equal(matchesFormat('date-time', '1900-02-28T00:00:00Z'), true)
+})
+
 test('a contract declaring an UNIMPLEMENTED format fails LOUDLY at the import bar', () => {
   const withEmail: SchemaObj = {
     type: 'object',
