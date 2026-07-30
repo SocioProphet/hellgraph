@@ -44,9 +44,21 @@ speaks is subject to this plane.
 The proposal is validated against these bytes by the same JSON-Schema subset validator
 `ts/src/nlq.ts` uses (`validateAgainst`), whose implemented keyword set is asserted over this
 schema at import — an unimplemented keyword fails loudly rather than silently validating less
-than the contract says. That subset implements `format: "uri"` only, so
-`requestedAt`'s `format: "date-time"` is **not** covered by it; `vendor-graph.ts` checks that
-field explicitly instead of leaving it unenforced.
+than the contract says.
+
+`format` is part of that bar, and it is checked by **value**, not by name: the validator implements
+`uri` and `date-time` (`FORMAT_CHECKS` in `nlq.ts`), and a schema declaring any other one — `email`,
+`uuid` — fails loudly at import instead of clearing the bar and then being validated for everything
+except the constraint it declares. So `requestedAt`'s `format: "date-time"` is enforced by the
+shared validator, for this contract and every other one.
+
+It was not always. Until the fix, `format` was admitted as a bare keyword and enforced only for
+`uri`, which meant this contract declared `date-time` and nothing checked it; `vendor-graph.ts`
+carried a private regex at the `proposeRevendor` call site to cover the field. That regex is gone —
+the call site now asks the one implementation (`matchesFormat`). It still fails loudly there rather
+than recording a `contractViolations` entry, because `analyzeVendorFreshness` seals whatever
+proposals it is handed without reading that array: a bad instant must stop the run, not ride inside
+the seal.
 
 ## Regeneration
 The embedded copy the engine ships (`ts/src/effect-request-data.ts`) is generated from this file

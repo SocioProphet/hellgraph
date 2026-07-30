@@ -364,11 +364,47 @@ test('the proposal is validated against the sha-asserted vendored contract', () 
   assert.equal((EFFECT_REQUEST_SCHEMA as Record<string, unknown>)['title'], 'EffectRequest')
 })
 
-test('requestedAt must be a real date-time — the shared validator subset does not cover format: date-time', () => {
+/** Every `format` the schema declares, at any depth — walked here, not asked of the validator. */
+function declaredFormats(node: unknown, into = new Set<string>()): Set<string> {
+  if (Array.isArray(node)) { for (const v of node) declaredFormats(v, into); return into }
+  if (node === null || typeof node !== 'object') return into
+  for (const [k, v] of Object.entries(node as Record<string, unknown>)) {
+    if (k === 'format' && typeof v === 'string') into.add(v)
+    else declaredFormats(v, into)
+  }
+  return into
+}
+
+/**
+ * `requestedAt` carries the contract's `format: "date-time"`. That format used to be declared here
+ * and enforced nowhere but a private regex in `vendor-graph.ts`; the shared validator now implements
+ * it, so this asserts BOTH ends: the contract-shaped check has teeth on its own, and the call site
+ * still refuses to build a proposal — loudly — from a value that fails it.
+ */
+test('requestedAt must be a real date-time — enforced by the SHARED validator, from the contract', () => {
   const store = fixture()
+
+  // 1. Every format this contract declares is one the validator implements (the whole bar).
+  const declared = declaredFormats(EFFECT_REQUEST_SCHEMA)
+  assert.deepEqual([...declared].sort(), ['date-time'], 'the contract declares format: date-time')
+
+  // 2. The shared validator itself rejects it — no call-site workaround involved. Before the fix
+  //    this produced [] : the format was declared by the contract and checked by nobody.
+  const good = proposeRevendor(store, SERVICE_PIN, { requestedAt: '2026-07-29T00:00:00Z' })
+  assert.deepEqual(good.contractViolations, [], 'baseline: a real instant conforms')
+
+  const errs: string[] = []
+  validateAgainst(EFFECT_REQUEST_SCHEMA as Record<string, unknown>,
+    { ...good.effectRequest, requestedAt: '2026-07-29' }, 'EffectRequest', errs)
+  assert.ok(errs.some((e) => /requestedAt.*not an ISO-8601 date-time/.test(e)), errs.join('; '))
+
+  // 3. And the call site still fails loudly rather than sealing a proposal that carries a violation.
   assert.throws(
     () => proposeRevendor(store, SERVICE_PIN, { requestedAt: '2026-07-29' }),
     /not an ISO-8601 date-time/)
+  assert.throws(
+    () => analyzeVendorFreshness(store, { requestedAt: '2026-07-29' }),
+    /not an ISO-8601 date-time/, 'a bad instant must stop the run, not ride inside the seal')
 })
 
 // ─── Sealing ───────────────────────────────────────────────────────────────────
