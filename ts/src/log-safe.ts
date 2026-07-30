@@ -43,11 +43,21 @@
  * made to misrender, never from what this function happens to strip.
  */
 
-/** Render one control character as a visible, unambiguous escape. */
+/**
+ * Render one control character as a visible, unambiguous escape.
+ *
+ * `codePointAt`, not `charCodeAt`: \p{Cf} reaches beyond the BMP (U+13430-U+1343F Egyptian
+ * format controls, U+1BCA0-U+1BCA3), and the `u`-flagged class matches those as a whole code
+ * point. `charCodeAt(0)` would report only the HIGH SURROGATE, printing `\ud80d` for U+13430.
+ * The character is neutralized either way — the replace consumes the whole match — but the
+ * escape is the forensic record of what was neutralized, and naming the wrong code point
+ * defeats the reason these are made visible instead of deleted.
+ */
 function escapeControl(ch: string): string {
-  const code = ch.charCodeAt(0)
+  const code = ch.codePointAt(0) ?? 0
   const hex = code.toString(16)
-  return code <= 0xff ? '\\x' + hex.padStart(2, '0') : '\\u' + hex.padStart(4, '0')
+  if (code <= 0xff) return '\\x' + hex.padStart(2, '0')
+  return code <= 0xffff ? '\\u' + hex.padStart(4, '0') : '\\u{' + hex + '}'
 }
 
 /** Hard cap so one request cannot flood the log (and so a record stays greppable). */

@@ -259,6 +259,19 @@ test('SECURITY: log fields are bounded and non-string input is coerced safely', 
   }
 })
 
+test('SECURITY: an astral-plane format character is escaped as itself, not as its surrogate', () => {
+  // \p{Cf} extends past the BMP. The `u`-flagged class matches the whole code point, so the
+  // character is neutralized regardless — but the escape is the forensic record of WHAT was
+  // neutralized, and charCodeAt would name the high surrogate (\ud80d) instead of U+13430.
+  for (const cp of [0x13430, 0x1bca0]) {
+    const out = sanitizeLogValue('benign' + String.fromCodePoint(cp) + 'tail')
+    assert.ok(!LINE_BREAKING.test(out), `U+${cp.toString(16)} survived sanitization`)
+    assert.ok(out.includes(`\\u{${cp.toString(16)}}`),
+      `U+${cp.toString(16)} must be escaped as its own code point, got ${JSON.stringify(out)}`)
+    assert.ok(!/\\ud8[0-9a-f]{2}/.test(out), 'must not report a bare surrogate')
+  }
+})
+
 test('SECURITY: sanitizing leaves ordinary log text untouched', () => {
   const ordinary = "SPARQL parse error: expected 'BY', got 'LIMIT' (offset 42) — 100% ok"
   assert.equal(sanitizeLogValue(ordinary), ordinary, 'the sanitizer must not mangle normal messages')
