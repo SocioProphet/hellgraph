@@ -259,6 +259,34 @@ test('SECURITY: log fields are bounded and non-string input is coerced safely', 
   }
 })
 
+/**
+ * Copilot review finding on #34. `String(value)` is not total, and this module's own PR is what
+ * makes the null-prototype case live: safe-dict.ts hands out `Object.create(null)` dictionaries
+ * throughout the engine, and super-peer calls the sanitizer from INSIDE a catch block — so a
+ * throw here would swallow the 500 response and turn the log boundary into the outage.
+ */
+test('SECURITY: the sanitizer never throws, even on values that refuse to stringify', () => {
+  const throwingToString = { toString() { throw new Error('boom') } }
+  const nullProto = Object.create(null)
+  const nullProtoWithProps = Object.assign(Object.create(null), { variable: '?__proto__' })
+
+  // Precondition: these really do defeat a bare String(). If this ever stops being true the
+  // test below is no longer exercising anything.
+  for (const v of [throwingToString, nullProto, nullProtoWithProps]) {
+    assert.throws(() => String(v), 'precondition: String() must throw for this value')
+  }
+
+  for (const v of [throwingToString, nullProto, nullProtoWithProps]) {
+    const out = sanitizeLogValue(v)
+    assert.equal(typeof out, 'string')
+    assert.ok(out.length > 0, 'must produce something a reader can see')
+    assert.ok(!LINE_BREAKING.test(out), 'and it must still be a safe single-line field')
+  }
+
+  // The exact shape super-peer's catch block passes when a non-Error is thrown.
+  assert.doesNotThrow(() => sanitizeLogValue(nullProto))
+})
+
 test('SECURITY: an astral-plane format character is escaped as itself, not as its surrogate', () => {
   // \p{Cf} extends past the BMP. The `u`-flagged class matches the whole code point, so the
   // character is neutralized regardless — but the escape is the forensic record of WHAT was
