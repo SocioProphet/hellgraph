@@ -30,7 +30,7 @@ permissions:
 
 jobs:
   build-and-verify-dist:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -107,7 +107,7 @@ jobs:
   # the engine — the artifact's source of truth — was the one copy where drift went unnoticed.
   # Runs on every PR (cheap, no path filter) so a re-vendor can never land unverified.
   kko-provenance:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
