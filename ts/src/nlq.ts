@@ -73,14 +73,73 @@ import {
 /** A parsed JSON Schema object. Exported with `validateAgainst`, which takes one. */
 export type SchemaObj = Record<string, unknown>
 
+// ─── format: one list, and it IS the list of checks that exist ──────────────────
+
+/** `format: "uri"` — require an absolute URI (a scheme). Rejects bare `:Thing` shorthand. */
+function isAbsoluteUri(s: string): boolean {
+  return /^[A-Za-z][A-Za-z0-9+.-]*:[^\s]*$/.test(s)
+}
+
+/**
+ * `format: "date-time"` — an RFC-3339 instant: date, `T`, time, and an EXPLICIT offset (`Z` or
+ * ±HH:MM). A bare date (`2026-07-29`) names a day, not an instant, and does not pass.
+ */
+function isIsoDateTime(s: string): boolean {
+  return /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$/.test(s)
+}
+
+/**
+ * Every `format` this validator genuinely enforces, with the phrase its violation reads as.
+ *
+ * This map is the SINGLE source of truth for both halves of the guard: `validateAgainst` enforces
+ * through it, and `assertSupportedKeywords` admits a declared `format` only if it has a key here.
+ * Adding a name to the accept-list without writing the check is therefore not expressible — the
+ * accept-list IS the set of checks. (A vacuous check that rejects nothing is still expressible;
+ * `nlq.test.ts` demands a rejected counter-example per format, which closes that door.)
+ *
+ * A Map, not an object: `'constructor' in {}` is true, and a prototype key must never read as an
+ * implemented format.
+ */
+const FORMAT_CHECKS: ReadonlyMap<string, { check: (s: string) => boolean; expected: string }> = new Map([
+  ['date-time', { check: isIsoDateTime, expected: 'an ISO-8601 date-time' }],
+  ['uri', { check: isAbsoluteUri, expected: 'an absolute URI' }],
+])
+
+/**
+ * The `format` values a vendored contract may declare — i.e. the ones `validateAgainst` implements.
+ * Derived from the checks themselves, so it cannot name one that does not exist.
+ */
+export const IMPLEMENTED_FORMATS: ReadonlySet<string> = new Set(FORMAT_CHECKS.keys())
+
+/**
+ * True when `value` satisfies `format: <name>`. THROWS for a format nothing implements — asking
+ * about an unenforced format must never quietly answer "fine". This is the one door for a call site
+ * that needs a contract's format checked before it builds the object it will validate.
+ */
+export function matchesFormat(format: string, value: string): boolean {
+  const f = FORMAT_CHECKS.get(format)
+  if (f === undefined) {
+    throw new Error(
+      `nlq: format '${format}' is not implemented by validateAgainst ` +
+      `(implemented: ${[...IMPLEMENTED_FORMATS].sort().join(', ')})`)
+  }
+  return f.check(value)
+}
+
 /**
  * Keywords carrying validation semantics that `validateAgainst` implements. Anything else that could
  * change what validates ($ref, allOf, anyOf, …) must fail LOUDLY at import rather than silently
  * validate less than the contract says — the registry's whole claim is conformance.
+ *
+ * `format` is deliberately absent: it is admitted by VALUE, not by name (see `FORMAT_CHECKS` and the
+ * explicit branch in `assertSupportedKeywords`). Listing the bare keyword would clear this bar for
+ * `format: "email"` and then enforce nothing — the exact silent under-enforcement the bar exists to
+ * prevent. Its absence is also fail-safe: delete that branch and `format` becomes an unknown
+ * keyword, which throws.
  */
 const SUPPORTED_KEYWORDS = new Set([
   'type', 'const', 'enum', 'pattern', 'minLength', 'required',
-  'properties', 'additionalProperties', 'items', 'uniqueItems', 'format',
+  'properties', 'additionalProperties', 'items', 'uniqueItems',
 ])
 /** Pure annotations — no validation effect; safe to ignore. */
 const ANNOTATION_KEYWORDS = new Set(['$schema', '$id', 'title', 'description', 'default', 'examples'])
@@ -90,6 +149,10 @@ const ANNOTATION_KEYWORDS = new Set(['$schema', '$id', 'title', 'description', '
  * vendored sourceos-spec contract in the engine (SemanticAction here, EffectRequest in
  * `vendor-graph.ts`) must clear the same bar at import: a contract using an unimplemented keyword
  * fails LOUDLY rather than silently validating less than it says.
+ *
+ * `format` is checked by VALUE, not by name. `format: "email"` names a keyword the validator has,
+ * carrying a constraint it does not implement — passing it on the strength of the keyword would be
+ * this guard failing at its own job, so the value must be one of `IMPLEMENTED_FORMATS`.
  */
 export function assertSupportedKeywords(schema: unknown, at: string): void {
   if (Array.isArray(schema)) { schema.forEach((v, i) => assertSupportedKeywords(v, `${at}[${i}]`)); return }
@@ -100,6 +163,16 @@ export function assertSupportedKeywords(schema: unknown, at: string): void {
       continue
     }
     if (k === 'items' || k === 'additionalProperties') { assertSupportedKeywords(v, `${at}.${k}`); continue }
+    if (k === 'format') {
+      if (typeof v !== 'string' || !IMPLEMENTED_FORMATS.has(v)) {
+        throw new Error(
+          `nlq: schema format ${JSON.stringify(v)} at ${at} is declared by the contract but is NOT ` +
+          `implemented by validateAgainst (implemented: ${[...IMPLEMENTED_FORMATS].sort().join(', ')}) — ` +
+          'a declared format that nothing checks validates less than the contract says; implement it ' +
+          'in nlq.ts (and its tests) before re-vendoring a schema that declares it')
+      }
+      continue
+    }
     if (SUPPORTED_KEYWORDS.has(k) || ANNOTATION_KEYWORDS.has(k)) continue
     throw new Error(
       `nlq: schema keyword '${k}' at ${at} is outside the implemented validation subset — extend the ` +
@@ -144,17 +217,12 @@ function jsonTypeOf(v: unknown): string {
   return typeof v
 }
 
-/** `format: "uri"` — require an absolute URI (a scheme). Rejects bare `:Thing` shorthand. */
-function isAbsoluteUri(s: string): boolean {
-  return /^[A-Za-z][A-Za-z0-9+.-]*:[^\s]*$/.test(s)
-}
-
 /**
  * Validate `value` against the implemented 2020-12 subset of `schema`, appending violations to
  * `errs`. Shared by every vendored-contract validator in the engine so there is ONE validation
  * subset, guarded by ONE `assertSupportedKeywords` bar — never two that can drift apart.
- * `format` is enforced for `uri` only; a contract relying on another `format` must check it
- * explicitly at the call site (see `vendor-graph.ts` and `requestedAt`).
+ * `format` is enforced for every entry in `FORMAT_CHECKS`, and the bar refuses a contract declaring
+ * any other one — so for anything that cleared import, a declared format is an enforced format.
  */
 export function validateAgainst(schema: SchemaObj, value: unknown, at: string, errs: string[]): void {
   const t = schema['type']
@@ -174,7 +242,14 @@ export function validateAgainst(schema: SchemaObj, value: unknown, at: string, e
     if (typeof p === 'string' && !new RegExp(p).test(value)) errs.push(`${at}: does not match pattern ${p}`)
     const ml = schema['minLength']
     if (typeof ml === 'number' && value.length < ml) errs.push(`${at}: shorter than minLength ${ml}`)
-    if (schema['format'] === 'uri' && !isAbsoluteUri(value)) errs.push(`${at}: '${value}' is not an absolute URI`)
+    const fmt = schema['format']
+    if (typeof fmt === 'string') {
+      // `assertSupportedKeywords` refuses a contract declaring a format with no check, so `f` is
+      // present for every schema that cleared import. A hand-built schema that skipped the bar
+      // degrades to unchecked rather than throwing mid-validation: the bar polices formats, not this.
+      const f = FORMAT_CHECKS.get(fmt)
+      if (f !== undefined && !f.check(value)) errs.push(`${at}: '${value}' is not ${f.expected}`)
+    }
   }
   if (Array.isArray(value)) {
     const items = schema['items']

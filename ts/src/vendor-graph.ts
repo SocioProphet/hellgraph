@@ -66,7 +66,7 @@
 import { createHash } from 'node:crypto'
 import type { HellGraphStore } from './store'
 import type { PropertyValue } from './types'
-import { validateAgainst, assertSupportedKeywords, type SchemaObj } from './nlq'
+import { validateAgainst, assertSupportedKeywords, matchesFormat, type SchemaObj } from './nlq'
 import {
   EFFECT_REQUEST_SCHEMA_TEXT,
   EFFECT_REQUEST_SCHEMA_SHA256,
@@ -887,8 +887,6 @@ export interface ProposeOptions {
   blastRadius?: number
 }
 
-const ISO_DATE_TIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$/
-
 /**
  * Emit a re-vendor **proposal** for one pin as an `EffectRequest`-shaped object, validated against
  * the sha-asserted vendored contract.
@@ -902,12 +900,13 @@ const ISO_DATE_TIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:
  * PURE with respect to the graph.
  */
 export function proposeRevendor(store: HellGraphStore, pinId: string, opts: ProposeOptions): RevendorProposal {
-  if (!ISO_DATE_TIME.test(opts.requestedAt)) {
-    // The shared subset validator implements `format: "uri"` only, so `requestedAt`'s
-    // `format: "date-time"` would otherwise go unchecked. Checked here rather than left unenforced.
-    throw new Error(
-      `vendor-graph: requestedAt '${opts.requestedAt}' is not an ISO-8601 date-time (the contract's ` +
-      'format: date-time is outside the shared validator subset and is enforced here instead)')
+  // `requestedAt` carries the contract's `format: "date-time"`, which the shared validator now
+  // implements — so this asks that ONE implementation (`matchesFormat`) rather than keeping a second
+  // copy of the rule here. It stays a THROW rather than a `contractViolations` entry because
+  // `analyzeVendorFreshness` seals whatever proposals this returns without reading that array: a bad
+  // `requestedAt` reaching the seal must stop the run, not ride along inside it.
+  if (!matchesFormat('date-time', opts.requestedAt)) {
+    throw new Error(`vendor-graph: requestedAt '${opts.requestedAt}' is not an ISO-8601 date-time`)
   }
   const verdict = stalenessOf(store, pinId)
   const risk = contractCrossingRiskOf(store, pinId)
