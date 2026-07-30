@@ -137,10 +137,32 @@ const FORMAT_CHECKS: ReadonlyMap<string, { check: (s: string) => boolean; expect
 ])
 
 /**
- * The `format` values a vendored contract may declare — i.e. the ones `validateAgainst` implements.
- * Derived from the checks themselves, so it cannot name one that does not exist.
+ * True when a vendored contract may declare `format: <name>` — i.e. when `validateAgainst`
+ * implements it.
+ *
+ * A FUNCTION over `FORMAT_CHECKS`, not an exported collection. This was
+ * `export const IMPLEMENTED_FORMATS: ReadonlySet<string>`, and `ReadonlySet` is a compile-time
+ * fiction: the runtime value is a live `Set`, so `(IMPLEMENTED_FORMATS as Set<string>).add('email')`
+ * widened the accept-list without adding a check — and `validateAgainst` skips a format it has no
+ * entry for, so `format: "email"` then passed the bar and was enforced by nobody. That is the exact
+ * declared-unenforced gap this module exists to close, reachable from outside the module.
+ * (Copilot review on #37, low-confidence channel.) Asking `FORMAT_CHECKS` on every call means the
+ * accept-list cannot be widened without adding the check that defines it.
  */
-export const IMPLEMENTED_FORMATS: ReadonlySet<string> = new Set(FORMAT_CHECKS.keys())
+export function isImplementedFormat(format: string): boolean {
+  return FORMAT_CHECKS.has(format)
+}
+
+/**
+ * The implemented `format` names, as a fresh sorted snapshot.
+ *
+ * A new array per call AND frozen: `readonly string[]` is erased at runtime exactly as
+ * `ReadonlySet` was, so the freeze is what makes a mutation attempt fail loudly (in strict mode,
+ * which every module here is) instead of silently succeeding on a copy the caller then believes in.
+ */
+export function implementedFormats(): readonly string[] {
+  return Object.freeze([...FORMAT_CHECKS.keys()].sort())
+}
 
 /**
  * True when `value` satisfies `format: <name>`. THROWS for a format nothing implements — asking
@@ -152,7 +174,7 @@ export function matchesFormat(format: string, value: string): boolean {
   if (f === undefined) {
     throw new Error(
       `nlq: format '${format}' is not implemented by validateAgainst ` +
-      `(implemented: ${[...IMPLEMENTED_FORMATS].sort().join(', ')})`)
+      `(implemented: ${implementedFormats().join(', ')})`)
   }
   return f.check(value)
 }
@@ -183,7 +205,8 @@ const ANNOTATION_KEYWORDS = new Set(['$schema', '$id', 'title', 'description', '
  *
  * `format` is checked by VALUE, not by name. `format: "email"` names a keyword the validator has,
  * carrying a constraint it does not implement — passing it on the strength of the keyword would be
- * this guard failing at its own job, so the value must be one of `IMPLEMENTED_FORMATS`.
+ * this guard failing at its own job, so the value must satisfy `isImplementedFormat`, which reads
+ * `FORMAT_CHECKS` itself rather than any exported copy of its keys.
  */
 export function assertSupportedKeywords(schema: unknown, at: string): void {
   if (Array.isArray(schema)) { schema.forEach((v, i) => assertSupportedKeywords(v, `${at}[${i}]`)); return }
@@ -195,10 +218,10 @@ export function assertSupportedKeywords(schema: unknown, at: string): void {
     }
     if (k === 'items' || k === 'additionalProperties') { assertSupportedKeywords(v, `${at}.${k}`); continue }
     if (k === 'format') {
-      if (typeof v !== 'string' || !IMPLEMENTED_FORMATS.has(v)) {
+      if (typeof v !== 'string' || !isImplementedFormat(v)) {
         throw new Error(
           `nlq: schema format ${JSON.stringify(v)} at ${at} is declared by the contract but is NOT ` +
-          `implemented by validateAgainst (implemented: ${[...IMPLEMENTED_FORMATS].sort().join(', ')}) — ` +
+          `implemented by validateAgainst (implemented: ${implementedFormats().join(', ')}) — ` +
           'a declared format that nothing checks validates less than the contract says; implement it ' +
           'in nlq.ts (and its tests) before re-vendoring a schema that declares it')
       }

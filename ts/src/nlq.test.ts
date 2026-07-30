@@ -17,7 +17,8 @@ import {
   validateAgainst,
   validateSemanticAction,
   DEFAULT_SENSE_WEIGHTS,
-  IMPLEMENTED_FORMATS,
+  implementedFormats,
+  isImplementedFormat,
   NLQ_LITERAL_TYPE,
   SEMANTIC_ACTION_CONTRACT,
   SEMANTIC_ACTION_SCHEMA,
@@ -208,7 +209,7 @@ test('stored action definitions are frozen — a search cannot be mutated undern
  * The formats the validator is expected to implement, each with a value it must ACCEPT and one it
  * must REJECT.
  *
- * Written out literally, on purpose. Deriving this list from `IMPLEMENTED_FORMATS` would make the
+ * Written out literally, on purpose. Deriving this list from `implementedFormats()` would make the
  * tests below a tautology — they would go green for a format that reached the accept-list and was
  * never implemented, which is exactly the bug this section exists to catch. So adding a format
  * forces a row here, and the row forces a counter-example, which is what keeps a stub check that
@@ -232,7 +233,7 @@ function declaredFormats(node: unknown, into = new Set<string>()): Set<string> {
 
 test('the format accept-list is exactly the set of formats that have a check', () => {
   assert.deepEqual(
-    [...IMPLEMENTED_FORMATS].sort(),
+    [...implementedFormats()].sort(),
     EXPECTED_FORMATS.map((f) => f.format).sort(),
     'a format reached the accept-list without a row — and a counter-example — in this test')
 })
@@ -302,6 +303,34 @@ test('date-time rejects impossible instants, not just the wrong shape', () => {
   assert.equal(matchesFormat('date-time', '1900-02-28T00:00:00Z'), true)
 })
 
+/**
+ * Copilot review finding on #37, low-confidence channel — and the sharpest one on this PR.
+ *
+ * The accept-list used to be `export const IMPLEMENTED_FORMATS: ReadonlySet<string>`. `ReadonlySet`
+ * is erased at runtime, so a caller could `.add()` to it and widen what the bar admits WITHOUT
+ * adding a check. `validateAgainst` skips any format it has no entry for, so the smuggled name then
+ * cleared import and was enforced by nobody — the module's own failure mode, reachable from outside
+ * it. The accept-list is now a function over `FORMAT_CHECKS`, so there is nothing to mutate.
+ */
+test('the accept-list cannot be widened from outside — there is no mutable copy of it', () => {
+  const before = implementedFormats()
+  assert.ok(!isImplementedFormat('email'), 'precondition: email is not implemented')
+
+  // Whatever a caller is handed, mutating it must not widen the bar. (A fresh array per call, so
+  // this mutates a copy and nothing else.)
+  assert.throws(() => { (before as string[]).push('email') }, TypeError,
+    'the snapshot handed to callers must be frozen')
+
+  assert.equal(isImplementedFormat('email'), false, 'the bar must still refuse email')
+  assert.deepEqual(implementedFormats(), before, 'a later snapshot must be unchanged')
+  assert.throws(() => assertSupportedKeywords({ type: 'string', format: 'email' }, 'T'),
+    /is NOT implemented/, 'and a contract declaring it must still be refused at import')
+
+  // Two snapshots must not be the same object, or handing one out leaks the source of truth.
+  assert.notEqual(implementedFormats(), implementedFormats(), 'each call returns a fresh array')
+  assert.deepEqual(implementedFormats(), implementedFormats(), '…with equal contents')
+})
+
 test('a contract declaring an UNIMPLEMENTED format fails LOUDLY at the import bar', () => {
   const withEmail: SchemaObj = {
     type: 'object',
@@ -332,7 +361,7 @@ test('SemanticAction declares only formats that are enforced, and its uri format
   assertSupportedKeywords(SEMANTIC_ACTION_SCHEMA as SchemaObj, 'SemanticAction')
   const declared = declaredFormats(SEMANTIC_ACTION_SCHEMA)
   assert.deepEqual([...declared].sort(), ['uri'], 'the contract declares format: uri and nothing else')
-  for (const f of declared) assert.ok(IMPLEMENTED_FORMATS.has(f), `${f} is declared but not implemented`)
+  for (const f of declared) assert.ok(isImplementedFormat(f), `${f} is declared but not implemented`)
 
   // …and the real contract's own `format: uri` (on `typeRef`) rejects the bare `:Thing` shorthand,
   // not just a synthetic schema built in this file.
