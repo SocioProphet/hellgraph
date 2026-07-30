@@ -105,7 +105,16 @@ function coerceToString(value: unknown): string {
  */
 export function sanitizeLogValue(value: unknown, max: number = LOG_FIELD_MAX): string {
   const raw = coerceToString(value)
-  const escaped = raw
+  // Bound the work, not just the output: the escape passes below are attacker-reachable
+  // (this runs at log boundaries on values like parse errors) and every char can only
+  // EXPAND under escaping (never shrink), so slicing the input to `max` still leaves at
+  // least `max` chars for the final truncation to work with -- the output is identical to
+  // running the full pipeline unsliced and truncating after, for any input up to `max`
+  // chars past this point. Without this, a multi-MB value pays for two full-string regex
+  // passes and a per-character escape call before the one-line cap discards nearly all of
+  // it -- the sanitizer meant to bound abuse becomes itself an unbounded-cost boundary.
+  const bounded = raw.length > max ? raw.slice(0, max) : raw
+  const escaped = bounded
     // CR and LF first, and individually. Besides being the obvious vector, this exact shape
     // — a global replace of a constant string — is the barrier CodeQL's js/log-injection
     // recognises. A quantified character class such as /[\r\n\t]+/g is not recognised, which

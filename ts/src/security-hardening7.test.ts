@@ -260,6 +260,22 @@ test('SECURITY: log fields are bounded and non-string input is coerced safely', 
 })
 
 /**
+ * Copilot review finding on #46. The escape passes ran over the FULL input before the length
+ * cap discarded nearly all of it -- an attacker-controlled multi-MB value paid for two
+ * full-string regex passes and a per-character escape call it never needed to. Bounding the
+ * input to `max` before escaping must not change the output for anything that would have
+ * survived truncation anyway: a line-breaking character planted just inside the boundary
+ * still has to come out escaped, not silently pass through because it fell outside a naive
+ * pre-slice.
+ */
+test('SECURITY: bounding the escape pass to `max` does not skip escaping near the boundary', () => {
+  const justInside = 'A'.repeat(LOG_FIELD_MAX - 5) + C(0x0a) + 'AAAAAAAAAA'.repeat(10_000)
+  const out = sanitizeLogValue(justInside)
+  assert.ok(!LINE_BREAKING.test(out), 'a line break just inside the cap must still be escaped, not truncated away unescaped')
+  assert.ok(out.includes('\\n'), 'the escape marker for the newline must survive into the output')
+})
+
+/**
  * Copilot review finding on #34. `String(value)` is not total, and this module's own PR is what
  * makes the null-prototype case live: safe-dict.ts hands out `Object.create(null)` dictionaries
  * throughout the engine, and super-peer calls the sanitizer from INSIDE a catch block — so a
