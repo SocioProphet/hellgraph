@@ -8,6 +8,7 @@ import {
   proposeRevendor, analyzeVendorFreshness, vendorPinIds, vfpId,
   VFP, VFP_EDGE, VFP_KKO_TYPES, VFP_NS, EFFECT_REQUEST_CONTRACT, EFFECT_REQUEST_SCHEMA,
 } from './vendor-graph'
+import { validateAgainst } from './nlq'
 
 /**
  * The REAL situation, as declared in sociosphere `registry/vendor-freshness.yaml` and lifted in
@@ -468,4 +469,66 @@ test('a pin id that is not a VendorPin fails loudly', () => {
   const store = fixture()
   assert.throws(() => stalenessOf(store, vfpId.repository('SocioProphet/hellgraph')), /is not a vfp:VendorPin/)
   assert.throws(() => contractCrossingRiskOf(store, 'nope'), /is not a vfp:VendorPin/)
+})
+
+// ─── The checks that must be able to FAIL ──────────────────────────────────────
+
+/**
+ * `contractViolations: []` is asserted in two tests above. An empty array is also what a validator
+ * that does nothing returns, so on its own that assertion proves the proposal is well-formed only
+ * if the validator can, in fact, report. This test breaks a proposal against the SAME
+ * sha-asserted schema object and requires violations — so the green above means something.
+ */
+test('the vendored-contract validator has TEETH — a malformed EffectRequest is rejected', () => {
+  const store = fixture()
+  const good = proposeRevendor(store, WARDEN_PIN, { requestedAt: '2026-07-29T00:00:00Z' })
+  assert.deepEqual(good.contractViolations, [], 'baseline: the real proposal conforms')
+
+  const schema = EFFECT_REQUEST_SCHEMA as Record<string, unknown>
+  const check = (mutate: (er: Record<string, unknown>) => void): string[] => {
+    const er = JSON.parse(JSON.stringify(good.effectRequest)) as Record<string, unknown>
+    mutate(er)
+    const errs: string[] = []
+    validateAgainst(schema, er, 'EffectRequest', errs)
+    return errs
+  }
+
+  // Each of these is a distinct keyword in the vendored contract. If any returns [], that keyword
+  // is declared by the schema and enforced by nothing.
+  assert.ok(check((er) => { delete er['idempotencyKey'] }).length > 0, 'required')
+  assert.ok(check((er) => { er['type'] = 'EffectDecision' }).length > 0, 'const')
+  assert.ok(check((er) => { er['effectKind'] = 'detonate' }).length > 0, 'enum')
+  assert.ok(check((er) => { er['requiresHumanApproval'] = 'yes' }).length > 0, 'type')
+  assert.ok(check((er) => { er['id'] = 'not-a-urn' }).length > 0, 'pattern')
+  assert.ok(check((er) => { er['capability'] = '' }).length > 0, 'minLength')
+  assert.ok(check((er) => { er['policyLabels'] = ['dup', 'dup'] }).length > 0, 'uniqueItems')
+  assert.ok(check((er) => { er['smuggled'] = true }).length > 0, 'additionalProperties: false')
+  assert.ok(check((er) => {
+    (er['target'] as Record<string, unknown>)['identifier'] = 42
+  }).length > 0, 'nested object properties')
+})
+
+/**
+ * CodeQL `js/polynomial-redos` on the pre-fix `slug()` trim (`/^-+|-+$/`). `artifact_id` becomes
+ * `pinKey`, which `slug()` puts into the EffectRequest `id` — so a register value walks straight
+ * into the regex. Measured on the pre-fix implementation: 48 ms at 10k dashes, 2.8 s at 80k,
+ * 11.4 s at 160k (clean quadratic). The linear index walk does 400k in about a millisecond, so the
+ * 5 s bound below cannot be met by the old code on any runner and is not tight for the new one.
+ */
+test('slug() is linear — the EffectRequest id builder is not a ReDoS', () => {
+  const pathological = 'x' + '-'.repeat(400_000) + 'y'
+  const store = new HellGraphStore(new AtomSpace('vendor-graph-redos', false))
+  ingestVendorFreshness(store, {
+    ...REGISTER,
+    artifacts: [{ ...REGISTER.artifacts[1], artifact_id: pathological }],
+  })
+
+  const t0 = process.hrtime.bigint()
+  const p = proposeRevendor(store, vfpId.pin(pathological), { requestedAt: '2026-07-29T00:00:00Z' })
+  const ms = Number(process.hrtime.bigint() - t0) / 1e6
+
+  assert.ok(ms < 5_000, `slug() went quadratic: ${ms.toFixed(0)} ms for 400k separators`)
+  // ...and it still produces a contract-legal id: the dashes are trimmed at both ends.
+  assert.match(p.effectRequest.id, /^urn:srcos:effect:[A-Za-z0-9._~-]+$/)
+  assert.ok(!p.effectRequest.id.endsWith('-'), 'trailing separators trimmed')
 })

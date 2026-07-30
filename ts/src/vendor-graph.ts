@@ -282,7 +282,26 @@ export interface VendorGraphIngestStats {
   supersededByEdges: number
 }
 
-const slug = (s: string): string => s.replace(/[^A-Za-z0-9._~-]+/g, '-').replace(/^-+|-+$/g, '')
+/**
+ * Reduce a register-supplied string to the `[A-Za-z0-9._~-]` alphabet the EffectRequest `id` and
+ * `requestedByEventRef` patterns allow, with leading/trailing separators trimmed.
+ *
+ * The trim is an index walk, NOT `/^-+|-+$/`. That regex is a polynomial-ReDoS (CodeQL
+ * `js/polynomial-redos`): on `x` + n dashes + `y` the `-+$` alternative is retried from every
+ * dash, each attempt scanning to the end — measured 48 ms at n=10k rising to 11.4 s at n=160k on
+ * the pre-fix implementation. `pinKey` and `version` reach here from a caller-supplied register,
+ * and this is a published library, so the input is not ours to trust. The walk below is linear
+ * and allocation-free.
+ */
+const slug = (s: string): string => {
+  const collapsed = s.replace(/[^A-Za-z0-9._~-]+/g, '-')
+  const DASH = 45 // '-'
+  let start = 0
+  let end = collapsed.length
+  while (start < end && collapsed.charCodeAt(start) === DASH) start++
+  while (end > start && collapsed.charCodeAt(end - 1) === DASH) end--
+  return collapsed.slice(start, end)
+}
 
 /** Deterministic node ids in the lift's `ex:` instance namespace. */
 export const vfpId = {
