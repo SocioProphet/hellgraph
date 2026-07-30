@@ -155,8 +155,37 @@ test('SECURITY: an unsupplied Cypher $param named for a prototype member resolve
 // them author entries a later reader attributes to the system.
 
 const C = String.fromCharCode
-/** Every character class a terminal, log viewer or line-oriented parser may treat as a break. */
-const LINE_BREAKING = /[\p{Cc}\p{Zl}\p{Zp}]/u
+
+/**
+ * What a log READER can be made to misrender.
+ *
+ * Written as an explicit enumeration, deliberately NOT as the Unicode categories
+ * `sanitizeLogValue` happens to strip. The first version of this constant was
+ * `/[\p{Cc}\p{Zl}\p{Zp}]/u` — character-for-character the implementation's own class — so the
+ * general assertions below could not fail for anything the implementation had omitted. They
+ * were decoration that looked like coverage, and `\p{Cf}` survived behind them: U+202E and
+ * U+200B passed the whole suite.
+ *
+ * So this list is derived from the consumer's behaviour instead. Each range is here because of
+ * what it does to a reader or a parser, not because of which category it belongs to. If the
+ * implementation later drops a class this list still names, these tests go red — which is the
+ * only arrangement in which they are worth running.
+ */
+const UNSAFE_IN_A_LOG_FIELD = new RegExp(
+  '[' +
+  '\\u0000-\\u001F' +  // C0: NUL truncates C-string consumers, ESC drives ANSI, VT/FF/CR/LF break
+  '\\u007F-\\u009F' +  // DEL + C1 controls; U+0085 NEL is a real terminator to Unicode readers
+  '\\u00AD' +          // SOFT HYPHEN — invisible; splits a token so a search never matches it
+  '\\u061C' +          // ARABIC LETTER MARK — bidi control
+  '\\u200B-\\u200F' +  // ZWSP/ZWNJ/ZWJ/LRM/RLM — invisible, or reorder the rest of the field
+  '\\u2028\\u2029' +   // LINE / PARAGRAPH SEPARATOR
+  '\\u202A-\\u202E' +  // bidi embed/override — the Trojan Source class
+  '\\u2066-\\u2069' +  // bidi isolates
+  '\\uFEFF' +          // BOM / ZWNBSP — invisible
+  ']', 'u')
+
+/** Kept under the old name so the assertions below read as before. */
+const LINE_BREAKING = UNSAFE_IN_A_LOG_FIELD
 
 const FORGERY_VECTORS: [string, string][] = [
   ['LF', C(0x0a)],
@@ -169,6 +198,19 @@ const FORGERY_VECTORS: [string, string][] = [
   ['PS U+2029', C(0x2029)],
   ['NUL', C(0x00)],
   ['ANSI CSI erase-line', C(0x1b) + '[2K' + C(0x1b) + '[1G'],
+  // Forge the READING of the line rather than the line itself. None of these contain a
+  // terminator, so every CR/LF-shaped defence lets them straight through.
+  ['RLO U+202E (Trojan Source)', C(0x202e)],
+  ['LRO U+202D', C(0x202d)],
+  ['RLE U+202B', C(0x202b)],
+  ['bidi isolate U+2066', C(0x2066)],
+  ['bidi isolate pop U+2069', C(0x2069)],
+  ['RLM U+200F', C(0x200f)],
+  ['ZWSP U+200B', C(0x200b)],
+  ['ZWNJ U+200C', C(0x200c)],
+  ['SOFT HYPHEN U+00AD', C(0xad)],
+  ['BOM U+FEFF', C(0xfeff)],
+  ['ARABIC LETTER MARK U+061C', C(0x61c)],
 ]
 
 test('SECURITY: no control character can forge a second log line', () => {
