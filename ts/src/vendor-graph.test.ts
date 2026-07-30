@@ -975,6 +975,26 @@ test('a stale track-minor pin proposes the newest IN-LANE release, not the newes
   assert.deepEqual(p.contractViolations, [])
 })
 
+test('the in-lane target is the newest by PRECEDENCE, not the last release in the declared chain', () => {
+  // The filter above ranks with `compareVersions` precisely because "a register may declare its
+  // releases out of order" — the supersession chain is declared order, not precedence order. The
+  // proposal target has to honour the same rule. Picking `onLine[last]` (the chain tail) here would
+  // reintroduce the exact chain-vs-precedence defect this stack removes, one level down: an
+  // out-of-order 0.4 line `[0.4.46, 0.4.9]` would propose `→ 0.4.9`, seal a re-vendor receipt for
+  // it, and print a rationale calling 0.4.9 the "newest". 0.4.46 is newer and also on the line.
+  const store = minorLineFixture(['0.4.5', '0.4.46', '0.4.9'], '0.4.5')
+  const v = stalenessOf(store, LINE_PIN)
+  assert.equal(v.freshnessState, 'stale')
+  assert.equal(v.policyTargetVersion, '0.4.46',
+    'newest IN-LANE by version, not 0.4.9 (the last release in the declared chain)')
+  assert.ok(v.rationale.includes('newest 0.4.46'), `rationale must name the real newest: ${v.rationale}`)
+  assert.ok(!v.rationale.includes('newest 0.4.9'), `rationale must not call 0.4.9 newest: ${v.rationale}`)
+
+  const p = proposeRevendor(store, LINE_PIN, { requestedAt: '2026-07-30T00:00:00Z' })
+  assert.equal(p.effectRequest.parameters['toVersion'], '0.4.46',
+    'the sealed proposal targets the real newest in-lane release')
+})
+
 test('track-latest still proposes the newest release — the split is per-policy, not global', () => {
   const store = minorLineFixture(['0.4.46', '0.4.47', '0.5.0'], '0.4.46', 'track-latest')
   const v = stalenessOf(store, LINE_PIN)

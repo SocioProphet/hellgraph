@@ -742,6 +742,14 @@ export interface StalenessVerdict {
    * `0.4.47` even when `0.5.0` exists. This is the version `proposeRevendor` proposes: without
    * it a policy that correctly REFUSES a cross-minor bump would still emit a proposal to make
    * it, and the refusal would be a verdict nobody acts on.
+   *
+   * Required, not optional. Like every other field on this verdict it is DERIVED and always
+   * produced — `stalenessOf` seeds it with `pinnedVersion` and only ever narrows it — and
+   * `StalenessVerdict` is an OUTPUT type: produced here, read by consumers, not constructed by
+   * them. Adding a field a reader will simply receive is not a break; making it optional would
+   * instead push an `undefined` that never occurs onto every read site (`proposeRevendor` reads it
+   * unconditionally). If a downstream ever does construct this verdict, that call site wanting the
+   * new field set is the correct signal, not a reason to weaken the type.
    */
   policyTargetVersion: string
   /** DERIVED, per the policy. */
@@ -875,7 +883,15 @@ export function stalenessOf(store: HellGraphStore, pinId: string): StalenessVerd
         (followsPre || !isPrerelease(a.version)))
       const offLine = intervening.filter((a) => minorLineOf(a.version) !== line)
       freshnessState = onLine.length > 0 ? 'stale' : 'current'
-      const newestOnLine = onLine[onLine.length - 1]?.version
+      // The newest in-lane release by PRECEDENCE, not by chain position. `onLine` preserves the
+      // supersession-chain order, which is the register's declared order and — as the filter above
+      // says — may be out of order; `onLine[last]` would therefore reintroduce the exact chain-vs-
+      // precedence defect this stack removes, one level down (an out-of-order `[0.4.46, 0.4.9]`
+      // would propose `0.4.9` and seal a receipt whose rationale calls it "newest"). Reduce by
+      // `compareVersions` — the same ranking `newestReleasedVersion` uses for the same reason.
+      const newestOnLine = onLine.length > 0
+        ? onLine.reduce((m, a) => (compareVersions(a.version, m.version) > 0 ? a : m)).version
+        : undefined
       // The proposal target is the newest IN-LANE release, never `latestVersion`. `0.5.0` being
       // newer is not a reason to propose it to a pin that follows `0.4.*`.
       if (newestOnLine !== undefined) policyTargetVersion = newestOnLine
