@@ -6,18 +6,25 @@ import { OPINION_WEIGHT_MULTIPLIER } from './claim-admissibility'
 import { SEMANTIC_ACTION_SCHEMA_SHA256 } from './semantic-action-data'
 import {
   ActionRegistry,
+  assertSupportedKeywords,
   compileQuestion,
   kkoConceptLexicon,
   kkoSemanticAnnotator,
   lexiconAnnotator,
+  matchesFormat,
   planNodes,
   tokenizeQuestion,
+  validateAgainst,
   validateSemanticAction,
   DEFAULT_SENSE_WEIGHTS,
+  implementedFormats,
+  isImplementedFormat,
   NLQ_LITERAL_TYPE,
   SEMANTIC_ACTION_CONTRACT,
+  SEMANTIC_ACTION_SCHEMA,
   type ConceptLexiconEntry,
   type PlanNode,
+  type SchemaObj,
   type SemanticActionDef,
 } from './nlq'
 
@@ -194,6 +201,179 @@ test('stored action definitions are frozen — a search cannot be mutated undern
   assert.equal(r.get(GET_CONTACT_LISTS)!.sideEffects, 'none')
   assert.throws(() => { def.inputs.push({ name: 'x', typeRef: THING, required: false, cardinality: 'one' }) }, TypeError)
   assert.equal(r.get(GET_CONTACT_LISTS)!.inputs.length, 1)
+})
+
+// ─── format: declared ⇒ enforced ───────────────────────────────────────────────
+
+/**
+ * The formats the validator is expected to implement, each with a value it must ACCEPT and one it
+ * must REJECT.
+ *
+ * Written out literally, on purpose. Deriving this list from `implementedFormats()` would make the
+ * tests below a tautology — they would go green for a format that reached the accept-list and was
+ * never implemented, which is exactly the bug this section exists to catch. So adding a format
+ * forces a row here, and the row forces a counter-example, which is what keeps a stub check that
+ * returns `true` for everything from being smuggled in behind an accepted name.
+ */
+const EXPECTED_FORMATS: ReadonlyArray<{ format: string; accepts: string; rejects: string }> = [
+  { format: 'date-time', accepts: '2026-07-29T00:00:00Z', rejects: '2026-07-29' },
+  { format: 'uri', accepts: 'https://schemas.srcos.ai/v2/SemanticAction.json', rejects: ':ContactList' },
+]
+
+/** Every `format` value a schema declares, at any depth. Independent of the validator's own walk. */
+function declaredFormats(node: unknown, into = new Set<string>()): Set<string> {
+  if (Array.isArray(node)) { for (const v of node) declaredFormats(v, into); return into }
+  if (node === null || typeof node !== 'object') return into
+  for (const [k, v] of Object.entries(node as Record<string, unknown>)) {
+    if (k === 'format' && typeof v === 'string') into.add(v)
+    else declaredFormats(v, into)
+  }
+  return into
+}
+
+test('the format accept-list is exactly the set of formats that have a check', () => {
+  assert.deepEqual(
+    [...implementedFormats()].sort(),
+    EXPECTED_FORMATS.map((f) => f.format).sort(),
+    'a format reached the accept-list without a row — and a counter-example — in this test')
+})
+
+test('every accepted format has TEETH: it accepts the good value and rejects the bad one', () => {
+  for (const { format, accepts, rejects } of EXPECTED_FORMATS) {
+    const schema: SchemaObj = { type: 'string', format }
+
+    const clean: string[] = []
+    validateAgainst(schema, accepts, 'v', clean)
+    assert.deepEqual(clean, [], `${format}: '${accepts}' should validate clean`)
+
+    const errs: string[] = []
+    validateAgainst(schema, rejects, 'v', errs)
+    assert.equal(errs.length, 1,
+      `${format}: '${rejects}' must be rejected — a format that rejects nothing is declared, not enforced`)
+
+    // The same rule asked directly, so a call site cannot get a second opinion.
+    assert.equal(matchesFormat(format, accepts), true, format)
+    assert.equal(matchesFormat(format, rejects), false, format)
+  }
+})
+
+/**
+ * Copilot review finding on #37. A structural regex accepts the right punctuation, not a time:
+ * `2026-99-99T99:99:99Z` cleared the old check. A format check that admits values no clock can
+ * produce is shape-matching wearing enforcement's clothes, which is the thing this whole section
+ * exists to prevent — so the ranges, and the calendar, are asserted here.
+ */
+test('date-time rejects impossible instants, not just the wrong shape', () => {
+  const IMPOSSIBLE = [
+    '2026-99-99T99:99:99Z',   // the value that cleared the purely structural regex
+    '2026-13-01T00:00:00Z',   // month 13
+    '2026-00-01T00:00:00Z',   // month 0
+    '2026-02-30T00:00:00Z',   // February 30 — shape-valid, calendar-impossible
+    '2026-04-31T00:00:00Z',   // April has 30 days
+    '2026-01-32T00:00:00Z',   // day 32
+    '2026-01-00T00:00:00Z',   // day 0
+    '2026-01-01T24:00:00Z',   // hour 24
+    '2026-01-01T00:60:00Z',   // minute 60
+    '2026-01-01T00:00:61Z',   // second 61 (60 is a permitted leap second)
+    '2026-01-01T00:00:00+99:00', // offset hours out of range
+    '2026-01-01T00:00:00+00:99', // offset minutes out of range
+  ]
+  for (const bad of IMPOSSIBLE) {
+    assert.equal(matchesFormat('date-time', bad), false, `${bad} must not pass as an instant`)
+    const errs: string[] = []
+    validateAgainst({ type: 'string', format: 'date-time' }, bad, 'v', errs)
+    assert.equal(errs.length, 1, `${bad} must be reported as a violation`)
+  }
+
+  // …and the real ones still pass, including the leap second and a genuine leap day.
+  for (const good of [
+    '2026-07-29T00:00:00Z',
+    '2024-02-29T12:00:00Z',      // 2024 is a leap year
+    '2000-02-29T00:00:00Z',      // divisible by 400 — a leap year
+    '2026-12-31T23:59:60Z',      // leap second, permitted by RFC 3339
+    '2026-01-01T00:00:00.123Z',
+    '2026-01-01T00:00:00-05:00',
+  ]) {
+    assert.equal(matchesFormat('date-time', good), true, `${good} is a real instant and must pass`)
+  }
+
+  // 1900 is NOT a leap year (divisible by 100, not by 400) — the rule `Date.UTC` would have got
+  // wrong for a two-digit year is exercised at both ends.
+  assert.equal(matchesFormat('date-time', '1900-02-29T00:00:00Z'), false)
+  assert.equal(matchesFormat('date-time', '1900-02-28T00:00:00Z'), true)
+})
+
+/**
+ * Copilot review finding on #37, low-confidence channel — and the sharpest one on this PR.
+ *
+ * The accept-list used to be `export const IMPLEMENTED_FORMATS: ReadonlySet<string>`. `ReadonlySet`
+ * is erased at runtime, so a caller could `.add()` to it and widen what the bar admits WITHOUT
+ * adding a check. `validateAgainst` skips any format it has no entry for, so the smuggled name then
+ * cleared import and was enforced by nobody — the module's own failure mode, reachable from outside
+ * it. The accept-list is now a function over `FORMAT_CHECKS`, so there is nothing to mutate.
+ */
+test('the accept-list cannot be widened from outside — there is no mutable copy of it', () => {
+  const before = implementedFormats()
+  assert.ok(!isImplementedFormat('email'), 'precondition: email is not implemented')
+
+  // Whatever a caller is handed, mutating it must not widen the bar. (A fresh array per call, so
+  // this mutates a copy and nothing else.)
+  assert.throws(() => { (before as string[]).push('email') }, TypeError,
+    'the snapshot handed to callers must be frozen')
+
+  assert.equal(isImplementedFormat('email'), false, 'the bar must still refuse email')
+  assert.deepEqual(implementedFormats(), before, 'a later snapshot must be unchanged')
+  assert.throws(() => assertSupportedKeywords({ type: 'string', format: 'email' }, 'T'),
+    /is NOT implemented/, 'and a contract declaring it must still be refused at import')
+
+  // Two snapshots must not be the same object, or handing one out leaks the source of truth.
+  assert.notEqual(implementedFormats(), implementedFormats(), 'each call returns a fresh array')
+  assert.deepEqual(implementedFormats(), implementedFormats(), '…with equal contents')
+})
+
+test('a contract declaring an UNIMPLEMENTED format fails LOUDLY at the import bar', () => {
+  const withEmail: SchemaObj = {
+    type: 'object',
+    properties: { contact: { type: 'string', format: 'email' } },
+  }
+  assert.throws(
+    () => assertSupportedKeywords(withEmail, 'T'),
+    /format "email" at T\.properties\.contact is declared by the contract but is NOT implemented/)
+
+  // Why the bar has to be the thing that rejects it: silence is the failure mode. Bypass the bar and
+  // the declared constraint simply is not applied — no error, no signal, less validation than the
+  // contract claims. That is the gap; the throw above is the whole fix.
+  const errs: string[] = []
+  validateAgainst(withEmail, { contact: 'definitely not an email' }, 'T', errs)
+  assert.deepEqual(errs, [], 'unenforced when the bar is skipped — which is precisely why it must reject')
+
+  for (const bogus of ['uuid', 'ipv4', 'hostname', 'URI', '', 'constructor', 'toString']) {
+    assert.throws(() => assertSupportedKeywords({ type: 'string', format: bogus }, 'T'),
+      /is NOT implemented/, `format: ${JSON.stringify(bogus)} must not clear the bar`)
+  }
+  assert.throws(() => assertSupportedKeywords({ type: 'string', format: 7 }, 'T'), /is NOT implemented/)
+  assert.throws(() => matchesFormat('email', 'a@b.example'), /not implemented by validateAgainst/)
+})
+
+test('SemanticAction declares only formats that are enforced, and its uri format bites', () => {
+  // Importing nlq.ts at all ran the bar over this schema; assert it explicitly so the claim is
+  // stated rather than implied, and pin what the contract actually declares.
+  assertSupportedKeywords(SEMANTIC_ACTION_SCHEMA as SchemaObj, 'SemanticAction')
+  const declared = declaredFormats(SEMANTIC_ACTION_SCHEMA)
+  assert.deepEqual([...declared].sort(), ['uri'], 'the contract declares format: uri and nothing else')
+  for (const f of declared) assert.ok(isImplementedFormat(f), `${f} is declared but not implemented`)
+
+  // …and the real contract's own `format: uri` (on `typeRef`) rejects the bare `:Thing` shorthand,
+  // not just a synthetic schema built in this file.
+  const good = act({ name: 'crm.fmt' }) as unknown as Record<string, unknown>
+  const clean: string[] = []
+  validateAgainst(SEMANTIC_ACTION_SCHEMA as SchemaObj, good, 'SemanticAction', clean)
+  assert.deepEqual(clean, [], 'baseline: a well-formed action conforms')
+
+  const errs: string[] = []
+  validateAgainst(SEMANTIC_ACTION_SCHEMA as SchemaObj,
+    { ...good, output: { typeRef: ':ContactList', cardinality: 'one' } }, 'SemanticAction', errs)
+  assert.ok(errs.some((e) => /not an absolute URI/.test(e)), errs.join('; '))
 })
 
 // ─── Tokenization + annotation ─────────────────────────────────────────────────
