@@ -38,7 +38,43 @@ jobs:
 
       - name: Detect TS/dist-relevant changes
         id: changed
+        env:
+          # Single source of truth for "this change can affect ts/dist". Must stay a superset of
+          # the `on.push.paths` list above — the step below asserts exactly that, because the two
+          # drifting apart is what this comment block keeps recording.
+          TS_PATHS: '^(package(-lock)?\.json|ts/|ontology/|scripts/|\.github/workflows/ts-ci\.yml)'
         run: |
+          # The PR detector must not be NARROWER than the workflow's own push filter. It was:
+          # push declared ontology/** and scripts/** relevant, the detector did not, and the
+          # derivation is real —
+          #   ontology/kko/kko-2.10.n3        -> scripts/gen-kko.mjs             -> ts/src/kko-data.ts
+          #   ontology/effect-request/*.json  -> scripts/gen-effect-request.mjs  -> ts/src/*
+          #   ontology/semantic-action/*.json -> scripts/gen-semantic-action.mjs -> ts/src/semantic-action-data.ts
+          #                                                                      -> ts/dist
+          # so a re-vendor touching only ontology/ took the "trivially satisfied" branch and
+          # build-and-verify-dist — a REQUIRED check on main — went green having built nothing.
+          # The kko-provenance job below covers the FIRST of those three chains, but it is not a
+          # required check, and nothing covers the other two.
+          #
+          # Derive the push filter from this file rather than restating it, so widening one and
+          # forgetting the other fails here instead of silently skipping a build.
+          python3 - <<'PY'
+          import os, re, sys, pathlib
+          wf = pathlib.Path('.github/workflows/ts-ci.yml').read_text().split('\n')
+          start = next(i for i, l in enumerate(wf) if l.startswith('  push:'))
+          end = next(i for i, l in enumerate(wf[start + 1:], start + 1) if re.match(r'^  \S', l))
+          declared = re.findall(r'^\s*-\s*"([^"]+)"', '\n'.join(wf[start:end]), re.M)
+          if not declared:
+              sys.exit('::error::could not read on.push.paths from ts-ci.yml — this guard has gone blind')
+          rx = re.compile(os.environ['TS_PATHS'])
+          # One representative path per declared family; a glob stands for a file beneath it.
+          bad = [p for p in declared if not rx.match(p.replace('**', 'x').replace('*', 'x'))]
+          if bad:
+              sys.exit(f'::error::on.push.paths declares {bad} relevant, but the PR change-detector '
+                       f'regex does not match them. A PR touching only those paths would report '
+                       f'build-and-verify-dist green without building anything.')
+          print(f'detector covers all {len(declared)} declared push paths: {declared}')
+          PY
           if [ "${{ github.event_name }}" != "pull_request" ]; then
             # push is already path-filtered to TS-relevant paths — always build.
             echo "ts=true" >> "$GITHUB_OUTPUT"
@@ -53,8 +89,7 @@ jobs:
           #     defines this gate was the one change the gate never ran on. This PR is that
           #     shape: before this line was widened, the commit adding the Test step below had
           #     it reported as `skipped`.
-          if git diff --name-only "$base" "$head" \
-             | grep -qE '^(package(-lock)?\.json|ts/|\.github/workflows/ts-ci\.yml)'; then
+          if git diff --name-only "$base" "$head" | grep -qE "$TS_PATHS"; then
             echo "ts=true" >> "$GITHUB_OUTPUT"
           else
             echo "ts=false" >> "$GITHUB_OUTPUT"
@@ -99,7 +134,7 @@ jobs:
 
       - name: No TS/dist changes — required check trivially satisfied
         if: steps.changed.outputs.ts != 'true'
-        run: echo "This PR touches no package.json, package-lock.json, ts/** or ts-ci.yml files; build-and-verify-dist has nothing to verify."
+        run: echo "This PR touches no package.json, package-lock.json, ts/**, ontology/**, scripts/** or ts-ci.yml files; build-and-verify-dist has nothing to verify."
 
   # ── Vendored-ontology provenance (W12) ─────────────────────────────────────────────
   # ontology/kko/PROVENANCE.md recorded a sha256 that NOTHING verified. Consumers across the
