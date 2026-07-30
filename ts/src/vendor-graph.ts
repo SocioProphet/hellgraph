@@ -734,6 +734,16 @@ export interface StalenessVerdict {
   /** The artifacts crossed, in release order. `releaseDistance === intervening.length`. */
   intervening: InterveningArtifact[]
   freshnessPolicy: FreshnessPolicy
+  /**
+   * The newest release the POLICY is willing to take — which is not always `latestVersion`.
+   *
+   * `track-latest` takes the newest release; `pin-exact` takes nothing, so it is the pinned
+   * version; `track-minor` takes the newest release **on the pinned `x.y` line**, which is
+   * `0.4.47` even when `0.5.0` exists. This is the version `proposeRevendor` proposes: without
+   * it a policy that correctly REFUSES a cross-minor bump would still emit a proposal to make
+   * it, and the refusal would be a verdict nobody acts on.
+   */
+  policyTargetVersion: string
   /** DERIVED, per the policy. */
   freshnessState: FreshnessState
   /** DECLARED in the register. */
@@ -750,7 +760,23 @@ export interface StalenessVerdict {
   guardInvokedByCi?: boolean
 }
 
-const majorOf = (v: string): string => v.split('.')[0] ?? v
+/**
+ * The `x.y` line a version belongs to — the lane a `track-minor` pin follows — or `undefined`
+ * if the version is not release-shaped and therefore has no lane.
+ *
+ * Derived through `parseVersion`, not `split('.')`: `v0.4.46`, `0.4.46+build.7` and `0.4` all
+ * name a point on the `0.4` line, and a commit sha or the literal `unknown` names no line at
+ * all. A missing minor is `0` (`1` and `1.0` are the same lane), matching `compareVersions`,
+ * which already treats a missing component as `0`.
+ */
+function minorLineOf(v: string): string | undefined {
+  const p = parseVersion(v)
+  if (!p) return undefined
+  return `${p.release[0] ?? '0'}.${p.release[1] ?? '0'}`
+}
+
+/** Is `v` a prerelease (`1.0.0-rc.1`)? Non-release-shaped strings are not. */
+const isPrerelease = (v: string): boolean => parseVersion(v)?.prerelease !== undefined
 
 /**
  * Derive the staleness of one pin from the graph.
@@ -758,13 +784,41 @@ const majorOf = (v: string): string => v.split('.')[0] ?? v
  * PURE — reads only. Returns the release distance and the intervening artifacts, because the
  * actionable question is never "is it stale" but "how far, across what".
  *
- * Policy semantics are the register's, implemented verbatim:
+ * Policy semantics are the register's:
  *   • `pin-exact`    — never stale, but ONLY if upstream has actually been OBSERVED. A pin to
  *                      something nobody has looked at is `unknown`, not `current` — it is an
  *                      unknown wearing a pin's clothes.
- *   • `track-minor`  — stale if a newer artifact shares the pinned major, or if the newest
- *                      artifact's major differs at all.
+ *   • `track-minor`  — the pin follows ONE MINOR LINE, `x.y.*`. Stale when a newer release lands
+ *                      ON that line; NOT stale when the only newer releases have left it.
  *   • `track-latest` — stale if the distance is greater than zero.
+ *
+ * ── `track-minor` used to mean `track-latest` ───────────────────────────────────────────
+ * The previous implementation was
+ *
+ *     const sameMajorNewer = intervening.some((a) => majorOf(a.version) === majorOf(pinnedVersion))
+ *     const majorMoved     = releaseDistance > 0 && majorOf(latestVersion) !== majorOf(pinnedVersion)
+ *     freshnessState = sameMajorNewer || majorMoved ? 'stale' : 'current'
+ *
+ * — MAJOR, not minor, and the two arms between them are exhaustive: if nothing newer shares the
+ * pinned major then the newest cannot either, so `majorMoved` fires. `releaseDistance > 0` was
+ * therefore ALWAYS stale, and `track-minor` was `track-latest` with a major-shaped rationale
+ * string attached. Three declared policies, two distinct behaviours. A register author writing
+ * `freshness_policy: track-minor` — the DEFAULT, and what every pin in the live vendor register
+ * declares — was silently opted in to cross-minor bumps: a pin at `0.4.46` was reported stale
+ * against `0.5.0` and a re-vendor proposal to `0.5.0` was emitted and sealed for it.
+ *
+ * Now: a `track-minor` pin at `0.4.46` is stale against `0.4.47` and CURRENT against `0.5.0`.
+ * Leaving the line is a deliberate act — an owner editing the pin, or declaring `track-latest` —
+ * not something the freshness plane proposes on the owner's behalf. The rationale names the
+ * off-line releases anyway, so `current` here never means "nothing happened upstream".
+ *
+ * Two boundary rules, both stated so they are not rediscovered as bugs:
+ *   · A pin whose version is NOT release-shaped (a sha, `unknown`) has no minor line to follow,
+ *     so its state is `unknown`, not a guess in either direction — the same answer this function
+ *     already gives an unobserved pin, for the same reason.
+ *   · A PRERELEASE does not make a stable pin stale (`0.4.47-rc.1` leaves `0.4.46` current),
+ *     matching how semver ranges treat prereleases: opt-in, never inherited. A pin that is
+ *     itself a prerelease does follow them.
  */
 export function stalenessOf(store: HellGraphStore, pinId: string): StalenessVerdict {
   const pin = store.getNode(pinId)
@@ -789,6 +843,8 @@ export function stalenessOf(store: HellGraphStore, pinId: string): StalenessVerd
   const observed = releaseDistance > 0 || store.in(pinnedArtifact.id, VFP_EDGE.supersededBy).length > 0
   let freshnessState: FreshnessState
   let rationale: string
+  // Defaults to the pinned version: a policy that takes nothing proposes nothing.
+  let policyTargetVersion = pinnedVersion
   if (!observed) {
     freshnessState = 'unknown'
     rationale = `no upstream release history for ${pinnedVersion} in the graph — unobserved, not current`
@@ -797,18 +853,40 @@ export function stalenessOf(store: HellGraphStore, pinId: string): StalenessVerd
     rationale = `pin-exact against an observed upstream: ${releaseDistance} newer release(s) exist and are deliberately not taken`
   } else if (freshnessPolicy === 'track-latest') {
     freshnessState = releaseDistance > 0 ? 'stale' : 'current'
+    policyTargetVersion = latestVersion
     rationale = releaseDistance > 0
       ? `track-latest: ${releaseDistance} release(s) behind ${latestVersion}`
       : `track-latest: pinned at the newest release ${pinnedVersion}`
   } else {
-    const sameMajorNewer = intervening.some((a) => majorOf(a.version) === majorOf(pinnedVersion))
-    const majorMoved = releaseDistance > 0 && majorOf(latestVersion) !== majorOf(pinnedVersion)
-    freshnessState = sameMajorNewer || majorMoved ? 'stale' : 'current'
-    rationale = freshnessState === 'stale'
-      ? (sameMajorNewer
-        ? `track-minor: ${releaseDistance} newer release(s) share major ${majorOf(pinnedVersion)}, newest ${latestVersion}`
-        : `track-minor: newest release ${latestVersion} changes major from ${majorOf(pinnedVersion)}`)
-      : `track-minor: nothing newer within major ${majorOf(pinnedVersion)}`
+    const line = minorLineOf(pinnedVersion)
+    if (line === undefined) {
+      // No lane can be derived, so neither `stale` nor `current` is a fact. Saying either would
+      // be inventing one; `unknown` is the state this function already has for exactly that.
+      freshnessState = 'unknown'
+      rationale = `track-minor: pinned version '${pinnedVersion}' is not release-shaped, so it names no ` +
+        `x.y line to follow — undecidable, not current (declare pin-exact or track-latest, or pin a release)`
+    } else {
+      // In-lane: same x.y line, strictly newer by PRECEDENCE (not by chain position — a register
+      // may declare its releases out of order), and not a prerelease unless the pin is one.
+      const followsPre = isPrerelease(pinnedVersion)
+      const onLine = intervening.filter((a) =>
+        minorLineOf(a.version) === line &&
+        compareVersions(a.version, pinnedVersion) > 0 &&
+        (followsPre || !isPrerelease(a.version)))
+      const offLine = intervening.filter((a) => minorLineOf(a.version) !== line)
+      freshnessState = onLine.length > 0 ? 'stale' : 'current'
+      const newestOnLine = onLine[onLine.length - 1]?.version
+      // The proposal target is the newest IN-LANE release, never `latestVersion`. `0.5.0` being
+      // newer is not a reason to propose it to a pin that follows `0.4.*`.
+      if (newestOnLine !== undefined) policyTargetVersion = newestOnLine
+      const offLineNote = offLine.length > 0
+        ? ` (${offLine.length} newer release(s) have left the ${line} line — ${offLine.map((a) => a.version).join(', ')} — ` +
+          `not followed under track-minor)`
+        : ''
+      rationale = freshnessState === 'stale'
+        ? `track-minor: ${onLine.length} newer release(s) on the pinned ${line} line, newest ${newestOnLine}${offLineNote}`
+        : `track-minor: nothing newer on the pinned ${line} line${offLineNote || ` (newest overall ${latestVersion})`}`
+    }
   }
 
   // Agreement, not enforcement of freshness. A `current` declaration over a `stale` derivation is
@@ -829,6 +907,7 @@ export function stalenessOf(store: HellGraphStore, pinId: string): StalenessVerd
     releaseDistance,
     intervening,
     freshnessPolicy,
+    policyTargetVersion,
     freshnessState,
     disposition,
     dispositionAgrees,
@@ -1074,7 +1153,11 @@ export function proposeRevendor(store: HellGraphStore, pinId: string, opts: Prop
   const risk = contractCrossingRiskOf(store, pinId)
   const pin = store.getNode(pinId)!
 
-  const toVersion = str(pin.properties['targetVersion']) ?? verdict.latestVersion
+  // `policyTargetVersion`, not `latestVersion`. They differ exactly when the policy declines the
+  // newest release — a `track-minor` pin at 0.4.46 with 0.4.47 and 0.5.0 upstream is stale, and
+  // the proposal it earns is `→ 0.4.47`. Proposing `→ 0.5.0` there would hand a human the very
+  // cross-minor bump the policy exists to withhold, over a rationale that says it was withheld.
+  const toVersion = str(pin.properties['targetVersion']) ?? verdict.policyTargetVersion
   const location = verdict.artifactPath !== undefined
     ? `${verdict.consumerRepo}/${verdict.artifactPath}`
     : undefined
