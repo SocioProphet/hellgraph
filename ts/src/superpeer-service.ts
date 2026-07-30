@@ -81,7 +81,13 @@ export async function startSuperPeerFromEnv(env: SuperPeerServiceEnv = process.e
       // over any transport wired directly (e.g. a sidecar). Don't crash the pod.
       // Same log boundary as super-peer's request handler: this message originates outside the
       // process (swarm/DHT peers), so it is untrusted text and must not be able to forge a line.
-      console.warn(`[superpeer] joinSwarm skipped: ${sanitizeLogValue((e as Error).message)}`)
+      //
+      // The VALUE is handed over, not `(e as Error).message`: a rejection need not be an Error,
+      // and that cast reads `.message` off whatever it is — `undefined` for a thrown string, so
+      // every non-Error failure logs the identical useless line. `sanitizeLogValue` coerces
+      // total (see `coerceToString`), which is what makes passing the raw value the safe option
+      // rather than the risky one. Same shape super-peer's catch block uses.
+      console.warn(`[superpeer] joinSwarm skipped: ${sanitizeLogValue(e instanceof Error ? e.message : e)}`)
     }
   }
 

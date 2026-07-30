@@ -287,6 +287,35 @@ test('SECURITY: the sanitizer never throws, even on values that refuse to string
   assert.doesNotThrow(() => sanitizeLogValue(nullProto))
 })
 
+/**
+ * Copilot review finding on #34 (low-confidence channel). A `catch` binding is not an Error —
+ * `throw 'boom'` and a promise rejected with a non-Error both land here — so `(e as Error).message`
+ * is `undefined`, and every such failure logs the same contentless line. The whole reason the raw
+ * value can be handed over instead is `coerceToString`: the sanitizer is total, so passing the
+ * value is the SAFE option, not the risky one.
+ */
+test('a non-Error throw keeps its diagnostic content at the log boundary', () => {
+  const notErrors: unknown[] = ['swarm refused: ECONNREFUSED', 42, { code: 'EAI_AGAIN' }, null]
+
+  for (const e of notErrors) {
+    // What the bare cast produced: the content is gone.
+    const viaCast = sanitizeLogValue((e as Error | undefined)?.message)
+    assert.equal(viaCast, 'undefined', 'precondition: reading .message off a non-Error loses it')
+
+    // What the call site does now: the value itself, coerced safely.
+    const viaValue = sanitizeLogValue(e instanceof Error ? e.message : e)
+    assert.notEqual(viaValue, 'undefined', `${String(e)}: must not collapse to "undefined"`)
+    assert.ok(viaValue.length > 0)
+  }
+
+  // A real Error still logs its message, not its [object Error] tag.
+  assert.equal(sanitizeLogValue(new Error('real') instanceof Error ? new Error('real').message : ''), 'real')
+
+  // And the non-Error path is still sanitized — it is untrusted text like any other.
+  const forged = sanitizeLogValue('swarm' + C(0x0a) + '[superpeer] audit: admitted=attacker')
+  assert.ok(!LINE_BREAKING.test(forged), 'a non-Error throw must not be able to forge a line either')
+})
+
 test('SECURITY: an astral-plane format character is escaped as itself, not as its surrogate', () => {
   // \p{Cf} extends past the BMP. The `u`-flagged class matches the whole code point, so the
   // character is neutralized regardless — but the escape is the forensic record of WHAT was
