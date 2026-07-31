@@ -545,6 +545,74 @@ test('the vendored-contract validator has TEETH — a malformed EffectRequest is
 })
 
 /**
+ * …and the verdict that validator produces must be READ.
+ *
+ * `RevendorProposal.contractViolations` has always documented "non-empty means the proposal is NOT
+ * emitted", and nothing implemented it: `analyzeVendorFreshness` sealed every candidate regardless,
+ * and across the whole repo the field had no production reader — no branch, no `.length`, no throw,
+ * only its own definition and these tests. A violation computed, sealed, and never read is worse
+ * than no check at all, because the receipt then carries evidence that the system looked.
+ *
+ * The violation here is driven from the GRAPH, not by mutating a finished request: `policyLabels`
+ * on the pin is declared `['ops','ops']`, `proposeRevendor` joins and re-splits it, and the
+ * vendored contract's `uniqueItems` rejects it. Exactly the shape a bad register entry would take.
+ */
+test('a contract-violating proposal is WITHHELD from the seal and NAMED in it', () => {
+  const store = new HellGraphStore(new AtomSpace('vendor-graph-violation', false))
+  ingestVendorFreshness(store, {
+    ...REGISTER,
+    artifacts: [
+      REGISTER.artifacts[0],
+      { ...REGISTER.artifacts[1], policy_labels: ['ops', 'ops'] },
+    ],
+  })
+
+  // The input really does violate the contract — otherwise the rest of this test proves nothing.
+  const direct = proposeRevendor(store, WARDEN_PIN, { requestedAt: '2026-07-29T00:00:00Z' })
+  assert.ok(direct.contractViolations.length > 0, 'the duplicate policy label is a real violation')
+
+  const a = analyzeVendorFreshness(store, { requestedAt: '2026-07-29T00:00:00Z' })
+
+  // WITHHELD: both pins are stale, so two candidates were built, but only the conforming one is
+  // emitted. Sealing the bad one alongside the good one is the defect.
+  assert.equal(a.pins.filter((p) => p.freshnessState === 'stale').length, 2, 'two stale pins')
+  assert.equal(a.proposals.length, 1, 'only the conforming proposal is emitted')
+  assert.equal(a.proposals[0]!.effectRequest.target.identifier, 'hellgraph-engine@hellgraph-service')
+  assert.ok(a.proposals.every((p) => p.contractViolations.length === 0),
+    'nothing carrying a violation rides inside the seal')
+
+  // NAMED: withholding on its own would be a silent drop.
+  assert.ok(a.contractViolations.length > 0, 'the withheld proposal is reported, not dropped')
+  assert.ok(a.contractViolations.every((v) => v.startsWith('hellgraph-engine@lifecycle-warden: ')),
+    'each violation names the pin it came from, like dispositionViolations does')
+  assert.ok(a.contractViolations.some((v) => /policyLabels/.test(v)), 'and says what was wrong')
+
+  // Sealed, not merely returned: the field is inside the hashed record.
+  const clean = analyzeVendorFreshness(fixture(), { requestedAt: '2026-07-29T00:00:00Z' })
+  assert.deepEqual(clean.contractViolations, [], 'a conforming graph reports none')
+  assert.equal(clean.proposals.length, 2, 'and withholds nothing')
+  assert.notEqual(a.hash, clean.hash, 'the withheld violation changes the seal')
+})
+
+test('contractViolations participates in the seal rather than sitting beside it', () => {
+  // Two analyses whose ONLY difference is the violation must not seal identically. If the field
+  // were dropped from the sealed record, these hashes would collide.
+  const violating = () => {
+    const s = new HellGraphStore(new AtomSpace('vendor-graph-seal', false))
+    ingestVendorFreshness(s, {
+      ...REGISTER,
+      artifacts: [REGISTER.artifacts[0], { ...REGISTER.artifacts[1], policy_labels: ['ops', 'ops'] }],
+    })
+    return analyzeVendorFreshness(s, { requestedAt: '2026-07-29T00:00:00Z' })
+  }
+  const x = violating()
+  const y = violating()
+  assert.equal(x.hash, y.hash, 'still deterministic')
+  assert.ok(x.contractViolations.length > 0)
+  assert.ok(JSON.stringify(x).includes(x.contractViolations[0]!), 'the violation text is in the record')
+})
+
+/**
  * CodeQL `js/polynomial-redos` on the pre-fix `slug()` trim (`/^-+|-+$/`). `artifact_id` becomes
  * `pinKey`, which `slug()` puts into the EffectRequest `id` — so a register value walks straight
  * into the regex. Measured on the pre-fix implementation: 48 ms at 10k dashes, 2.8 s at 80k,
