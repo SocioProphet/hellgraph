@@ -884,3 +884,169 @@ test('a source with no repo produces no edge to an empty repository id', () => {
   assert.equal(store.getNode(emptyRepo), undefined, 'no node was created for the empty repository id')
   assert.deepEqual(store.in(emptyRepo, VFP_EDGE.producedBy), [], 'and nothing points at it')
 })
+
+// ─── 9 ─ `track-minor` means the MINOR line ────────────────────────────────────
+
+/**
+ * `track-minor` was implemented with `majorOf`:
+ *
+ *     const sameMajorNewer = intervening.some((a) => majorOf(a.version) === majorOf(pinnedVersion))
+ *     const majorMoved     = releaseDistance > 0 && majorOf(latestVersion) !== majorOf(pinnedVersion)
+ *     freshnessState = sameMajorNewer || majorMoved ? 'stale' : 'current'
+ *
+ * A policy whose NAME states one contract and whose CODE honoured another. Worse than
+ * "track-minor is really track-major": the two arms are exhaustive — if nothing newer shares the
+ * pinned major then the newest release cannot either, so `majorMoved` fires — which made
+ * `releaseDistance > 0` always stale. `track-minor` was `track-latest`, wearing a major-shaped
+ * rationale string. Three declared policies, two distinct behaviours, and the collapsed one is
+ * the DEFAULT that every pin in the live register declares.
+ *
+ * These tests fix the contract the name states: a pin on `x.y.*` follows its own minor line.
+ */
+const minorLineFixture = (releases: string[], pinned: string, policy = 'track-minor'): HellGraphStore => {
+  const store = new HellGraphStore(new AtomSpace(`vendor-graph-line-${pinned}-${releases.join('_')}-${policy}`, false))
+  ingestVendorFreshness(store, {
+    manifest_id: 'vendor-freshness-minor-line',
+    sources: [{
+      source_id: 'engine',
+      repo: 'SocioProphet/hellgraph',
+      artifact_kind: 'npm-tarball',
+      version_scheme: 'semver',
+      releases: releases.map((version) => ({ version })),
+    }],
+    artifacts: [{
+      artifact_id: 'engine@probe',
+      source_id: 'engine',
+      consumer_repo: 'SocioProphet/prophet-platform',
+      consumer_app: 'apps/probe',
+      vendored_version: pinned,
+      freshness_policy: policy,
+      disposition: 'current',
+    }],
+  })
+  return store
+}
+const LINE_PIN = vfpId.pin('engine@probe')
+
+test('track-minor ACCEPTS a patch bump inside the pinned minor: 0.4.46 → 0.4.47', () => {
+  const v = stalenessOf(minorLineFixture(['0.4.46', '0.4.47'], '0.4.46'), LINE_PIN)
+  assert.equal(v.freshnessState, 'stale', '0.4.47 is on the 0.4 line the pin follows — take it')
+  assert.equal(v.policyTargetVersion, '0.4.47')
+  assert.match(v.rationale, /on the pinned 0\.4 line, newest 0\.4\.47/)
+})
+
+test('track-minor REFUSES a minor bump inside the pinned major: 0.4.46 → 0.5.0', () => {
+  const v = stalenessOf(minorLineFixture(['0.4.46', '0.5.0'], '0.4.46'), LINE_PIN)
+  assert.equal(v.freshnessState, 'current', '0.5.0 left the 0.4 line — not this pin\'s to take')
+  assert.equal(v.releaseDistance, 1, 'and the distance is still REPORTED: current ≠ nothing happened')
+  assert.equal(v.policyTargetVersion, '0.4.46', 'so no cross-minor target is proposed')
+  assert.match(v.rationale, /0\.5\.0.*not followed under track-minor/)
+})
+
+test('track-minor is no longer track-latest — the two now disagree', () => {
+  // The differential the old implementation could not produce: identical graph, both policies.
+  const cases: [string[], string, string, string][] = [
+    [['0.4.46', '0.4.47'], '0.4.46', 'stale', 'stale'],
+    [['0.4.46', '0.5.0'], '0.4.46', 'current', 'stale'],
+    [['0.4.46', '1.0.0'], '0.4.46', 'current', 'stale'],
+    [['0.4.46', '0.4.47', '0.5.0'], '0.4.46', 'stale', 'stale'],
+  ]
+  for (const [releases, pinned, wantMinor, wantLatest] of cases) {
+    assert.equal(stalenessOf(minorLineFixture(releases, pinned), LINE_PIN).freshnessState, wantMinor,
+      `track-minor over ${releases.join('→')}`)
+    assert.equal(stalenessOf(minorLineFixture(releases, pinned, 'track-latest'), LINE_PIN).freshnessState, wantLatest,
+      `track-latest over ${releases.join('→')}`)
+  }
+})
+
+test('a stale track-minor pin proposes the newest IN-LANE release, not the newest release', () => {
+  // 0.4.47 and 0.5.0 both exist. The pin IS stale — 0.4.47 is on its line — and the proposal it
+  // earns is `→ 0.4.47`. Proposing `→ 0.5.0` would hand a human the cross-minor bump the policy
+  // exists to withhold, under a rationale that says it was withheld.
+  const store = minorLineFixture(['0.4.46', '0.4.47', '0.5.0'], '0.4.46')
+  const v = stalenessOf(store, LINE_PIN)
+  assert.equal(v.freshnessState, 'stale')
+  assert.equal(v.latestVersion, '0.5.0', 'the newest release is still reported as such')
+  assert.equal(v.policyTargetVersion, '0.4.47', 'but the policy will only take the 0.4 line')
+
+  const p = proposeRevendor(store, LINE_PIN, { requestedAt: '2026-07-30T00:00:00Z' })
+  assert.equal(p.effectRequest.parameters['toVersion'], '0.4.47')
+  assert.equal(p.effectRequest.idempotencyKey, 'engine@probe@0.4.46->0.4.47')
+  assert.deepEqual(p.contractViolations, [])
+})
+
+test('the in-lane target is the newest by PRECEDENCE, not the last release in the declared chain', () => {
+  // The filter above ranks with `compareVersions` precisely because "a register may declare its
+  // releases out of order" — the supersession chain is declared order, not precedence order. The
+  // proposal target has to honour the same rule. Picking `onLine[last]` (the chain tail) here would
+  // reintroduce the exact chain-vs-precedence defect this stack removes, one level down: an
+  // out-of-order 0.4 line `[0.4.46, 0.4.9]` would propose `→ 0.4.9`, seal a re-vendor receipt for
+  // it, and print a rationale calling 0.4.9 the "newest". 0.4.46 is newer and also on the line.
+  const store = minorLineFixture(['0.4.5', '0.4.46', '0.4.9'], '0.4.5')
+  const v = stalenessOf(store, LINE_PIN)
+  assert.equal(v.freshnessState, 'stale')
+  assert.equal(v.policyTargetVersion, '0.4.46',
+    'newest IN-LANE by version, not 0.4.9 (the last release in the declared chain)')
+  assert.ok(v.rationale.includes('newest 0.4.46'), `rationale must name the real newest: ${v.rationale}`)
+  assert.ok(!v.rationale.includes('newest 0.4.9'), `rationale must not call 0.4.9 newest: ${v.rationale}`)
+
+  const p = proposeRevendor(store, LINE_PIN, { requestedAt: '2026-07-30T00:00:00Z' })
+  assert.equal(p.effectRequest.parameters['toVersion'], '0.4.46',
+    'the sealed proposal targets the real newest in-lane release')
+})
+
+test('track-latest still proposes the newest release — the split is per-policy, not global', () => {
+  const store = minorLineFixture(['0.4.46', '0.4.47', '0.5.0'], '0.4.46', 'track-latest')
+  const v = stalenessOf(store, LINE_PIN)
+  assert.equal(v.policyTargetVersion, '0.5.0')
+  assert.equal(proposeRevendor(store, LINE_PIN, { requestedAt: '2026-07-30T00:00:00Z' })
+    .effectRequest.parameters['toVersion'], '0.5.0')
+})
+
+test('the minor line is parsed, not string-split: v-prefix, build metadata, missing patch', () => {
+  // `split('.')[0]` on `v0.4.46` yields `v0`; on `0.4.46+build.7` the LINE is still 0.4. These all
+  // name a point on the 0.4 line, and `parseVersion` is what knows that.
+  for (const [pinned, newer] of [['v0.4.46', '0.4.47'], ['0.4.46+build.7', 'v0.4.47+build.8'], ['0.4', '0.4.1']]) {
+    const v = stalenessOf(minorLineFixture([pinned!, newer!], pinned!), LINE_PIN)
+    assert.equal(v.freshnessState, 'stale', `${pinned} → ${newer} is an in-lane bump`)
+  }
+  // …and 1 / 1.0 / 1.0.0 are one lane, so 1.1.0 leaves it.
+  assert.equal(stalenessOf(minorLineFixture(['1', '1.1.0'], '1'), LINE_PIN).freshnessState, 'current')
+  assert.equal(stalenessOf(minorLineFixture(['1', '1.0.1'], '1'), LINE_PIN).freshnessState, 'stale')
+})
+
+test('a prerelease does not make a stable track-minor pin stale — but does for a prerelease pin', () => {
+  assert.equal(stalenessOf(minorLineFixture(['0.4.46', '0.4.47-rc.1'], '0.4.46'), LINE_PIN).freshnessState,
+    'current', 'prereleases are opt-in, as in every semver range')
+  assert.equal(stalenessOf(minorLineFixture(['0.4.47-rc.1', '0.4.47-rc.2'], '0.4.47-rc.1'), LINE_PIN).freshnessState,
+    'stale', 'a pin that is itself a prerelease follows them')
+  assert.equal(stalenessOf(minorLineFixture(['0.4.47-rc.1', '0.4.47'], '0.4.47-rc.1'), LINE_PIN).freshnessState,
+    'stale', 'and the release the prerelease led to is in-lane')
+})
+
+test('a track-minor pin that is not release-shaped is UNKNOWN, not a guess', () => {
+  // A sha names no x.y line. Deriving `current` would be the same silent guess the unobserved
+  // branch already refuses to make.
+  const store = new HellGraphStore(new AtomSpace('vendor-graph-shapeless', false))
+  ingestVendorFreshness(store, {
+    manifest_id: 'vendor-freshness-shapeless',
+    sources: [{ source_id: 'engine', repo: 'SocioProphet/hellgraph', releases: [{ version: '7d74db8' }, { version: '0.4.47' }] }],
+    artifacts: [{
+      artifact_id: 'engine@probe', source_id: 'engine',
+      consumer_repo: 'SocioProphet/prophet-platform', consumer_app: 'apps/probe',
+      vendored_version: '7d74db8', freshness_policy: 'track-minor', disposition: 'current',
+    }],
+  })
+  const v = stalenessOf(store, LINE_PIN)
+  assert.equal(v.freshnessState, 'unknown')
+  assert.equal(v.dispositionAgrees, false, 'declaring `current` over an undecidable state is a violation')
+  assert.match(v.rationale, /not release-shaped/)
+})
+
+test('the live register is unaffected: 0.4.40 → 0.4.45 is all one 0.4 line', () => {
+  // The fix must not quietly un-stale the real finding it was built to keep reporting.
+  const v = stalenessOf(fixture(), SERVICE_PIN)
+  assert.equal(v.freshnessState, 'stale')
+  assert.equal(v.policyTargetVersion, '0.4.45', 'every intervening release is on the 0.4 line')
+  assert.equal(v.latestVersion, '0.4.45')
+})
