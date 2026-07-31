@@ -24,7 +24,8 @@
     "typecheck": "tsc -p ts/tsconfig.json --noEmit",
     "test": "node --import tsx --test ts/src/*.test.ts",
     "check:dist": "tsup && git diff --quiet -- ts/dist || (echo 'ERROR: ts/dist is stale vs ts/src \u2014 run: npm run build, then commit ts/dist' && exit 1)",
-    "check:kko": "node --import tsx scripts/check-kko-provenance.mjs"
+    "check:kko": "node --import tsx scripts/check-kko-provenance.mjs",
+    "check:safe-dict": "node scripts/check-safe-dict.mjs"
   },
   "optionalDependencies": {
     "autobase": "7.28.1",
