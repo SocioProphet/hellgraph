@@ -5,7 +5,7 @@ import { HellGraphStore } from './store'
 import { loadKkoIntoAtomSpace } from './kko'
 import {
   ingestVendorFreshness, stalenessOf, blastRadiusOf, contractCrossingRiskOf,
-  proposeRevendor, analyzeVendorFreshness, vendorPinIds, vfpId,
+  proposeRevendor, analyzeVendorFreshness, vendorPinIds, vfpId, compareVersions,
   VFP, VFP_EDGE, VFP_KKO_TYPES, VFP_NS, EFFECT_REQUEST_CONTRACT, EFFECT_REQUEST_SCHEMA,
 } from './vendor-graph'
 import { validateAgainst } from './nlq'
@@ -567,4 +567,320 @@ test('slug() is linear — the EffectRequest id builder is not a ReDoS', () => {
   // ...and it still produces a contract-legal id: the dashes are trimmed at both ends.
   assert.match(p.effectRequest.id, /^urn:srcos:effect:[A-Za-z0-9._~-]+$/)
   assert.ok(!p.effectRequest.id.endsWith('-'), 'trailing separators trimmed')
+})
+
+// ─── Version precedence ────────────────────────────────────────────────────────
+
+/**
+ * A repository can produce more than one vendored artifact — this one demonstrably does: the
+ * package description calls the npm engine the "polyglot sibling of the Rust hellgraph crate", and
+ * the register keys release history by `source_id` while blast radius is keyed by `repo`. So the
+ * head set `newestReleasedVersion` picks from is a set of *several* artifacts, one per source, and
+ * something has to rank them.
+ *
+ * Ranking them with `.sort()` is ASCII ranking, and ASCII puts `0.4.9` above `0.4.46`. That is not
+ * a latent edge case at the time of writing: this engine is at 0.4.46, so every repository past a
+ * two-digit patch resolves to the wrong "newest", and the wrong version is then handed to
+ * `blastRadiusOf` as `proposedVersion` — the blast-radius report names a release that is not the
+ * one anybody would cut.
+ *
+ * The four versions below are chosen so a single-digit-patch fixture cannot pass in place of this
+ * one: ASCII order is 0.4.10, 0.4.46, 0.4.5, 0.4.9 (picking 0.4.9), release order is 0.4.5, 0.4.9,
+ * 0.4.10, 0.4.46 (picking 0.4.46). They disagree on both the maximum and the whole ordering.
+ */
+const POLYGLOT = {
+  manifest_id: 'vendor-freshness-polyglot',
+  policy: { default_freshness_policy: 'track-latest' },
+  sources: [
+    { source_id: 'hellgraph-npm', repo: 'SocioProphet/hellgraph', artifact_kind: 'npm-tarball', releases: [{ version: '0.4.5' }] },
+    { source_id: 'hellgraph-crate', repo: 'SocioProphet/hellgraph', artifact_kind: 'cargo-crate', releases: [{ version: '0.4.9' }] },
+    { source_id: 'hellgraph-wheel', repo: 'SocioProphet/hellgraph', artifact_kind: 'python-wheel', releases: [{ version: '0.4.10' }] },
+    { source_id: 'hellgraph-oci', repo: 'SocioProphet/hellgraph', artifact_kind: 'oci-image', releases: [{ version: '0.4.46' }] },
+  ],
+  artifacts: [
+    {
+      artifact_id: 'hellgraph-npm@service',
+      source_id: 'hellgraph-npm',
+      consumer_repo: 'SocioProphet/prophet-platform',
+      consumer_app: 'apps/hellgraph-service',
+      vendored_version: '0.4.5',
+      freshness_policy: 'track-latest',
+      disposition: 'observation-required',
+    },
+  ],
+}
+
+/**
+ * The comparator's documented rules, pinned one at a time.
+ *
+ * `newestReleasedVersion` only ever asks for the maximum, so almost none of this is exercised by
+ * the graph tests — and an ordering rule that nothing asserts is an ordering rule that the next
+ * edit is free to change. The docstring on `compareVersions` is the specification; this is the
+ * enforcement of it. In particular the prerelease case is here because ASCII on the whole suffix
+ * would rank `rc.10` below `rc.2` and quietly reintroduce the defect one level down.
+ */
+test('compareVersions implements the documented total order', () => {
+  const lt = (a: string, b: string): void => {
+    assert.ok(compareVersions(a, b) < 0, `${a} should precede ${b}`)
+    assert.ok(compareVersions(b, a) > 0, `${b} should follow ${a}`)
+  }
+  const eq = (a: string, b: string): void => {
+    assert.equal(compareVersions(a, b), 0, `${a} and ${b} should be equal in precedence`)
+  }
+
+  // (2) numeric components, not ASCII — the bug this comparator exists for.
+  lt('0.4.5', '0.4.9')
+  lt('0.4.9', '0.4.10')
+  lt('0.4.10', '0.4.46')
+  lt('0.9.0', '0.10.0')
+  lt('2.0.0', '10.0.0')
+
+  // (2) a missing component is 0.
+  lt('0.4', '0.4.1')
+  // ...so these name the same release — but (6) the order is TOTAL, so they are still ordered,
+  // by raw text, rather than tying. A tie would let the sort's output depend on input order, and
+  // this sort's result is sealed.
+  lt('0.4', '0.4.0')
+  lt('1', '1.0.0')
+  assert.notEqual(compareVersions('0.4', '0.4.0'), 0, 'same release, still not a tie')
+
+  // (1) non-releases sort below every release, and by ASCII between themselves.
+  lt('unknown', '0.0.0')
+  lt('f3a9c21', '0.0.0')
+  lt('', '0.0.0')
+  lt('a1b2c3d', 'f3a9c21')
+
+  // (3) a prerelease precedes the release it leads to.
+  lt('1.0.0-rc.1', '1.0.0')
+  lt('0.4.46-alpha', '0.4.46')
+
+  // (4) semver §11 between prereleases: numeric identifiers numerically, and BELOW alphanumeric.
+  lt('1.0.0-rc.2', '1.0.0-rc.10')
+  lt('1.0.0-alpha', '1.0.0-beta')
+  lt('1.0.0-1', '1.0.0-alpha')
+  lt('1.0.0-rc.1', '1.0.0-rc.1.1')
+
+  // (5) build metadata is not part of precedence: it does not make 1.0.0+a newer than 1.0.0.
+  lt('1.0.0-rc.1', '1.0.0+a')
+  // ...but (6) the order stays TOTAL: differing only in build metadata still ranks deterministically.
+  assert.notEqual(compareVersions('1.0.0+a', '1.0.0+b'), 0, 'total order — no unresolved ties')
+  assert.equal(
+    compareVersions('1.0.0+a', '1.0.0+b') + compareVersions('1.0.0+b', '1.0.0+a'), 0,
+    'and it is antisymmetric',
+  )
+
+  // (6) zero is returned for identical strings, and — the contract — for nothing else.
+  eq('1.0.0', '1.0.0')
+  eq('unknown', 'unknown')
+  eq('v1.2.3', 'v1.2.3')
+
+  // A `v` prefix is accepted and does not change the release.
+  lt('v1.2.3', 'v1.2.4')
+  lt('v1.2.3', '1.2.4')
+
+  // The whole point, as a sort: the four-version case orders correctly end to end.
+  assert.deepEqual(
+    ['0.4.10', '0.4.46', '0.4.5', '0.4.9'].sort(compareVersions),
+    ['0.4.5', '0.4.9', '0.4.10', '0.4.46'],
+  )
+  // ...which is exactly what the default sort does NOT do.
+  assert.deepEqual(['0.4.10', '0.4.46', '0.4.5', '0.4.9'].sort(), ['0.4.10', '0.4.46', '0.4.5', '0.4.9'])
+})
+
+/**
+ * The register is attacker-influenced text and `slug()` in this same file already earned a CodeQL
+ * `js/polynomial-redos` finding on it, so the version parser is a hand-written linear scan rather
+ * than a nested-quantifier regex. This is the assertion that keeps it that way.
+ */
+test('compareVersions is linear — the version parser is not a ReDoS', () => {
+  const pathological = '9'.repeat(200_000) + 'x'
+  const t0 = process.hrtime.bigint()
+  for (let i = 0; i < 50; i++) compareVersions(pathological, '0.4.46')
+  const ms = Number(process.hrtime.bigint() - t0) / 1e6
+
+  assert.ok(ms < 5_000, `version parsing went superlinear: ${ms.toFixed(0)} ms`)
+  // ...and it still gets the answer right: a 200k-digit non-release is not newer than 0.4.46.
+  assert.ok(compareVersions(pathological, '0.4.46') < 0)
+})
+
+test('the newest release is the newest by VERSION, not by ASCII — 0.4.46 outranks 0.4.9', () => {
+  const store = new HellGraphStore(new AtomSpace('vendor-graph-semver', false))
+  ingestVendorFreshness(store, POLYGLOT)
+
+  const a = analyzeVendorFreshness(store)
+  const report = a.blastRadius.find((b) => b.repository === 'SocioProphet/hellgraph')
+  assert.ok(report, 'the producing repository has a blast-radius report')
+
+  // The whole point of the report: "what breaks if I cut the next one?" answered about the release
+  // that would actually be cut. `.sort()` answers it about 0.4.9, a release five patches behind.
+  assert.equal(report.proposedVersion, '0.4.46')
+})
+
+/**
+ * The same defect, one step worse, and reachable from the register as it is written today.
+ *
+ * A pin may name a version the source's release history does not list — the ingest says so in
+ * as many words and builds the artifact anyway, with no supersession chain. Such an artifact is a
+ * HEAD (nothing supersedes it), so it lands in the same candidate set. A `vendored_commit` pin
+ * therefore puts a commit sha in there, and an entry with neither version nor commit puts the
+ * literal string `unknown` in there.
+ *
+ * Under ASCII both outrank every real release, because letters sort above digits. The blast-radius
+ * report then proposes cutting `f3a9c21` — or `unknown`. Non-numeric versions are not releases and
+ * must not be ranked as though they were.
+ */
+test('a commit sha and the literal unknown are not "newer" than every release', () => {
+  const store = new HellGraphStore(new AtomSpace('vendor-graph-nonnumeric', false))
+  ingestVendorFreshness(store, {
+    ...POLYGLOT,
+    artifacts: [
+      ...POLYGLOT.artifacts,
+      {
+        artifact_id: 'hellgraph-crate@gateway',
+        source_id: 'hellgraph-crate',
+        consumer_repo: 'SocioProphet/prophet-platform',
+        consumer_app: 'apps/compute-gateway',
+        vendored_commit: 'f3a9c21',
+        disposition: 'observation-required',
+      },
+      {
+        artifact_id: 'hellgraph-wheel@warden',
+        source_id: 'hellgraph-wheel',
+        consumer_repo: 'SocioProphet/prophet-platform',
+        consumer_app: 'apps/lifecycle-warden',
+        disposition: 'observation-required',
+      },
+    ],
+  })
+
+  // Both non-numeric heads really are in the graph — otherwise this test proves nothing.
+  const heads = store.nodesByLabel(VFP.Artifact)
+    .filter((n) => store.out(n.id, VFP_EDGE.supersededBy).length === 0)
+    .map((n) => n.properties['version'])
+  assert.ok(heads.includes('f3a9c21'), 'the commit-sha artifact is a head')
+  assert.ok(heads.includes('unknown'), 'the version-less artifact is a head')
+
+  const a = analyzeVendorFreshness(store)
+  const report = a.blastRadius.find((b) => b.repository === 'SocioProphet/hellgraph')
+  assert.equal(report?.proposedVersion, '0.4.46')
+})
+
+// ─── Forked supersession ───────────────────────────────────────────────────────
+
+/**
+ * The register can fork a release history, and does it the ordinary way: two entries for the same
+ * `source_id` — a re-observation, or a backport branch enumerated separately — whose release lists
+ * share an ancestor. `0.4.40` then has TWO outgoing `vfp:supersededBy` edges.
+ *
+ * `supersessionChain` resolves that fork by taking the LOWEST NEXT NODE ID, which is a deliberate
+ * choice: it is replayable, so the sealed receipt is reproducible from the graph alone. It is not
+ * the longest path, and the docstring that claimed it was has been corrected.
+ *
+ * The branches below are built so the two rules give different answers and the difference is
+ * visible in the verdict: the low-id branch (0.4.41) is a dead end at distance 1, the high-id
+ * branch (0.4.42 → 0.4.43) runs to distance 2. A future "improvement" to longest-path would change
+ * `releaseDistance`, `latestVersion` and therefore the seal — so it breaks here rather than
+ * silently rewriting receipts.
+ */
+const FORKED = {
+  manifest_id: 'vendor-freshness-forked',
+  policy: { default_freshness_policy: 'track-latest' },
+  sources: [
+    {
+      source_id: 'hellgraph-engine',
+      repo: 'SocioProphet/hellgraph',
+      releases: [{ version: '0.4.40' }, { version: '0.4.41' }],
+    },
+    {
+      source_id: 'hellgraph-engine',
+      repo: 'SocioProphet/hellgraph',
+      releases: [{ version: '0.4.40' }, { version: '0.4.42' }, { version: '0.4.43' }],
+    },
+  ],
+  artifacts: [
+    {
+      artifact_id: 'hellgraph-engine@service',
+      source_id: 'hellgraph-engine',
+      consumer_repo: 'SocioProphet/prophet-platform',
+      consumer_app: 'apps/hellgraph-service',
+      vendored_version: '0.4.40',
+      freshness_policy: 'track-latest',
+      disposition: 'remediation-required',
+    },
+  ],
+}
+
+test('a forked release history follows the LOWEST NEXT NODE ID, not the longest path', () => {
+  const store = new HellGraphStore(new AtomSpace('vendor-graph-fork', false))
+  ingestVendorFreshness(store, FORKED)
+
+  // The fork is real: 0.4.40 is superseded by two different artifacts.
+  const forkPoint = vfpId.artifact('hellgraph-engine', '0.4.40')
+  assert.deepEqual(
+    store.out(forkPoint, VFP_EDGE.supersededBy).map((n) => n.id).sort(),
+    [vfpId.artifact('hellgraph-engine', '0.4.41'), vfpId.artifact('hellgraph-engine', '0.4.42')],
+  )
+
+  const v = stalenessOf(store, vfpId.pin('hellgraph-engine@service'))
+
+  // Lowest id wins, so the chain is the SHORT branch. Longest-path would give ['0.4.42','0.4.43'].
+  assert.deepEqual(v.intervening.map((i) => i.version), ['0.4.41'])
+  assert.equal(v.releaseDistance, 1)
+  assert.equal(v.latestVersion, '0.4.41')
+
+  // Deterministic: the same graph replays to the same chain, which is why the receipt is sealable.
+  const again = stalenessOf(store, vfpId.pin('hellgraph-engine@service'))
+  assert.deepEqual(again.intervening, v.intervening)
+})
+
+/**
+ * `stats.releases` was the one counter not gated by a `seen*` set, so the fork fixture above — five
+ * release lines naming four distinct versions, because `0.4.40` is declared by both source
+ * entries — reported five releases where the graph holds four `vfp:Release` nodes. Every other
+ * counter reports nodes created; this one reported manifest lines read. Two different questions
+ * under one name, and the caller cannot tell which answer it got.
+ */
+test('ingest stats count NODES, not manifest lines — a repeated release is counted once', () => {
+  const store = new HellGraphStore(new AtomSpace('vendor-graph-stats', false))
+  const stats = ingestVendorFreshness(store, FORKED)
+
+  // Content-addressed: both `0.4.40` lines intern to the same vfp:Release atom.
+  assert.equal(store.nodesByLabel(VFP.Release).length, 4, '0.4.40, 0.4.41, 0.4.42, 0.4.43')
+  assert.equal(stats.releases, 4, 'the repeated 0.4.40 is counted once, as the artifact would be')
+  assert.equal(stats.releases, store.nodesByLabel(VFP.Release).length, 'stats.releases matches the graph')
+
+  // The guard must not suppress genuinely distinct releases: same version, different source.
+  assert.equal(stats.artifacts, 4, 'artifacts were already gated this way — the two agree now')
+})
+
+/**
+ * The pinned-artifact branch of the ingest built its `vfp:producedBy` edge straight from the
+ * matched source's `repo` field, with no check that the field was there. A source entry missing
+ * `repo` is skipped by the source loop — no repository node is ever created for it — but the
+ * artifact loop still found it with `sources.find`, so the edge was built to `vfp:repo/`: an edge
+ * to an empty id, pointing at a node that does not exist.
+ *
+ * That is a dangling edge in a graph whose whole claim is that its receipts are derivable from it,
+ * and `store.in(vfpId.repository(''), ...)` is a live query someone can run.
+ */
+test('a source with no repo produces no edge to an empty repository id', () => {
+  const store = new HellGraphStore(new AtomSpace('vendor-graph-emptyrepo', false))
+  ingestVendorFreshness(store, {
+    manifest_id: 'vendor-freshness-norepo',
+    sources: [{ source_id: 'orphan', releases: [{ version: '0.1.0' }] }],
+    artifacts: [
+      {
+        artifact_id: 'orphan@service',
+        source_id: 'orphan',
+        consumer_repo: 'SocioProphet/prophet-platform',
+        consumer_app: 'apps/hellgraph-service',
+        vendored_version: '0.1.0',
+        disposition: 'observation-required',
+      },
+    ],
+  })
+
+  const emptyRepo = vfpId.repository('')
+  assert.equal(store.getNode(emptyRepo), undefined, 'no node was created for the empty repository id')
+  assert.deepEqual(store.in(emptyRepo, VFP_EDGE.producedBy), [], 'and nothing points at it')
 })
