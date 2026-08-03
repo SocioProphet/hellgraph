@@ -30,7 +30,7 @@ permissions:
 
 jobs:
   build-and-verify-dist:
-    runs-on: [self-hosted, linux, x64]
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
@@ -161,7 +161,7 @@ jobs:
   # truth" (D1) and "a control-telos is unconstitutional" (K1). Deterministic + stdlib only (no
   # deps, no install, no path filter) so the boundary can never regress unverified.
   constitution:
-    runs-on: [self-hosted, linux, x64]
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
