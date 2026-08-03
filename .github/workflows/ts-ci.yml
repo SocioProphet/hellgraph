@@ -30,7 +30,7 @@ permissions:
 
 jobs:
   build-and-verify-dist:
-    runs-on: [self-hosted, linux, x64]
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
@@ -152,3 +152,20 @@ jobs:
         run: npm install --no-audit --no-fund
       - name: Verify vendored KKO provenance + generated kko-data.ts
         run: npm run check:kko
+
+  # ── Constitutional conformance (ADR-0004, the Crown) ────────────────────────────────
+  # Seats the Telos Layer over the Truth Engine: Keter (welfare-annealing objective, NOT
+  # control-max), Da'at (policy weights/thresholds, CANNOT assert truth), Truth Engine
+  # (falsifiable + witnessed + multi-valued/temporal/adversary-aware). The checker fires the
+  # cross-layer invariants that no single discourse.ts function sees — esp. "Da'at cannot assert
+  # truth" (D1) and "a control-telos is unconstitutional" (K1). Deterministic + stdlib only (no
+  # deps, no install, no path filter) so the boundary can never regress unverified.
+  constitution:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Verify constitutional invariants (ADR-0004 teeth)
+        run: npm run check:constitution

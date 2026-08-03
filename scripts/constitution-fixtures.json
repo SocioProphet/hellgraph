@@ -1,0 +1,127 @@
+{
+  "_comment": [
+    "Constitutional conformance corpus for scripts/check-constitution.mjs (ADR-0004).",
+    "Data, not logic — the checker is scripts/check-constitution.mjs; these are the",
+    "records it must admit or void. Every fixture declares its own `expect` (admit|void)",
+    "and the `teeth` (invariant id) that must decide it, so the suite proves the",
+    "invariants fire in BOTH directions: a green run means the admits admitted AND the",
+    "voids voided for the stated reason. See ADR-0004 for the seating rationale.",
+    "Layers: keter = objective+constraints (Crown), daat = policy weights/thresholds",
+    "(Knowledge), truth = TruthRecord (Truth Engine). Only the Truth Engine asserts truth."
+  ],
+
+  "keter": [
+    {
+      "id": "keter/welfare-annealing/WEA-1",
+      "note": "Seats economic-prophet welfare_annealing WEA-1 (PR #59): welfare-max over conserved energy. Live objective data: prophet-platform apps/agentic-os-api/app/data.py.",
+      "expect": "admit",
+      "teeth": "K1-flourishing-telos",
+      "objective": "welfare",
+      "maximand": "human_flourishing",
+      "conserves": "energy",
+      "constraints": ["non-domination", "consent", "dignity"]
+    },
+    {
+      "id": "keter/control-max/INVERSION",
+      "note": "SILENT-vs-welfare inversion: a control-max / domination telos. Unconstitutional.",
+      "expect": "void",
+      "teeth": "K1-flourishing-telos",
+      "objective": "control",
+      "maximand": "control",
+      "constraints": ["non-domination", "consent", "dignity"]
+    },
+    {
+      "id": "keter/welfare-no-constraints",
+      "note": "Flourishing maximand but strips the non-domination/consent/dignity constraints.",
+      "expect": "void",
+      "teeth": "K2-constraints-present",
+      "objective": "welfare",
+      "maximand": "human_flourishing",
+      "constraints": ["consent"]
+    }
+  ],
+
+  "daat": [
+    {
+      "id": "daat/omnirisk-weights",
+      "note": "Da'at policy interface: omnirisk/outcome-pricing weights + the-assay grade thresholds + counter-test-gate. Sets weights & thresholds only.",
+      "expect": "admit",
+      "teeth": "D1-daat-cannot-assert-truth",
+      "sets": "weights",
+      "weights": { "harm_burden_multiplier": 3.0, "assay_grade_threshold": "B", "counter_test_required": true }
+    },
+    {
+      "id": "daat/asserts-pos-verdict",
+      "note": "Da'at record that manufactures a POS/true verdict — affirming-the-consequent guard (eik#3 firewall). Policy sets weights, never asserts truth.",
+      "expect": "void",
+      "teeth": "D1-daat-cannot-assert-truth",
+      "sets": "weights",
+      "weights": { "assay_grade_threshold": "B" },
+      "verdict": "POS"
+    },
+    {
+      "id": "daat/asserts-truth-flag",
+      "note": "Same firewall rule via an `asserts` field: a policy record cannot carry an asserted truth value.",
+      "expect": "void",
+      "teeth": "D1-daat-cannot-assert-truth",
+      "sets": "thresholds",
+      "asserts": "true"
+    }
+  ],
+
+  "truth": [
+    {
+      "id": "truth/well-formed",
+      "note": "TruthRecord that carries a TestObligation (refutation channel) + a Witness/Attestation (provenance+independence), multi-valued + temporal + adversary-aware. Admitted.",
+      "expect": "admit",
+      "teeth": "T-admits",
+      "claimId": "claim:example-1",
+      "verdict": "NEG",
+      "testObligation": "ctest:codex-reverify:claim-example-1",
+      "attestations": ["witness:independent-1"],
+      "cut": { "frame": "read-cut@t0" },
+      "verdictSpace": ["POS", "ZERO", "NEG"],
+      "ts": "2026-08-03T00:00:00Z",
+      "adversaryAware": true
+    },
+    {
+      "id": "truth/no-test-obligation",
+      "note": "Unfalsifiable -> void (mirrors the Phase-0 counter-test gate; discourse.ts assertClaim rejects a claim with no refutation channel).",
+      "expect": "void",
+      "teeth": "T1-test-obligation-required",
+      "claimId": "claim:example-2",
+      "verdict": "POS",
+      "attestations": ["witness:independent-1"],
+      "cut": { "frame": "read-cut@t0" },
+      "verdictSpace": ["POS", "ZERO", "NEG"],
+      "ts": "2026-08-03T00:00:00Z",
+      "adversaryAware": true
+    },
+    {
+      "id": "truth/no-witness",
+      "note": "No Witness/Attestation -> void (mirrors discourse.ts recordTruth: >=1 attestation required; unbacked verdict rejected).",
+      "expect": "void",
+      "teeth": "T2-witness-required",
+      "claimId": "claim:example-3",
+      "verdict": "POS",
+      "testObligation": "ctest:codex-reverify:claim-example-3",
+      "attestations": [],
+      "cut": { "frame": "read-cut@t0" },
+      "verdictSpace": ["POS", "ZERO", "NEG"],
+      "ts": "2026-08-03T00:00:00Z",
+      "adversaryAware": true
+    },
+    {
+      "id": "truth/single-valued-atemporal",
+      "note": "Single-valued + atemporal + not adversary-aware where the constitution requires multi-valued + temporal + adversary-aware -> void.",
+      "expect": "void",
+      "teeth": "T3-multivalued-temporal-adversary",
+      "claimId": "claim:example-4",
+      "verdict": "POS",
+      "testObligation": "ctest:codex-reverify:claim-example-4",
+      "attestations": ["witness:independent-1"],
+      "verdictSpace": ["true"],
+      "adversaryAware": false
+    }
+  ]
+}

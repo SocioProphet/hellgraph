@@ -38,6 +38,8 @@ jobs:
           test -f PROVENANCE.md
           test -f NOTICE.md
           test -f docs/adr/0001-hellgraph-positioning.md
+          test -f docs/adr/0004-crown-telos-truth-constitution.md
+          test -f scripts/check-constitution.mjs
           test -f docs/audit/SPEC_TRACEABILITY.md
           test -f docs/audit/KERNEL_SEAM_AUDIT.md
 
