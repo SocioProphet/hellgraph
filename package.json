@@ -48,6 +48,7 @@
     "typescript": "^5.5.0"
   },
   "bin": {
-    "hellgraph-superpeer": "bin/hellgraph-superpeer.mjs"
+    "hellgraph-superpeer": "bin/hellgraph-superpeer.mjs",
+    "hellgraph-agent-ingest": "bin/hellgraph-agent-ingest.mjs"
   }
 }
